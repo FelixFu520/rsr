@@ -1,0 +1,20 @@
+# 零配置回退:未提供 settings.toml 时全部走 stub,CI 不必装 Isaac
+[logging]
+level = "INFO"  # 控制台和文件共用的最低日志级别
+console = true  # 文本控制台输出
+# log_file = "logs/rsr.log"  # 设置后追加保存到文件
+
+[sim_world]
+backend = "stub"  # 不启动 Kit
+
+[scene]
+backend = "stub"
+
+[robot]
+backend = "stub"
+
+[planner]
+backend = "stub"
+
+[job]
+backend = "stub"  # StubJob 只串工厂,不采集

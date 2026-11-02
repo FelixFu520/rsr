@@ -1,0 +1,22 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "collect",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/app/python.sh",
+      "module": "real2sim2real.core.cli",
+      "args": [
+        "collect",
+        "run",
+        "-c",
+        "configs/navigation_g1_official.toml"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "envFile": "${workspaceFolder}/.env"
+    }
+  ]
+}
