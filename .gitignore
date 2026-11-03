@@ -1,5 +1,7 @@
 app
 uv.lock
+assets/
+outputs/
 
 tests/
 

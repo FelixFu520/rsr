@@ -1,0 +1,124 @@
+# 分拣快递:工厂背景 + 分拣场景包 + Pro-M6 分三个 USD 引用
+#
+# /World/background  → assets/Background/Factory/factory_002/Factory_Interior.usd
+# /World/scene       → assets/Scene/sorting_station/composed/scene.usdc(关掉包内自带机器人)
+# /World/robots      → assets/Robot/pro_m6_696/pro_m6_696.usda(引用场景包里的视觉机器人)
+# 只引用,不改各 USD 内部尺度.机器人源 prim 已带工位世界位姿.
+
+[logging]
+level = "INFO"
+console = true
+log_file = "outputs/sorting_pro_m6/rsr.log"
+
+[sim_world]
+backend = "isaacsim"
+headless = false
+renderer = "RayTracedLighting"
+rt_subframes = 8
+background_usd_path = "assets/Background/Factory/factory_002/Factory_Interior.usd"
+background_prim_path = "/World/background"
+background_gravity = false
+device = "cuda:0"
+enable_newton = true
+physics_backend = ""
+physics_dt = 0.016666666666666666
+rendering_dt = 0.016666666666666666
+wait_init_time = 30
+dlss = false
+auto_exposure = false
+
+[scene]
+backend = "sorting"
+usd_path = "assets/Scene/sorting_station/composed/scene.usdc"
+prim_path = "/World/scene"
+hide_prim_paths = ["/World/scene/Pro_m6_696_dynamics_fixed"]
+platform_prim_path = "/World/scene/platform/Empty/Plane/Plane_002"
+conveyor_in_prim_path = "/World/scene/ConveyorBelt_A06_01"
+conveyor_out_prim_path = "/World/scene/ConveyorBelt_A06"
+
+[[scene.objects]]
+name = "bagged_clothing"
+prim_path = "/World/scene/ImportedBaggedClothing"
+grasp_type = "target"
+
+[[scene.cameras]]
+name = "overview_cam"
+usd_path = ""
+prim_path = "/World/Cameras/overview_cam"
+# 斜上方后拉,看清入带→平台→出带整条分拣;焦距 12mm ≈ 82° 水平视场
+pose = { position = [1.80, -5.20, 4.40], orientation_wxyz = [0.835040, 0.486020, 0.129713, 0.222862] }
+pose_relative_to = "/World"
+resolution = [1280, 720]
+annotators = ["rgb"]
+clipping_range = [0.1, 80.0]
+focal_length = 12.0
+horizontal_aperture = 20.955
+hide_visuals = true
+
+[robot]
+backend = "pro_m6"
+name = "pro_m6"
+usd_path = "assets/Robot/pro_m6_696/pro_m6_696.usda"
+usd_prim_path = "/Pro_m6_696_dynamics_fixed"
+prim_path = "/World/robots/Pro_m6_696_dynamics_fixed"
+pose_relative_to = "/World"
+
+[[robot.cameras]]
+name = "head_cam"
+prim_path = "/World/robots/Pro_m6_696_dynamics_fixed/Geometry/base_link/tn__Headdepth_Link_oE/Camera_Head"
+pose_relative_to = "/World/robots/Pro_m6_696_dynamics_fixed/Geometry/base_link"
+resolution = [640, 480]
+annotators = ["rgb"]
+hide_visuals = false
+
+[planner]
+backend = "sorting"
+timeout_s = 3600.0
+robot_prim_path = "/World/robots/Pro_m6_696_dynamics_fixed"
+clothing_root_prim_path = "/World/scene/ImportedBaggedClothing"
+clothing_surface_prim_path = "/World/scene/ImportedBaggedClothing/Asset/visual/visual"
+clothing_volume_proxy_prim_path = "/World/scene/ImportedBaggedClothing/Asset/visual/visual_proxy"
+support_prim_path = "/World/scene/platform/Empty/Plane/Plane_002"
+belt_prim_path = "/World/scene/ConveyorBelt_A06/Belt"
+infeed_prim_path = "/World/scene/ConveyorBelt_A06_01"
+runtime_root_prim_path = "/World/ProM6_SortingRuntime"
+physics_device = "cuda:0"
+physics_hz = 60.0
+replay_cache_dir = "outputs/sorting_pro_m6/replay_cache"
+drive_mode = "callback"
+youngs_modulus = 10000.0
+poisson_ratio = 0.3
+density = 70.0
+particle_radius = 0.0015
+soft_contact_mu = 0.5
+shape_mu = 1.5
+newton_substeps = 10
+vbd_iterations = 10
+min_lift_height_m = 0.08
+belt_speed_mps = 0.5
+
+[job]
+backend = "sorting"
+inspect_gui = false
+num_episodes = 2
+object_jitter_xy = 0.06
+object_jitter_seed = 0
+camera_warmup_steps = 30
+max_steps = 6000
+record_stride = 0
+physics_hz = 60.0
+viewport_camera_prims = [
+  "/World/robots/Pro_m6_696_dynamics_fixed/Geometry/base_link/tn__Headdepth_Link_oE/Camera_Head",
+  "/World/Cameras/overview_cam",
+]
+
+[job.recorder]
+format = "lerobot_v2"
+output_dir = "outputs/sorting_pro_m6"
+task = "relay the bagged package from the infeed belt to the platform, then to the outfeed belt"
+robot_type = "pro_m6"
+fps = 15
+record_camera_prims = [
+  "/World/robots/Pro_m6_696_dynamics_fixed/Geometry/base_link/tn__Headdepth_Link_oE/Camera_Head",
+  "/World/Cameras/overview_cam",
+]
