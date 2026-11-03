@@ -1,12 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Pro-M6 双臂分拣中继:柔性包裹 入带 → 平台 → 出带.
-
-刚体(臂/夹爪/工位)仍由 PhysX Articulation 驱动.袋装包裹走 Newton VBD
-体积软体,靠夹爪摩擦接触承重,不再使用掩码 AutoDeformableAttachment.
-松爪后出带以 kinematic box 的 -X 速度靠摩擦送走.
-"""
+"""分拣包裹后端：配置与实现。"""
 
 from __future__ import annotations
 
@@ -16,32 +11,1334 @@ import os
 import time
 import traceback
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum, auto
 from pathlib import Path
+from typing import Any, Literal
 
 import numpy as np
-import omni.timeline
-import omni.usd
-from isaacsim.core.experimental.prims import (
-    Articulation,
-    DeformablePrim,
-    RigidPrim,
-    XformPrim,
-)
-from isaacsim.core.simulation_manager import (
-    PhysicsScene,
-    SimulationManager,
-)
-from omni.physx.scripts import deformableUtils
-from omni.physx.scripts.ifaces import (
-    get_physx_attachment_private_interface,
-)
-from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics
+from pydantic import Field, field_validator
 
+from real2sim2real.core.config import BaseConfig
 from real2sim2real.core.logger import get_logger
-from real2sim2real.planner.newton_sorting import NewtonSortingWorld
+from real2sim2real.planner.base import BasePlanner
+from real2sim2real.utils.surface import surface_patch_normal, uv_patch_triangles
+
+
+def _load_runtime_dependencies() -> None:
+    """世界初始化后才导入 Kit 与 USD 运行时。"""
+    global Articulation, DeformablePrim, Gf, PhysicsScene, PhysxSchema, RigidPrim, Sdf
+    global SimulationManager, Usd, UsdGeom, UsdPhysics, XformPrim, deformableUtils
+    global get_physx_attachment_private_interface, omni
+    import omni.timeline
+    import omni.usd
+    from isaacsim.core.experimental.prims import (
+        Articulation,
+        DeformablePrim,
+        RigidPrim,
+        XformPrim,
+    )
+    from isaacsim.core.simulation_manager import (
+        PhysicsScene,
+        SimulationManager,
+    )
+    from omni.physx.scripts import deformableUtils
+    from omni.physx.scripts.ifaces import (
+        get_physx_attachment_private_interface,
+    )
+    from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics
+
+
+class SortingPlannerConfig(BaseConfig):
+    """``[planner]``:Pro-M6 双臂分拣中继(柔性包裹 入带 → 平台 → 出带).
+
+    状态机在 本模块.刚体仍走 PhysX;袋装包裹走
+    Newton VBD 接触抓取.本配置暴露场景 prim、Newton 材料与提起验收.
+    """
+
+    timeout_s: float = Field(
+        default=1800.0,
+        description="单集分拣超时(s,墙钟);RTX 渲染 + GPU 柔性体下实时率远低于 1x",
+    )
+    robot_prim_path: str = Field(
+        default="/World/robots/Pro_m6_696_dynamics_fixed", description="机器人根 prim"
+    )
+    clothing_root_prim_path: str = Field(
+        default="/World/scene/ImportedBaggedClothing", description="柔性包裹根 prim"
+    )
+    clothing_surface_prim_path: str = Field(
+        default="/World/scene/ImportedBaggedClothing/Asset/visual/visual",
+        description="袋装包裹可视 Mesh;Play 前会去掉 PhysX 柔性 API,改由 Newton 写回顶点",
+    )
+    clothing_volume_proxy_prim_path: str = Field(
+        default="/World/scene/ImportedBaggedClothing/Asset/visual/visual_proxy",
+        description="体积代理 prim;存在时必须 inactive,避免与 Newton 软体抢显示",
+    )
+    support_prim_path: str = Field(
+        default="/World/scene/platform/Empty/Plane/Plane_002", description="平台支撑面 prim"
+    )
+    belt_prim_path: str = Field(
+        default="/World/scene/ConveyorBelt_A06/Belt", description="出带皮带 prim,判定包裹是否送出"
+    )
+    infeed_prim_path: str = Field(
+        default="/World/scene/ConveyorBelt_A06_01",
+        description="入带 prim;Newton 里做成静态碰撞盒,空则跳过",
+    )
+    left_gripper_prim_path: str = Field(
+        default="", description="左夹爪 prim;空则 <root>/robotiq_left"
+    )
+    right_gripper_prim_path: str = Field(
+        default="", description="右夹爪 prim;空则 <root>/robotiq_right"
+    )
+    left_finger_prim_paths: list[str] = Field(
+        default_factory=list,
+        description="左指垫 Mesh prim;空则在左夹爪下按 inner_finger 自动发现",
+    )
+    right_finger_prim_paths: list[str] = Field(
+        default_factory=list,
+        description="右指垫 Mesh prim;空则在右夹爪下按 inner_finger 自动发现",
+    )
+    runtime_root_prim_path: str = Field(
+        default="/World/ProM6_SortingRuntime",
+        description="运行期临时 prim 根,收尾时整棵删掉",
+    )
+    youngs_modulus: float = Field(default=10000.0, gt=0.0, description="Newton 包裹杨氏模量 Pa")
+    poisson_ratio: float = Field(default=0.3, gt=0.0, lt=0.5, description="Newton 包裹泊松比")
+    density: float = Field(default=70.0, gt=0.0, description="Newton 包裹等效密度 kg/m^3")
+    particle_radius: float = Field(default=0.0015, gt=0.0, description="Newton 粒子接触半径 m")
+    soft_contact_mu: float = Field(default=0.5, ge=0.0, description="Newton 软接触摩擦")
+    shape_mu: float = Field(default=1.5, ge=0.0, description="Newton 刚体代理摩擦")
+    newton_substeps: int = Field(default=10, ge=1, description="每物理帧 Newton 子步数")
+    vbd_iterations: int = Field(default=10, ge=1, description="VBD 每子步迭代次数")
+    min_lift_height_m: float = Field(
+        default=0.08,
+        ge=0.0,
+        description="左右提起结束时包裹 COM 相对提起前至少升高这么多,否则 FAILED",
+    )
+    keep_label_up: bool = Field(
+        default=False,
+        description="左臂从主体中部抓取；平台松爪后须通过标签朝上检查，要求入带时标签已朝上",
+    )
+    label_uv_bounds: tuple[float, float, float, float] = Field(
+        default=(0.14, 0.50, 0.32, 0.615),
+        description="标签材质 UV 矩形 [u_min, v_min, u_max, v_max]；默认对应 bagged_clothing_000",
+    )
+    label_up_min_cos: float = Field(
+        default=0.9, ge=0.0, le=1.0, description="平台交接时标签区域法线与世界 +Z 夹角的最小余弦"
+    )
+    left_lift_height_m: float = Field(
+        default=0.28,
+        gt=0.0,
+        le=0.35,
+        description="左臂起始提起高度；稳握后仍接触入带时最多补抬 0.06 m，总高度不超过 0.35 m",
+    )
+    left_setdown_offset_m: float = Field(
+        default=0.025,
+        ge=-0.05,
+        le=0.05,
+        description="平台下放额外向下偏移；标签朝上采集用 0，避免过度挤压翻折",
+    )
+
+    @field_validator("label_uv_bounds")
+    @classmethod
+    def _label_uv_rectangle(
+        cls, value: tuple[float, float, float, float]
+    ) -> tuple[float, float, float, float]:
+        bounds = np.asarray(value)
+        if not np.all(np.isfinite(bounds)) or np.any(bounds[:2] >= bounds[2:]):
+            raise ValueError("label_uv_bounds 须为有限、严格递增的 UV 矩形")
+        return value
+
+    belt_speed_mps: float = Field(
+        default=0.5, ge=0.0, description="松爪后出带运动学速度 m/s,沿世界 -X"
+    )
+    physics_device: str = Field(default="cuda:0", description="PhysX 设备;柔性体必须 GPU")
+    physics_hz: float = Field(default=60.0, gt=0.0, description="物理频率,与 physics_dt 对齐")
+    replay_cache_dir: str = Field(
+        default="outputs/sorting_pro_m6/replay_cache",
+        description="成功一次后落盘的 npz 回放目录",
+    )
+    drive_mode: Literal["callback", "manual"] = Field(
+        default="callback",
+        description=(
+            "callback:注册 PHYSICS_POST_STEP 回调推进状态机(与原脚本一致);"
+            "manual:由 Job 循环每步显式调用 step(dt)"
+        ),
+    )
+    timing_overrides: dict[str, float] = Field(
+        default_factory=dict,
+        description="覆盖 prom6_TimingConfig 的字段(秒),如 left_drag_seconds",
+    )
+
+
+_NEWTON_LOGGER = get_logger("NewtonSorting")
+
+_FINGER_NAME_HINTS = (
+    "inner_finger",
+    "finger_pad",
+    "pad_link",
+    "outer_finger",
+    "inner_knuckle",
+)
+
+_MIN_HALF_EXTENT_M = 0.004
+
+_SLAB_MIN_HALF_Z_M = 0.010
+
+_MAX_SLAB_HALF_XY_M = 6.0
+
+_MAX_FINGER_HALF_M = 0.08
+
+_MAX_FINGERS_PER_GRIPPER = 2
+
+_MAX_KINEMATIC_SPEED_M_S = 2.5
+
+_MAX_BAG_SPAN_M = 1.5
+
+_DEFAULT_PAD_HALF_M = np.array([0.022, 0.010, 0.028], dtype=np.float64)
+
+_JAW_OPEN_SEP_M = 0.040
+
+_JAW_CLOSED_SEP_M = 0.011
+
+_JAW_CLOSED_RAD = 0.8
+
+_JAW_AXIS = 1  # ToolCenter 局部 Y → 开合;局部 Z → 压入袋面
+
+_PAD_APPROACH_OFFSET_M = 0.024  # 沿 TCP +Z 探到袋底,形成托举面
+
+_SUPPORT_SHAPE_MU = 0.12  # 平台/入带低摩擦,才能揭起袋角
+
+_FINGER_SHAPE_MU = 3.0  # 指垫高摩擦
+
+_BELT_SHAPE_MU = 1.2  # 出带中等摩擦,既能送走又不把袋尾粘死
+
+_BELT_SUPPORT_GAP_M = 0.0  # 平台 -X 与出带 +X 对齐
+
+_BELT_PLUS_X_EXTEND_M = 0.0  # 不加长;加长后袋尾压在出带上,右爪揭不起
+
+RIGHT_PLATFORM_PAD_CLEARANCE_M = 0.003  # 右指垫最低点与平台顶面至少留 3 mm
+
+RIGHT_PLATFORM_PENETRATION_TOLERANCE_M = 0.002  # 抬升前允许的软体数值穿透上限
+
+
+@dataclass(frozen=True)
+class NewtonSortingParams:
+    """Newton VBD 材料、接触与步进;默认对齐 grasp_deformable 包裹 demo."""
+
+    youngs_modulus: float = 10000.0
+    poisson_ratio: float = 0.3
+    density: float = 70.0
+    particle_radius: float = 0.0015
+    soft_contact_margin: float = 0.01
+    soft_contact_ke: float = 2.0e6
+    soft_contact_kd: float = 1.0e-7
+    soft_contact_mu: float = 0.5
+    shape_mu: float = 1.5
+    k_damp: float = 1.0e-6
+    physics_hz: float = 60.0
+    sim_substeps: int = 10
+    vbd_iterations: int = 10
+    device: str = "cuda:0"
+    belt_speed_mps: float = 0.5
+    min_lift_height_m: float = 0.08
+
+
+@dataclass
+class _KinematicBody:
+    """一个随 USD prim 更新的 Newton kinematic box."""
+
+    body_id: int
+    prim_path: str
+    half_extents: np.ndarray
+    local_center: np.ndarray
+    prev_pos: np.ndarray | None = None
+    prev_quat: np.ndarray | None = None
+    kind: str = "finger"
+    side: str = "left"
+    jaw_sign: float = 0.0
+
+
+def _lame(youngs: float, poisson: float) -> tuple[float, float]:
+    mu = youngs / (2.0 * (1.0 + poisson))
+    lam = youngs * poisson / ((1.0 + poisson) * (1.0 - 2.0 * poisson))
+    return float(mu), float(lam)
+
+
+def jaw_separation_m(finger_joint_rad: float, closed_rad: float = _JAW_CLOSED_RAD) -> float:
+    """finger_joint 0→张开,closed_rad→合拢;closed_rad 须是实际下发的合爪目标(含关节上限)."""
+    closed = max(float(closed_rad), 1.0e-6)
+    t = float(np.clip(float(finger_joint_rad) / closed, 0.0, 1.0))
+    return (1.0 - t) * _JAW_OPEN_SEP_M + t * _JAW_CLOSED_SEP_M
+
+
+def _tcp_frame_pad_half(measured: np.ndarray) -> np.ndarray:
+    """把指尖 Mesh AABB 半长映射到 TCP:X 侧向、Y 开合、Z 压入;加厚加宽以便夹住袋角."""
+    extents = np.sort(np.abs(np.asarray(measured, dtype=np.float64).reshape(3)))
+    return np.array(
+        [
+            float(np.clip(max(extents[1], 0.018), 0.016, 0.028)),
+            float(np.clip(max(extents[0], 0.010), 0.008, 0.012)),
+            float(np.clip(max(extents[2], 0.024), 0.020, 0.035)),
+        ],
+        dtype=np.float64,
+    )
+
+
+def _jaw_local_center(jaw_sign: float, sep_m: float) -> np.ndarray:
+    offset = np.zeros(3, dtype=np.float64)
+    offset[_JAW_AXIS] = float(jaw_sign) * float(sep_m)
+    offset[2] = _PAD_APPROACH_OFFSET_M
+    return offset
+
+
+def _point_aabb_distance(point: np.ndarray, minimum: np.ndarray, maximum: np.ndarray) -> float:
+    nearest = np.minimum(np.maximum(point, minimum), maximum)
+    return float(np.linalg.norm(np.asarray(point, dtype=np.float64) - nearest))
+
+
+def _newton_matrix_pose(matrix: Gf.Matrix4d) -> tuple[np.ndarray, np.ndarray]:
+    translation = np.asarray(matrix.ExtractTranslation(), dtype=np.float64).reshape(3)
+    quat = matrix.ExtractRotationQuat()
+    imag = quat.GetImaginary()
+    xyzw = np.array([imag[0], imag[1], imag[2], quat.GetReal()], dtype=np.float64)
+    norm = float(np.linalg.norm(xyzw))
+    if not np.all(np.isfinite(xyzw)) or norm < 1e-12:
+        xyzw = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    else:
+        xyzw /= norm
+    return translation, xyzw
+
+
+def _rotate_wxyz(wxyz: np.ndarray, vec: np.ndarray) -> np.ndarray:
+    w, x, y, z = np.asarray(wxyz, dtype=np.float64).reshape(4)
+    qvec = np.array([x, y, z], dtype=np.float64)
+    v = np.asarray(vec, dtype=np.float64).reshape(3)
+    uv = np.cross(qvec, v)
+    uuv = np.cross(qvec, uv)
+    return v + 2.0 * (w * uv + uuv)
+
+
+def _isaac_world_pose(
+    prim_path: str, views: dict[str, object] | None = None
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """从 Isaac view/Fabric 读世界位姿;PhysX 驱动的关节 USD XformCache 往往是旧的.
+
+    Returns:
+        (position, xyzw) 或 None(view 尚未可用,回退 USD).
+    """
+    try:
+        from isaacsim.core.experimental.prims import XformPrim
+    except ImportError:
+        return None
+    view = None if views is None else views.get(prim_path)
+    try:
+        if view is None:
+            view = XformPrim(prim_path)
+            if views is not None:
+                views[prim_path] = view
+        positions, orientations = view.get_world_poses()
+        if hasattr(positions, "numpy"):
+            positions = positions.numpy()
+        if hasattr(orientations, "numpy"):
+            orientations = orientations.numpy()
+        position = np.asarray(positions, dtype=np.float64).reshape(-1, 3)[0]
+        wxyz = np.asarray(orientations, dtype=np.float64).reshape(-1, 4)[0]
+    except Exception:  # noqa: BLE001  # Play 前 view 可能还没绑上
+        return None
+    norm = float(np.linalg.norm(wxyz))
+    if not np.all(np.isfinite(position)) or not np.all(np.isfinite(wxyz)) or norm < 1e-12:
+        return None
+    wxyz = wxyz / norm
+    xyzw = np.array([wxyz[1], wxyz[2], wxyz[3], wxyz[0]], dtype=np.float64)
+    return position, xyzw
+
+
+def _prim_world_matrix(stage: Usd.Stage, path: str, cache: UsdGeom.XformCache) -> Gf.Matrix4d:
+    prim = stage.GetPrimAtPath(path)
+    if not prim.IsValid():
+        raise RuntimeError(f"Newton 代理缺少 prim: {path}")
+    return cache.GetLocalToWorldTransform(prim)
+
+
+def _mesh_points_local(prim: Usd.Prim) -> np.ndarray:
+    mesh = UsdGeom.Mesh(prim)
+    points = mesh.GetPointsAttr().Get()
+    if not points:
+        raise RuntimeError(f"Mesh 没有顶点: {prim.GetPath()}")
+    return np.array([[p[0], p[1], p[2]] for p in points], dtype=np.float64)
+
+
+def _set_mesh_local_points(mesh: UsdGeom.Mesh, local: np.ndarray) -> None:
+    mesh.GetPointsAttr().Set([Gf.Vec3f(float(p[0]), float(p[1]), float(p[2])) for p in local])
+
+
+_REST_MESH_LOCAL: dict[str, np.ndarray] = {}
+
+
+def restore_cached_rest_mesh(stage: Usd.Stage, mesh_path: str) -> bool:
+    """把袋表面写回首次四面体化时的静止局部顶点.
+
+    上一集 Newton 会把 Mesh 写成变形后的形状;再做星形 tet 会失败.
+    首次调用若尚无缓存,则把当前顶点记为静止形状,不改 Mesh.
+
+    Args:
+        stage: 当前 USD stage.
+        mesh_path: 袋装包裹可视 Mesh 路径.
+
+    Returns:
+        True 表示写回了已有缓存;False 表示刚建立缓存.
+
+    Raises:
+        RuntimeError: prim 不是活动 Mesh.
+    """
+    prim = stage.GetPrimAtPath(mesh_path)
+    if not prim.IsValid() or not prim.IsA(UsdGeom.Mesh):
+        raise RuntimeError(f"需要活动 Mesh: {mesh_path}")
+    mesh = UsdGeom.Mesh(prim)
+    cached = _REST_MESH_LOCAL.get(mesh_path)
+    if cached is None:
+        _REST_MESH_LOCAL[mesh_path] = _mesh_points_local(prim).copy()
+        return False
+    current = _mesh_points_local(prim)
+    if current.shape != cached.shape or not np.allclose(current, cached, atol=1e-5):
+        _set_mesh_local_points(mesh, cached)
+        _NEWTON_LOGGER.info("已恢复袋表面静止网格", prim=mesh_path, n=int(cached.shape[0]))
+    return True
+
+
+def world_mesh_vertices(
+    stage: Usd.Stage, mesh_path: str
+) -> tuple[UsdGeom.Mesh, np.ndarray, Gf.Matrix4d]:
+    """读取可视 Mesh 的世界坐标顶点,供四面体化."""
+    restore_cached_rest_mesh(stage, mesh_path)
+    prim = stage.GetPrimAtPath(mesh_path)
+    if not prim.IsValid() or not prim.IsA(UsdGeom.Mesh):
+        raise RuntimeError(f"需要活动 Mesh: {mesh_path}")
+    mesh = UsdGeom.Mesh(prim)
+    cache = UsdGeom.XformCache()
+    world = cache.GetLocalToWorldTransform(prim)
+    local = _mesh_points_local(prim)
+    vertices = np.array([world.Transform(Gf.Vec3d(*row)) for row in local], dtype=np.float64)
+    return mesh, vertices, world
+
+
+def star_tetmesh_from_surface(vertices: np.ndarray, face_indices: np.ndarray) -> tuple[object, int]:
+    """封闭三角表面 → 中心扇形四面体.顶点须已是世界坐标,不做 recenter."""
+    import newton
+
+    verts = np.asarray(vertices, dtype=np.float32)
+    faces = np.asarray(face_indices, dtype=np.int32).reshape(-1, 3)
+    if verts.ndim != 2 or verts.shape[1] != 3 or verts.shape[0] < 4:
+        raise RuntimeError(f"无效表面顶点: {verts.shape}")
+    if faces.shape[0] < 4:
+        raise RuntimeError(f"表面三角太少: {faces.shape}")
+    center = verts.mean(axis=0)
+    relative = verts[faces] - center
+    volumes = np.linalg.det(relative) / 6.0
+    if not np.all(volumes > 1e-12):
+        raise RuntimeError("袋表面相对中心不是正体积星形,无法做简化四面体化")
+    edges = np.sort(
+        np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]),
+        axis=1,
+    )
+    counts = np.unique(edges, axis=0, return_counts=True)[1]
+    if not np.all(counts == 2):
+        raise RuntimeError("袋表面不是闭合流形(边共享次数不为 2)")
+    tet_index = np.column_stack([np.full(len(faces), len(verts), dtype=np.int32), faces])
+    tet = newton.TetMesh(np.vstack([verts, center.astype(np.float32)]), tet_index.flatten())
+    return tet, int(len(verts))
+
+
+def require_no_attachment_schemas(stage: Usd.Stage) -> None:
+    """Stage 上若还有 Attachment schema,说明仍在走伪抓取."""
+    leftover: list[str] = []
+    for prim in stage.Traverse():
+        type_name = prim.GetTypeName() or ""
+        schemas = prim.GetAppliedSchemas()
+        if "Attachment" in type_name or any("Attachment" in name for name in schemas):
+            leftover.append(str(prim.GetPath()))
+    if leftover:
+        raise RuntimeError(f"仍存在柔性附着 prim,拒绝接触抓取: {leftover[:8]}")
+
+
+def strip_clothing_physx(
+    stage: Usd.Stage,
+    *,
+    clothing_root_path: str,
+    clothing_surface_path: str,
+    volume_proxy_path: str,
+) -> None:
+    """Play 前去掉袋子上的 PhysX 柔性/碰撞,只留可视 Mesh 给 Newton 写回."""
+    volume = stage.GetPrimAtPath(volume_proxy_path)
+    if volume.IsValid() and volume.IsActive():
+        volume.SetActive(False)
+        _NEWTON_LOGGER.info("已关掉体积代理", prim=volume_proxy_path)
+
+    root = stage.GetPrimAtPath(clothing_root_path)
+    if not root.IsValid():
+        raise RuntimeError(f"缺少包裹根 prim: {clothing_root_path}")
+    surface = stage.GetPrimAtPath(clothing_surface_path)
+    if not surface.IsValid() or not surface.IsA(UsdGeom.Mesh) or not surface.IsActive():
+        raise RuntimeError(f"包裹表面须是活动 Mesh: {clothing_surface_path}")
+
+    removed: list[str] = []
+    for prim in Usd.PrimRange(root):
+        for schema in list(prim.GetAppliedSchemas()):
+            if "Attachment" in schema:
+                raise RuntimeError(f"包裹上已有附着 schema {schema}: {prim.GetPath()}")
+            if "Deformable" not in schema:
+                continue
+            try:
+                prim.RemoveAPI(schema)
+                removed.append(f"{prim.GetPath()}:{schema}")
+            except Exception as exc:  # noqa: BLE001  # 部分 schema 名要走 Registry
+                api_type = Usd.SchemaRegistry.GetTypeFromSchemaTypeName(schema)
+                if not api_type:
+                    raise RuntimeError(
+                        f"无法移除 deformable schema {schema} @ {prim.GetPath()}"
+                    ) from exc
+                prim.RemoveAPI(api_type)
+                removed.append(f"{prim.GetPath()}:{schema}")
+        collision_attr = prim.GetAttribute("physics:collisionEnabled")
+        if prim.HasAPI(UsdPhysics.CollisionAPI) or collision_attr.IsValid():
+            collision = UsdPhysics.CollisionAPI.Apply(prim)
+            collision.CreateCollisionEnabledAttr().Set(False)
+
+    _NEWTON_LOGGER.info(
+        "已去掉袋子 PhysX 柔性", removed=len(removed), surface=clothing_surface_path
+    )
+    require_no_attachment_schemas(stage)
+
+
+def discover_tool_centers(stage: Usd.Stage, robot_path: str) -> tuple[str, str]:
+    """找随 Articulation 动的 ToolCenter;优先 Geometry 子树,避开根上的静态视觉夹爪."""
+    left_candidates: list[str] = []
+    right_candidates: list[str] = []
+    prefix = robot_path.rstrip("/")
+    for prim in stage.Traverse():
+        path = str(prim.GetPath())
+        if not path.startswith(prefix):
+            continue
+        name = prim.GetName()
+        if name == "ToolCenter_L":
+            left_candidates.append(path)
+        elif name == "ToolCenter_R":
+            right_candidates.append(path)
+
+    def pick(candidates: list[str], label: str) -> str:
+        if not candidates:
+            raise RuntimeError(f"找不到 {label}")
+        ranked = sorted(candidates, key=lambda p: (0 if "/Geometry/" in p else 1, len(p)))
+        chosen = ranked[0]
+        if len(candidates) > 1:
+            _NEWTON_LOGGER.info("ToolCenter 候选", label=label, chosen=chosen, all=candidates)
+        return chosen
+
+    return pick(left_candidates, "ToolCenter_L"), pick(right_candidates, "ToolCenter_R")
+
+
+def resolve_infeed_prim_path(stage: Usd.Stage, infeed_prim_path: str) -> str:
+    """入带优先用 ``.../Belt`` 表面,避免整段机架 AABB 把袋子埋进盒子里."""
+    if not infeed_prim_path:
+        return ""
+    belt_child = infeed_prim_path.rstrip("/") + "/Belt"
+    if stage.GetPrimAtPath(belt_child).IsValid():
+        return belt_child
+    if stage.GetPrimAtPath(infeed_prim_path).IsValid():
+        return infeed_prim_path
+    return ""
+
+
+def _prim_local_aabb(prim: Usd.Prim) -> tuple[np.ndarray, np.ndarray]:
+    """指垫/指尖局部 AABB:扫子孙 Mesh(含 instance proxy),变回该 prim 局部坐标."""
+    xcache = UsdGeom.XformCache()
+    parent_world = xcache.GetLocalToWorldTransform(prim)
+    inverse = parent_world.GetInverse()
+    points: list[list[float]] = []
+    for child in Usd.PrimRange(prim, Usd.TraverseInstanceProxies()):
+        if not child.IsActive() or not child.IsA(UsdGeom.Mesh):
+            continue
+        try:
+            local = _mesh_points_local(child)
+        except RuntimeError:
+            continue
+        child_world = xcache.GetLocalToWorldTransform(child)
+        to_parent = inverse * child_world
+        for row in local:
+            mapped = to_parent.Transform(Gf.Vec3d(float(row[0]), float(row[1]), float(row[2])))
+            points.append([mapped[0], mapped[1], mapped[2]])
+    if len(points) < 2:
+        cache = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(),
+            [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
+            useExtentsHint=False,
+        )
+        rng = cache.ComputeUntransformedBound(prim).GetRange()
+        if rng.IsEmpty():
+            return np.zeros(3, dtype=np.float64), _DEFAULT_PAD_HALF_M.copy()
+        minimum = np.asarray(rng.GetMin(), dtype=np.float64).reshape(3)
+        maximum = np.asarray(rng.GetMax(), dtype=np.float64).reshape(3)
+        points = [minimum.tolist(), maximum.tolist()]
+    center, half = _aabb_half_from_points(np.asarray(points, dtype=np.float64))
+    if float(np.max(half)) > _MAX_FINGER_HALF_M:
+        _NEWTON_LOGGER.warning(
+            "指垫包围盒过大,已钳制", prim=str(prim.GetPath()), half=half.tolist()
+        )
+        half = np.minimum(half, _MAX_FINGER_HALF_M)
+    if float(np.max(half)) < 0.006:
+        half = np.maximum(half, _DEFAULT_PAD_HALF_M)
+    return center, half
+
+
+def _pick_opposing_fingers(paths: list[str]) -> list[str]:
+    """每个夹爪取相对的两指:指垫(或 inner_finger) + outer_finger."""
+
+    def leaf(path: str) -> str:
+        return path.rsplit("/", 1)[-1].lower()
+
+    pads = [
+        path for path in paths if leaf(path).endswith("finger_pad") or leaf(path).endswith("pad")
+    ]
+    outers = [path for path in paths if leaf(path).endswith("outer_finger")]
+    inners = [path for path in paths if leaf(path).endswith("inner_finger")]
+    chosen: list[str] = []
+    # 整段 inner/outer finger 比空的 pad Xform 更能包住指面网格
+    if inners:
+        chosen.append(inners[0])
+    elif pads:
+        chosen.append(pads[0])
+    if outers:
+        chosen.append(outers[0])
+    elif pads:
+        for path in pads:
+            if path not in chosen:
+                chosen.append(path)
+                break
+    return chosen[:_MAX_FINGERS_PER_GRIPPER]
+
+
+def discover_finger_meshes(stage: Usd.Stage, gripper_path: str) -> list[str]:
+    """在夹爪子树里找会随 finger_joint 动的一对指尖 prim.
+
+    ToolCenter 在基座上,合爪时不夹紧,不能当接触代理.
+    """
+    root = stage.GetPrimAtPath(gripper_path)
+    if not root.IsValid():
+        raise RuntimeError(f"夹爪 prim 不存在: {gripper_path}")
+    candidates: list[str] = []
+    for prim in Usd.PrimRange(root, Usd.TraverseInstanceProxies()):
+        if not prim.IsActive() or not prim.IsA(UsdGeom.Xformable):
+            continue
+        path = str(prim.GetPath())
+        lowered = path.lower()
+        if "joint" in lowered or "toolcenter" in lowered or "visuals" in lowered:
+            continue
+        leaf = path.rsplit("/", 1)[-1].lower()
+        if "knuckle" in leaf:
+            continue
+        if any(hint in lowered for hint in _FINGER_NAME_HINTS) or "finger" in lowered:
+            candidates.append(path)
+    chosen = _pick_opposing_fingers(candidates)
+    if not chosen:
+        raise RuntimeError(
+            f"夹爪下没有合用的指垫/指尖 prim(不能用 ToolCenter 代替): {gripper_path}"
+        )
+    sizes = []
+    for path in chosen:
+        center, half = _prim_local_aabb(stage.GetPrimAtPath(path))
+        sizes.append({"prim": path, "center": center.tolist(), "half": half.tolist()})
+    _NEWTON_LOGGER.info("指垫代理", gripper=gripper_path, prims=chosen, sizes=sizes)
+    return chosen
+
+
+def _aabb_half_from_points(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    minimum = points.min(axis=0)
+    maximum = points.max(axis=0)
+    half = np.maximum(0.5 * (maximum - minimum), _MIN_HALF_EXTENT_M)
+    center = 0.5 * (minimum + maximum)
+    return center, half
+
+
+def _static_slab_from_prim(stage: Usd.Stage, path: str) -> tuple[np.ndarray, np.ndarray]:
+    """用世界 AABB 的顶面做薄板;避免整段机架体积把袋子埋进碰撞盒."""
+    prim = stage.GetPrimAtPath(path)
+    if not prim.IsValid():
+        raise RuntimeError(f"缺少支撑/皮带 prim: {path}")
+    cache = UsdGeom.BBoxCache(
+        Usd.TimeCode.Default(),
+        [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
+        useExtentsHint=False,
+    )
+    world_range = cache.ComputeWorldBound(prim).ComputeAlignedRange()
+    if world_range.IsEmpty():
+        raise RuntimeError(f"prim 没有世界包围盒: {path}")
+    minimum = np.asarray(world_range.GetMin(), dtype=np.float64).reshape(3)
+    maximum = np.asarray(world_range.GetMax(), dtype=np.float64).reshape(3)
+    half_xy = 0.5 * (maximum[:2] - minimum[:2])
+    if np.any(half_xy > _MAX_SLAB_HALF_XY_M):
+        raise RuntimeError(f"支撑/皮带 XY 过大,可能扫进了整厂: {path} half_xy={half_xy}")
+    half_z = _SLAB_MIN_HALF_Z_M
+    center = np.array(
+        [
+            0.5 * (minimum[0] + maximum[0]),
+            0.5 * (minimum[1] + maximum[1]),
+            float(maximum[2]) - half_z,
+        ],
+        dtype=np.float64,
+    )
+    half = np.array(
+        [
+            max(float(half_xy[0]), _MIN_HALF_EXTENT_M),
+            max(float(half_xy[1]), _MIN_HALF_EXTENT_M),
+            half_z,
+        ],
+        dtype=np.float64,
+    )
+    return center, half
+
+
+def _extend_belt_plus_x(
+    belt_center: np.ndarray,
+    belt_half: np.ndarray,
+    extra_m: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """把出带 +X 边缘向平台加长,短拖后袋尾仍落在传送带上."""
+    extra = float(extra_m)
+    if extra <= 0.0:
+        return belt_center, belt_half
+    center = belt_center.copy()
+    half = belt_half.copy()
+    min_x = float(center[0] - half[0])
+    max_x = float(center[0] + half[0] + extra)
+    center[0] = 0.5 * (min_x + max_x)
+    half[0] = 0.5 * (max_x - min_x)
+    return center, half
+
+
+def _clip_support_away_from_belt(
+    support_center: np.ndarray,
+    support_half: np.ndarray,
+    belt_center: np.ndarray,
+    belt_half: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """缩短平台 -X,让静态薄板不再盖住出带接触面."""
+    support_min_x = float(support_center[0] - support_half[0])
+    support_max_x = float(support_center[0] + support_half[0])
+    belt_max_x = float(belt_center[0] + belt_half[0])
+    new_min = belt_max_x + _BELT_SUPPORT_GAP_M
+    if support_min_x >= new_min:
+        return support_center, support_half
+    if new_min >= support_max_x - 0.10:
+        raise RuntimeError(
+            "平台与出带重叠过多,无法裁出支撑面: "
+            f"support_x=[{support_min_x:.4f}, {support_max_x:.4f}], "
+            f"belt_max_x={belt_max_x:.4f}"
+        )
+    center = support_center.copy()
+    half = support_half.copy()
+    half[0] = 0.5 * (support_max_x - new_min)
+    center[0] = 0.5 * (new_min + support_max_x)
+    return center, half
+
+
+def _align_slab_top(
+    source_center: np.ndarray,
+    source_half: np.ndarray,
+    target_center: np.ndarray,
+    target_half: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """把 target 顶面齐到 source,避免平台到出带有台阶."""
+    top = float(source_center[2] + source_half[2])
+    center = target_center.copy()
+    half = target_half.copy()
+    center[2] = top - float(half[2])
+    return center, half
+
+
+class NewtonSortingWorld:
+    """一台 Newton 模型:软袋 + 平台/入带静态盒 + 出带/指垫 kinematic."""
+
+    def __init__(
+        self,
+        stage: Usd.Stage,
+        params: NewtonSortingParams,
+        *,
+        clothing_surface_path: str,
+        support_prim_path: str,
+        belt_prim_path: str,
+        infeed_prim_path: str = "",
+        finger_prim_paths: list[str] | None = None,
+        fallback_finger_xforms: list[str] | None = None,
+        tcp_jaw_prims: list[tuple[str, str]] | None = None,
+        label_uv_bounds: tuple[float, float, float, float] | None = None,
+    ) -> None:
+        import newton
+        import warp as wp
+        from newton.solvers import SolverVBD
+
+        self.stage = stage
+        self._xform_views: dict[str, object] = {}
+        self._tcp_pose_fns: dict[str, object] = {}
+        self._use_isaac_pose = False
+        self.params = params
+        self.clothing_surface_path = clothing_surface_path
+        self.belt_prim_path = belt_prim_path
+        self.support_prim_path = support_prim_path
+        wp.set_device(params.device)
+
+        infeed_prim_path = resolve_infeed_prim_path(stage, infeed_prim_path)
+
+        mesh, world_vertices, self._mesh_world = world_mesh_vertices(stage, clothing_surface_path)
+        counts = np.array(mesh.GetFaceVertexCountsAttr().Get())
+        if counts.size == 0 or not np.all(counts == 3):
+            raise RuntimeError(f"包裹表面必须是三角网格: {clothing_surface_path}")
+        faces = np.array(mesh.GetFaceVertexIndicesAttr().Get(), dtype=np.int32)
+        self.label_triangles = np.empty((0, 3), dtype=np.int64)
+        if label_uv_bounds is not None:
+            uv = UsdGeom.PrimvarsAPI(mesh.GetPrim()).GetPrimvar("st")
+            if not uv or not uv.HasValue():
+                raise RuntimeError("标签朝向检查需要包裹网格的 st UV")
+            values = np.asarray(uv.ComputeFlattened(), dtype=float)
+            if uv.GetInterpolation() == "vertex":
+                values = values[faces]
+            elif uv.GetInterpolation() != "faceVarying":
+                raise RuntimeError("标签朝向检查只支持 vertex / faceVarying UV")
+            self.label_triangles = uv_patch_triangles(faces, values, label_uv_bounds)
+            if mesh.GetOrientationAttr().Get() == "leftHanded":
+                self.label_triangles = self.label_triangles[:, [0, 2, 1]]
+        tet, self.surface_count = star_tetmesh_from_surface(world_vertices, faces)
+        span = world_vertices.max(axis=0) - world_vertices.min(axis=0)
+        if np.any(span > 1.5) or np.any(span < 0.02):
+            raise RuntimeError(
+                f"包裹世界尺寸异常,拒绝四面体化: span={span}, center={world_vertices.mean(axis=0)}"
+            )
+        self._mesh = mesh
+        self._world_to_local = self._mesh_world.GetInverse()
+
+        k_mu, k_lambda = _lame(params.youngs_modulus, params.poisson_ratio)
+        builder = newton.ModelBuilder(gravity=-9.81)
+        builder.default_shape_cfg.mu = float(params.shape_mu)
+
+        self._high_friction_shape_ids: list[int] = []
+        support_center, support_half = _static_slab_from_prim(stage, support_prim_path)
+        self.support_top_z = float(support_center[2] + support_half[2])
+        belt_center, belt_half = _static_slab_from_prim(stage, belt_prim_path)
+        belt_center, belt_half = _extend_belt_plus_x(belt_center, belt_half, _BELT_PLUS_X_EXTEND_M)
+        # 不裁平台 -X:与出带重叠共面,避免立边钩住袋尾把软袋拉长.
+        belt_center, belt_half = _align_slab_top(
+            support_center, support_half, belt_center, belt_half
+        )
+        builder.add_shape_box(
+            -1,
+            xform=wp.transform(wp.vec3(*support_center), wp.quat_identity()),
+            hx=float(support_half[0]),
+            hy=float(support_half[1]),
+            hz=float(support_half[2]),
+        )
+        if infeed_prim_path and stage.GetPrimAtPath(infeed_prim_path).IsValid():
+            in_center, in_half = _static_slab_from_prim(stage, infeed_prim_path)
+            builder.add_shape_box(
+                -1,
+                xform=wp.transform(wp.vec3(*in_center), wp.quat_identity()),
+                hx=float(in_half[0]),
+                hy=float(in_half[1]),
+                hz=float(in_half[2]),
+            )
+
+        self._belt_rest_pos = belt_center.copy()
+        self._belt_rest_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        belt_id = builder.add_body(
+            xform=wp.transform(wp.vec3(*belt_center), wp.quat_identity()),
+            mass=0.0,
+            is_kinematic=True,
+            label="outfeed_belt",
+        )
+        belt_shape = builder.add_shape_box(
+            belt_id,
+            hx=float(belt_half[0]),
+            hy=float(belt_half[1]),
+            hz=float(belt_half[2]),
+        )
+        self._high_friction_shape_ids.append(int(belt_shape))
+        self.belt_body_id = belt_id
+        self._belt_shape_id = int(belt_shape)
+        self.belt_speed_mps = 0.0
+
+        self._kinematics: list[_KinematicBody] = []
+        self._finger_grip_scale = {"left": 1.0, "right": 1.0}
+        self._pad_retract_m = 0.0
+        tcp_jaws = list(tcp_jaw_prims or [])
+        if tcp_jaws:
+            pad_half = _DEFAULT_PAD_HALF_M.copy()
+            for mesh_path in finger_prim_paths or []:
+                prim = stage.GetPrimAtPath(mesh_path)
+                if not prim.IsValid():
+                    continue
+                try:
+                    _, half = _prim_local_aabb(prim)
+                except RuntimeError:
+                    continue
+                if float(np.max(half)) >= 0.006:
+                    pad_half = _tcp_frame_pad_half(half)
+                    break
+            for path, side in tcp_jaws:
+                if not stage.GetPrimAtPath(path).IsValid():
+                    raise RuntimeError(f"TCP 指垫 prim 无效: {path}")
+                for jaw_sign in (1.0, -1.0):
+                    local_center = _jaw_local_center(jaw_sign, _JAW_OPEN_SEP_M)
+                    body_id = builder.add_body(
+                        xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+                        mass=0.0,
+                        is_kinematic=True,
+                        label=f"{side}_jaw_{int(jaw_sign)}",
+                    )
+                    jaw_shape = builder.add_shape_box(
+                        body_id,
+                        hx=float(pad_half[0]),
+                        hy=float(pad_half[1]),
+                        hz=float(pad_half[2]),
+                    )
+                    self._high_friction_shape_ids.append(int(jaw_shape))
+                    self._kinematics.append(
+                        _KinematicBody(
+                            body_id=body_id,
+                            prim_path=path,
+                            half_extents=pad_half.copy(),
+                            local_center=local_center,
+                            side=side,
+                            jaw_sign=jaw_sign,
+                        )
+                    )
+        else:
+            finger_paths = list(finger_prim_paths or [])
+            if not finger_paths and fallback_finger_xforms:
+                for path in fallback_finger_xforms:
+                    if stage.GetPrimAtPath(path).IsValid():
+                        finger_paths.append(path)
+            if not finger_paths:
+                raise RuntimeError("Newton 指垫代理为空:请配置 tcp_jaw_prims 或 finger prim")
+            for path in finger_paths:
+                prim = stage.GetPrimAtPath(path)
+                if not prim.IsValid():
+                    raise RuntimeError(f"指垫 prim 无效: {path}")
+                try:
+                    local_center, half = _prim_local_aabb(prim)
+                except RuntimeError:
+                    if prim.IsA(UsdGeom.Mesh):
+                        local_pts = _mesh_points_local(prim)
+                        local_center, half = _aabb_half_from_points(local_pts)
+                    else:
+                        local_center = np.zeros(3, dtype=np.float64)
+                        half = _DEFAULT_PAD_HALF_M.copy()
+                body_id = builder.add_body(
+                    xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+                    mass=0.0,
+                    is_kinematic=True,
+                    label=path.rsplit("/", 1)[-1],
+                )
+                finger_shape = builder.add_shape_box(
+                    body_id,
+                    hx=float(half[0]),
+                    hy=float(half[1]),
+                    hz=float(half[2]),
+                )
+                self._high_friction_shape_ids.append(int(finger_shape))
+                self._kinematics.append(
+                    _KinematicBody(
+                        body_id=body_id,
+                        prim_path=path,
+                        half_extents=half,
+                        local_center=local_center,
+                    )
+                )
+        if not self._kinematics:
+            raise RuntimeError("Newton 指垫代理为空")
+
+        builder.add_soft_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            mesh=tet,
+            density=float(params.density),
+            k_mu=k_mu,
+            k_lambda=k_lambda,
+            k_damp=float(params.k_damp),
+            particle_radius=float(params.particle_radius),
+        )
+        builder.color()
+        self.model = builder.finalize(requires_grad=False)
+        self.model.soft_contact_ke = float(params.soft_contact_ke)
+        self.model.soft_contact_kd = float(params.soft_contact_kd)
+        self.model.soft_contact_mu = float(params.soft_contact_mu)
+        self.model.shape_material_ke.fill_(float(params.soft_contact_ke))
+        self.model.shape_material_kd.fill_(float(params.soft_contact_kd))
+        mu = np.full(int(self.model.shape_count), _SUPPORT_SHAPE_MU, dtype=np.float32)
+        for shape_id in self._high_friction_shape_ids:
+            if 0 <= shape_id < mu.size:
+                mu[shape_id] = float(max(params.shape_mu, _FINGER_SHAPE_MU))
+        self._mu_template = mu
+        self._assign_shape_mu()
+
+        pinned = int(np.count_nonzero(self.model.particle_inv_mass.numpy() == 0))
+        if pinned:
+            raise RuntimeError(f"Newton 软体含 {pinned} 个固定粒子,接触抓取不允许 pin")
+
+        self.state_0 = self.model.state()
+        self.state_1 = self.model.state()
+        self.control = self.model.control()
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model,
+            soft_contact_margin=float(params.soft_contact_margin),
+        )
+        self.contacts = self.collision_pipeline.contacts()
+        self.soft_solver = SolverVBD(
+            self.model,
+            iterations=int(params.vbd_iterations),
+            integrate_with_external_rigid_solver=True,
+            particle_self_contact_radius=float(params.particle_radius) * 2.0,
+            particle_self_contact_margin=float(params.soft_contact_margin),
+            particle_enable_self_contact=False,
+            particle_vertex_contact_buffer_size=32,
+            particle_edge_contact_buffer_size=64,
+            particle_collision_detection_interval=-1,
+        )
+        self.frame_dt = 1.0 / float(params.physics_hz)
+        self.sim_dt = self.frame_dt / float(params.sim_substeps)
+        self._wp = wp
+        self._sync_kinematics(self.frame_dt, first=True, update_history=True)
+        self.write_surface_to_usd()
+        self._assert_bag_sane()
+        cache = UsdGeom.XformCache()
+        finger_world = [self._body_transform(item, cache)[0].tolist() for item in self._kinematics]
+        _NEWTON_LOGGER.info(
+            "Newton 分拣世界已建",
+            particles=int(self.model.particle_count),
+            surface=self.surface_count,
+            fingers=len(self._kinematics),
+            bodies=int(self.model.body_count),
+            bag_span=span.tolist(),
+            support_half=support_half.tolist(),
+            belt_half=belt_half.tolist(),
+            finger_half=[item.half_extents.tolist() for item in self._kinematics],
+            finger_local_center=[item.local_center.tolist() for item in self._kinematics],
+            finger_world=finger_world,
+            high_friction_shapes=self._high_friction_shape_ids,
+            support_mu=_SUPPORT_SHAPE_MU,
+        )
+
+    def set_belt_speed(self, speed_mps: float) -> None:
+        """出带 treadmill 速度,沿世界 -X;0 表示静止.静止时摩擦与平台相同,才能揭起袋尾."""
+        self.belt_speed_mps = float(speed_mps)
+        self._assign_shape_mu()
+
+    def set_finger_grip_scale(self, left_t: float, right_t: float) -> None:
+        """合爪比例 0→张开(低摩擦脱落) 1→夹紧(高摩擦承重)."""
+        self._finger_grip_scale = {
+            "left": float(np.clip(left_t, 0.0, 1.0)),
+            "right": float(np.clip(right_t, 0.0, 1.0)),
+        }
+        self._assign_shape_mu()
+
+    def _assign_shape_mu(self) -> None:
+        mu = np.array(self._mu_template, dtype=np.float32, copy=True)
+        if 0 <= int(self._belt_shape_id) < mu.size:
+            if abs(self.belt_speed_mps) > 1.0e-8:
+                mu[int(self._belt_shape_id)] = float(max(self.params.shape_mu, _BELT_SHAPE_MU))
+            else:
+                mu[int(self._belt_shape_id)] = _SUPPORT_SHAPE_MU
+        body_of = np.asarray(self.model.shape_body.numpy(), dtype=np.int32).reshape(-1)
+        for item in self._kinematics:
+            scale = 0.02 + 0.98 * self._finger_grip_scale.get(item.side, 1.0)
+            for shape_id, body_id in enumerate(body_of.tolist()):
+                if int(body_id) == int(item.body_id) and 0 <= shape_id < mu.size:
+                    mu[shape_id] = np.float32(float(self._mu_template[shape_id]) * scale)
+        self.model.shape_material_mu.assign(mu)
+
+    def set_pad_retract(self, retract_m: float) -> None:
+        """松爪时把指垫沿 TCP -Z 抽回,退出袋体再让软袋落台.
+
+        同时清掉有限差分历史:否则 ``step`` 会把 30cm 抽离插值成扫掠,把袋拉走.
+        """
+        self._pad_retract_m = float(max(0.0, retract_m))
+        for item in self._kinematics:
+            if item.jaw_sign == 0.0:
+                continue
+            center = np.asarray(item.local_center, dtype=np.float64).copy()
+            center[2] = _PAD_APPROACH_OFFSET_M - self._pad_retract_m
+            item.local_center = center
+            item.prev_pos = None
+            item.prev_quat = None
+
+    def set_jaw_separations(self, left_m: float, right_m: float) -> None:
+        """按左右 finger_joint 更新 TCP 指垫局部偏移,让合爪真正夹紧."""
+        seps = {"left": float(left_m), "right": float(right_m)}
+        for item in self._kinematics:
+            if item.jaw_sign == 0.0:
+                continue
+            center = _jaw_local_center(item.jaw_sign, seps.get(item.side, _JAW_OPEN_SEP_M))
+            center = center.copy()
+            center[2] -= self._pad_retract_m
+            item.local_center = center
+
+    def set_tcp_pose_fn(self, side: str, fn: object) -> None:
+        """用规划器 FK 的 TCP 驱动指垫;USD 视觉夹爪不在 PhysX Fabric 里."""
+        self._tcp_pose_fns[side] = fn
+
+    def top_down_tcp_floor_z(self, side: str, clearance_m: float = 0.0) -> float:
+        """返回顶抓姿态下不让该侧指垫侵入平台所需的最低 TCP 世界 Z。"""
+        pads = [item for item in self._kinematics if item.side == side and item.jaw_sign != 0.0]
+        if not pads:
+            raise RuntimeError(f"{side} 指垫代理不存在，无法计算平台安全高度")
+        clearance = float(clearance_m)
+        if not math.isfinite(clearance) or clearance < 0.0:
+            raise ValueError("指垫平台间隙必须是非负有限值")
+        # 固定顶抓四元数把 TCP 局部 +Z 映射到世界 -Z；因此
+        # local_center.z + half.z 是 TCP 到指垫最低点的距离。
+        tcp_to_lowest = max(float(item.local_center[2] + item.half_extents[2]) for item in pads)
+        return float(self.support_top_z + tcp_to_lowest + clearance)
+
+    def _body_transform(self, item: _KinematicBody, cache: UsdGeom.XformCache):
+        fn = self._tcp_pose_fns.get(item.side)
+        if fn is not None and item.jaw_sign != 0.0:
+            position, wxyz = fn()  # type: ignore[operator]
+            wxyz = np.asarray(wxyz, dtype=np.float64).reshape(4)
+            xyzw = np.array([wxyz[1], wxyz[2], wxyz[3], wxyz[0]], dtype=np.float64)
+            offset = _rotate_wxyz(wxyz, item.local_center)
+            return position + offset, xyzw
+        prim_path = item.prim_path
+        local_center = item.local_center
+        if self._use_isaac_pose:
+            live = _isaac_world_pose(prim_path, self._xform_views)
+            if live is not None:
+                position, xyzw = live
+                offset = _rotate_wxyz(
+                    np.array([xyzw[3], xyzw[0], xyzw[1], xyzw[2]], dtype=np.float64),
+                    local_center,
+                )
+                return position + offset, xyzw
+            if prim_path not in self._xform_views:
+                _NEWTON_LOGGER.warning("Isaac 指垫位姿不可用,回退 USD", prim=prim_path)
+        world = _prim_world_matrix(self.stage, prim_path, cache)
+        center_world = world.Transform(Gf.Vec3d(*local_center))
+        pos = np.array([center_world[0], center_world[1], center_world[2]], dtype=np.float64)
+        _, quat = _newton_matrix_pose(world)
+        return pos, quat
+
+    def reset_kinematic_history(self) -> None:
+        """机器人跳到 ready 后清零有限差分速度,避免指垫瞬移打飞袋子."""
+        self._xform_views.clear()
+        self._use_isaac_pose = True
+        for item in self._kinematics:
+            item.prev_pos = None
+            item.prev_quat = None
+        self._sync_kinematics(self.frame_dt, first=True, update_history=True)
+
+    def _empty_body_state(self, sim_dt: float = 0.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """返回 (q_prev, q_curr, qd).
+
+        SolverVBD 在 ``integrate_with_external_rigid_solver=True`` 时用
+        ``(body_q_out - body_q_in) / dt`` 当接触点速度,忽略 ``body_qd``.
+        出带碰撞盒钉在 rest,把 ``q_prev`` 沿 +X 错开 ``speed * sim_dt``,
+        形成世界 -X 的 treadmill.
+        """
+        nbody = int(self.model.body_count)
+        q_prev = np.zeros((nbody, 7), dtype=np.float32)
+        q_curr = np.zeros((nbody, 7), dtype=np.float32)
+        qd = np.zeros((nbody, 6), dtype=np.float32)
+        if nbody:
+            q_prev[:, 6] = 1.0
+            q_curr[:, 6] = 1.0
+        rest = np.array([*self._belt_rest_pos, *self._belt_rest_quat], dtype=np.float32)
+        q_curr[self.belt_body_id] = rest
+        q_prev[self.belt_body_id] = rest
+        speed = abs(float(self.belt_speed_mps))
+        dt = float(sim_dt)
+        if speed > 0.0 and dt > 1.0e-8:
+            q_prev[self.belt_body_id, 0] = np.float32(self._belt_rest_pos[0] + speed * dt)
+            qd[self.belt_body_id, 0] = np.float32(-speed)
+        return q_prev, q_curr, qd
+
+    def _assign_bodies(self, q: np.ndarray, qd: np.ndarray) -> None:
+        q_wp = self._wp.array(q, dtype=self._wp.transform)
+        qd_wp = self._wp.array(qd, dtype=self._wp.spatial_vector)
+        self.state_0.body_q.assign(q_wp)
+        self.state_0.body_qd.assign(qd_wp)
+        self.state_1.body_q.assign(q_wp)
+        self.state_1.body_qd.assign(qd_wp)
+
+    @staticmethod
+    def _clamped_velocity(pos: np.ndarray, prev: np.ndarray, dt: float) -> np.ndarray:
+        if dt <= 1e-8:
+            return np.zeros(3, dtype=np.float64)
+        vel = (pos - prev) / dt
+        speed = float(np.linalg.norm(vel))
+        if speed > _MAX_KINEMATIC_SPEED_M_S:
+            vel = vel * (_MAX_KINEMATIC_SPEED_M_S / speed)
+        return vel
+
+    def _sync_kinematics(self, dt: float, *, first: bool, update_history: bool) -> None:
+        cache = UsdGeom.XformCache()
+        _q_prev, q, qd = self._empty_body_state(sim_dt=0.0)
+        for item in self._kinematics:
+            pos, quat = self._body_transform(item, cache)
+            q[item.body_id] = np.array([*pos, *quat], dtype=np.float32)
+            if not first and item.prev_pos is not None:
+                vel = self._clamped_velocity(pos, item.prev_pos, dt)
+                qd[item.body_id, :3] = vel.astype(np.float32)
+            if update_history:
+                item.prev_pos = pos.copy()
+                item.prev_quat = quat.copy()
+        self._assign_bodies(q, qd)
+
+    def step(self, dt: float) -> None:
+        """同步 kinematic 代理,跑若干 VBD 子步,写回可视网格."""
+        frame_dt = float(dt) if dt > 1e-8 else self.frame_dt
+        cache = UsdGeom.XformCache()
+        samples: list[
+            tuple[_KinematicBody, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        ] = []
+        for item in self._kinematics:
+            pos, quat = self._body_transform(item, cache)
+            prev_pos = item.prev_pos if item.prev_pos is not None else pos
+            prev_quat = item.prev_quat if item.prev_quat is not None else quat
+            jump = float(np.linalg.norm(np.asarray(pos, dtype=np.float64) - prev_pos))
+            if jump > 0.08:
+                prev_pos = pos.copy()
+                prev_quat = quat.copy()
+                vel = np.zeros(3, dtype=np.float64)
+            else:
+                vel = self._clamped_velocity(pos, prev_pos, frame_dt)
+            samples.append((item, prev_pos, pos, prev_quat, quat, vel))
+
+        self.soft_solver.rebuild_bvh(self.state_0)
+        substeps = max(1, int(round(frame_dt / self.sim_dt)))
+        sim_dt = frame_dt / substeps
+        for index in range(substeps):
+            alpha_in = index / substeps
+            alpha_out = (index + 1) / substeps
+            q_in, q_out, qd = self._empty_body_state(sim_dt=sim_dt)
+            for item, prev_pos, pos, prev_quat, quat, vel in samples:
+                pos_in = (1.0 - alpha_in) * prev_pos + alpha_in * pos
+                pos_out = (1.0 - alpha_out) * prev_pos + alpha_out * pos
+                quat_in = prev_quat if alpha_in < 1.0 else quat
+                q_in[item.body_id] = np.array([*pos_in, *quat_in], dtype=np.float32)
+                q_out[item.body_id] = np.array([*pos_out, *quat], dtype=np.float32)
+                qd[item.body_id, :3] = vel.astype(np.float32)
+            self.state_0.body_q.assign(self._wp.array(q_in, dtype=self._wp.transform))
+            self.state_0.body_qd.assign(self._wp.array(qd, dtype=self._wp.spatial_vector))
+            self.state_1.body_q.assign(self._wp.array(q_out, dtype=self._wp.transform))
+            self.state_1.body_qd.assign(self._wp.array(qd, dtype=self._wp.spatial_vector))
+            self.state_0.clear_forces()
+            self.state_1.clear_forces()
+            self.collision_pipeline.collide(self.state_0, self.contacts)
+            self.soft_solver.step(self.state_0, self.state_1, self.control, self.contacts, sim_dt)
+            self.state_0, self.state_1 = self.state_1, self.state_0
+            self.state_0.body_q.assign(self._wp.array(q_out, dtype=self._wp.transform))
+            self.state_0.body_qd.assign(self._wp.array(qd, dtype=self._wp.spatial_vector))
+        for item, _, pos, _, quat, _ in samples:
+            item.prev_pos = pos.copy()
+            item.prev_quat = quat.copy()
+        self._assert_bag_sane()
+        self.write_surface_to_usd()
+
+    def _assert_bag_sane(self) -> None:
+        nodes = self.particle_positions()
+        if nodes.size == 0 or not np.all(np.isfinite(nodes)):
+            raise RuntimeError("Newton 粒子位置无效")
+        span = nodes.max(axis=0) - nodes.min(axis=0)
+        center = nodes.mean(axis=0)
+        if np.any(span > _MAX_BAG_SPAN_M) or float(center[2]) < 0.5:
+            raise RuntimeError(f"Newton 袋子不稳定: span={span}, center={center}")
+
+    def particle_positions(self) -> np.ndarray:
+        """全部仿真节点世界坐标,含内部中心."""
+        return np.asarray(self.state_0.particle_q.numpy(), dtype=np.float64).reshape(-1, 3)
+
+    def particle_velocities(self) -> np.ndarray:
+        return np.asarray(self.state_0.particle_qd.numpy(), dtype=np.float64).reshape(-1, 3)
+
+    def surface_positions(self) -> np.ndarray:
+        return self.particle_positions()[: self.surface_count]
+
+    def com(self) -> np.ndarray:
+        nodes = self.particle_positions()
+        return nodes.mean(axis=0)
+
+    def aabb(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        nodes = self.surface_positions()
+        minimum = nodes.min(axis=0)
+        maximum = nodes.max(axis=0)
+        return minimum, maximum, 0.5 * (minimum + maximum)
+
+    def soft_contact_count(self) -> int:
+        """当前粒子-形状接触数,抓取调参用."""
+        count = self.contacts.soft_contact_count
+        if hasattr(count, "numpy"):
+            count = count.numpy()
+        return int(np.asarray(count).reshape(-1)[0])
+
+    def contact_breakdown(self) -> dict[str, int]:
+        """把软接触按世界支撑 / 出带 / 指垫拆开,判断是夹住了还是只坐在皮带上."""
+        total = self.soft_contact_count()
+        counts = {"total": total, "world": 0, "belt": 0, "finger": 0}
+        if total <= 0:
+            return counts
+        shapes = np.asarray(self.contacts.soft_contact_shape.numpy(), dtype=np.int32).reshape(-1)[
+            :total
+        ]
+        body_of = np.asarray(self.model.shape_body.numpy(), dtype=np.int32).reshape(-1)
+        finger_ids = {item.body_id for item in self._kinematics}
+        for shape_id in shapes.tolist():
+            if shape_id < 0 or shape_id >= len(body_of):
+                continue
+            body_id = int(body_of[shape_id])
+            if body_id < 0:
+                counts["world"] += 1
+            elif body_id == int(self.belt_body_id):
+                counts["belt"] += 1
+            elif body_id in finger_ids:
+                counts["finger"] += 1
+        return counts
+
+    def finger_debug(self) -> list[dict[str, object]]:
+        """抓取验收用:指垫世界位姿相对袋子 AABB."""
+        cache = UsdGeom.XformCache()
+        bag_min, bag_max, bag_center = self.aabb()
+        rows: list[dict[str, object]] = [
+            {
+                "bag_min": bag_min.tolist(),
+                "bag_max": bag_max.tolist(),
+                "bag_center": bag_center.tolist(),
+                "contacts": self.contact_breakdown(),
+            }
+        ]
+        for item in self._kinematics:
+            pos, _ = self._body_transform(item, cache)
+            rows.append(
+                {
+                    "prim": item.prim_path.rsplit("/", 1)[-1],
+                    "side": item.side,
+                    "pos": np.round(pos, 4).tolist(),
+                    "half": np.round(item.half_extents, 4).tolist(),
+                    "local": np.round(item.local_center, 4).tolist(),
+                    "dist_aabb": round(_point_aabb_distance(pos, bag_min, bag_max), 4),
+                    "dist_center": round(float(np.linalg.norm(pos - bag_center)), 4),
+                }
+            )
+        return rows
+
+    def write_surface_to_usd(self) -> None:
+        """把 Newton 表面节点变回 Mesh 局部坐标,保留 UV/材质."""
+        nodes = self.surface_positions()
+        local = [
+            self._world_to_local.Transform(Gf.Vec3d(float(p[0]), float(p[1]), float(p[2])))
+            for p in nodes
+        ]
+        self._mesh.GetPointsAttr().Set([Gf.Vec3f(p[0], p[1], p[2]) for p in local])
+
 
 _LOGGER = get_logger("ProM6Relay")
 
@@ -58,67 +1355,110 @@ def _log(*parts: object) -> None:
     _LOGGER.info(" ".join(str(part) for part in parts))
 
 
-# =============================================================================
-# Scene, physics, grasp, and motion configuration
-# =============================================================================
-
 ROBOT_PATH = "/World/Pro_m6_696_dynamics_fixed"
+
 CLOTHING_ROOT_PATH = "/World/ImportedBaggedClothing"
+
 CLOTHING_SURFACE_PATH = "/World/ImportedBaggedClothing/Asset/visual/visual"
+
 CLOTHING_VOLUME_PROXY_PATH = "/World/ImportedBaggedClothing/Asset/visual/visual_proxy"
-# SUPPORT_PATH = "/World/platform/Empty/Plane/Plane_002"
+
 SUPPORT_PATH = "/World/platform/Empty/Plane/Plane_002"
+
 BELT_PATH = "/World/ConveyorBelt_A06/Belt"
+
 LEFT_GRIPPER_PATH = f"{ROBOT_PATH}/robotiq_left"
+
 RIGHT_GRIPPER_PATH = f"{ROBOT_PATH}/robotiq_right"
 
 RUNTIME_ROOT_PATH = "/World/ProM6_LeftClothingDragRuntime"
+
 ANCHOR_PATH = f"{RUNTIME_ROOT_PATH}/ClothingGraspFrame"
+
 ATTACHMENT_SCOPE_PATH = f"{RUNTIME_ROOT_PATH}/Attachments"
+
 ATTACHMENT_PATH = f"{ATTACHMENT_SCOPE_PATH}/Surface"
 
 REPLAY_CACHE_SCHEMA_VERSION = 1
+
 try:
     _SCRIPT_DIR = Path(__file__).resolve().parent
 except NameError:
     _SCRIPT_DIR = Path.cwd()
+
 REPLAY_CACHE_DIRECTORY = Path(
     os.environ.get(
         "PRO_M6_REPLAY_CACHE_DIRECTORY",
         str(_SCRIPT_DIR / "pro_m6_replay_cache"),
     )
 )
+
 REPLAY_CACHE_FILE_PREFIX = "pro_m6_clothing_drag_"
 
 PHYSICS_DEVICE = "cuda:0"
+
 GPU_COLLISION_STACK_SIZE_MIB = 192
+
 NOMINAL_PHYSICS_HZ = 60.0
 
 GRASP_EDGE_INSET_M = 0.022
+
 LEFT_GRASP_FROM_CENTER_FRAC = 0.20  # 左抓 X 从袋心往 -X 偏,咬袋体而不是 +X 薄边
+
 LEFT_GRASP_Y_INSET_M = 0.045  # 从袋 +Y 边往里咬实体;贴边会推走,再往里常是空腔
+
 LEFT_GRASP_BITE_M = 0.008  # 相对 AABB 顶再往下咬,合爪时袋会瘪
+
 LEFT_MIN_FINGER_CONTACTS = 40  # 入带袋更鼓,接触峰值约 50;80 会过压把袋捅穿
+
 LEFT_LIFT_MAX_WORLD_CONTACTS = 10  # 提起后袋身仍大量贴入带,说明只掐到边
+
+LEFT_LIFT_CLEARANCE_HOLD_S = 0.25
+
+LEFT_LIFT_CLEARANCE_STEP_M = 0.02
+
+LEFT_LIFT_MAX_EXTRA_HEIGHT_M = 0.06
+
+LEFT_LIFT_MAX_HEIGHT_M = 0.35
+
 LEFT_GRASP_DIP_STEP_M = 0.005
+
 LEFT_GRASP_DIP_MAX_M = 0.020
+
 RIGHT_GRASP_EDGE_INSET_M = 0.035  # 右爪从 -X 边再往里探,避开变形后的空边
+
 RIGHT_GRASP_FROM_CENTER_FRAC = 0.20  # 从袋心往 -X 偏半宽的这一比例,咬实体而不是薄边
+
 RIGHT_GRASP_BITE_M = 0.008  # 相对当前 AABB 顶再往下咬,合爪时袋会瘪
+
 RIGHT_MIN_FINGER_CONTACTS = 80  # 右提之前 Newton 指垫接触数;不够就继续下压
+
 RIGHT_GRASP_DIP_STEP_M = 0.005
+
 RIGHT_GRASP_DIP_MAX_M = 0.020
+
 GRIPPER_SURFACE_OFFSET_M = -0.014
+
 GRASP_MASK_SIZE_M = np.array([0.080, 0.080, 0.030], dtype=np.float64)
+
 PREGRASP_CLEARANCE_M = 0.080
+
 LOW_LIFT_HEIGHT_M = 0.28
+
 PLACEMENT_CLEARANCE_M = 0.002
+
 LEFT_LOWER_DISTANCE_OFFSET_M = 0.025  # Meters: positive lowers farther; negative lowers less.
+
 LEFT_RETRACT_HEIGHT_M = 0.28  # 松爪后先抬高再回 ready,避免关节插值把袋带走
+
 LEFT_RETRACT_HOLD_S = 1.2  # 张开后降摩擦再停一拍,让袋从指垫脱落
+
 LEFT_RETURN_CLEAR_X_OFFSET_M = 0.40  # 只往 +X 挪开;改 Y 会把袋拖出皮带 Y 范围
+
 LEFT_PAD_RETRACT_M = 0.30  # 松爪时指垫沿 TCP -Z 瞬移抽离,避免 VBD 扫掠把袋拉走
+
 PAD_RETRACT_HOLD_FRAMES = 6
+
 LEFT_PAD_CLEAR_GAP_M = 0.04  # 指垫距袋 AABB 超过此值即视为已脱离,不再等接触归零
 
 LEFT_READY_JOINTS = np.array(
@@ -126,7 +1466,7 @@ LEFT_READY_JOINTS = np.array(
     [0.10, 0.10, 0.10, -1.50, 0.0, 0.0, -1.30],
     dtype=np.float64,
 )
-# Pro-m6 left/right mirror convention negates Joint1, Joint3, and Joint7.
+
 RIGHT_READY_JOINTS = np.array(
     # [0.05, 0.65, -0.65, -1.25, -0.90, 0.30, 0.35],
     [-0.10, 0.10, -0.10, -1.50, 0.0, 0.0, 1.30],
@@ -190,7 +1530,6 @@ class TimingConfig:
         return self
 
 
-# Edit this one object to tune the task timing from the Isaac Sim Script Editor.
 TASK_TIMING = TimingConfig(
     settle_seconds=2.0,
     waiting_seconds=1.0,
@@ -222,84 +1561,135 @@ TASK_TIMING = TimingConfig(
 )
 
 LEFT_MAX_JOINT_SPEED_RAD_S = 0.9
+
 RIGHT_MAX_JOINT_SPEED_RAD_S = 0.9
 
 RIGHT_LIFT_HEIGHT_M = 0.28  # Independent world-Z lift; finite >= 0.
+
 RIGHT_DRAG_LOWER_DISTANCE_M = 0.02  # 短拖时略降,右臂 IK 比悬空 28cm 拖更稳
+
 RIGHT_DRAG_SPEED_M_S = 0.140
+
 RIGHT_MAX_DRAG_DISTANCE_M = 0.56
+
 BELT_ENTRY_INSET_M = 0.010
+
 BELT_TAIL_INSET_M = 0.050  # 袋 +X 尾须进入出带这么深才松爪
 
 RELEASE_CONVEYOR_SPEED_MPS = 0.5
+
 RELEASE_CONVEYOR_DIRECTION_XY = np.array([-1.0, 0.0], dtype=np.float64)
+
 RELEASE_CONVEYOR_STOP_XY_REGION: dict[str, float] | None = None
+
 RELEASE_CONVEYOR_STOP_ON_ARRIVAL = False
+
 RELEASE_CONVEYOR_ZERO_XY_ON_EXIT = False
 
 GRIPPER_OPEN_POSITION_RAD = 0.0
+
 GRIPPER_CLOSED_POSITION_RAD = 0.8
+
 GRIPPER_POSITION_TOLERANCE_RAD = 0.050
 
 CENTER_CORRECTION_STEP_M = 0.001
+
 CENTER_RELEASE_TOLERANCE_M = 0.050
+
 MAX_CENTER_CORRECTION_M = 0.500
 
 TCP_APPROACH_POSITION_TOLERANCE_M = 0.003
+
 TCP_APPROACH_ORIENTATION_TOLERANCE_RAD = math.radians(2.0)
+
 TCP_GRASP_POSITION_TOLERANCE_M = 0.004
+
 TCP_GRASP_ORIENTATION_TOLERANCE_RAD = math.radians(2.0)
+
 TCP_LIFT_POSITION_TOLERANCE_M = 0.025
+
+LEFT_RETURN_STALL_HOLD_S = 0.5
+
 TCP_LIFT_ORIENTATION_TOLERANCE_RAD = math.radians(20.0)
+
 DRAG_ENDPOINT_TOLERANCE_M = 0.010
+
 PROGRESS_LOG_INTERVAL_FRAMES = 60
+
 MAX_DEFORMABLE_SPAN_M = 1.5
 
 IK_RANDOM_SEED = 696
+
 IK_RANDOM_SEED_COUNT = 40
+
 IK_CANDIDATE_COUNT = IK_RANDOM_SEED_COUNT + 2
+
 IK_MAX_ITERATIONS = 900
+
 IK_DAMPING = 0.035
+
 ONLINE_DLS_DAMPING = 0.06
+
 IK_MAX_JOINT_STEP_RAD = 0.035
-# Joint4 相对 Joint2 在世界 XY 上至少离开躯干这么远,才算肘外展.
+
 IK_ELBOW_OUTBOARD_MIN_M = 0.12
+
 IK_ELBOW_IN_PENALTY = 25.0
+
 IK_JOINT1_WRAP_SCORE_WEIGHT = 0.4
+
 IK_POSTURE_SCORE_WEIGHT = 0.08
+
 _SHOULDER_JOINT_INDEX = 1  # Joint2:上臂根,用来量肘外展
+
 _ELBOW_JOINT_INDEX = 3  # Joint4:肘
+
 LEFT_ELBOW_OUTWARD_XY = np.array([1.0, 0.0], dtype=np.float64)  # 左臂外侧:世界 +X
+
 RIGHT_ELBOW_OUTWARD_XY = np.array([-1.0, 0.0], dtype=np.float64)  # 右臂外侧:世界 -X
+
 IK_INNER_POSITION_TOLERANCE_M = 2.0e-5
+
 IK_INNER_ORIENTATION_TOLERANCE_RAD = 2.0e-4
+
 IK_FINAL_POSITION_TOLERANCE_M = 0.002
+
 IK_FINAL_ORIENTATION_TOLERANCE_RAD = math.radians(1.0)
+
 IK_MODEL_POSITION_TOLERANCE_M = 0.001
+
 IK_MODEL_ORIENTATION_TOLERANCE_RAD = math.radians(0.5)
+
 IK_MODEL_JACOBIAN_TOLERANCE = 5.0e-3
+
 IK_JOINT_LIMIT_MARGIN_RAD = 0.0
+
 IK_PREFERRED_SEED = np.array(
     [-0.09, 1.367, 0.861, -2.069, -2.147, 0.482, -0.761],
     dtype=np.float64,
 )
+
 RIGHT_IK_PREFERRED_SEED = IK_PREFERRED_SEED * np.array(
     [-1.0, 1.0, -1.0, 1.0, 1.0, 1.0, -1.0],
     dtype=np.float64,
 )
-# Joint3 更正,让左肘先偏到入带外侧,再让 42 种子搜索收敛.
+
 LEFT_IK_ELBOW_OUT_SEED = np.array(
     [0.20, 1.15, 1.25, -1.75, -1.60, 0.40, -0.80],
     dtype=np.float64,
 )
+
 RIGHT_IK_ELBOW_OUT_SEED = LEFT_IK_ELBOW_OUT_SEED * np.array(
     [-1.0, 1.0, -1.0, 1.0, 1.0, 1.0, -1.0],
     dtype=np.float64,
 )
 
 CALLBACK_GLOBAL_NAME = "_pro_m6_left_clothing_drag_callback_id"
+
 STOP_CALLBACK_GLOBAL_NAME = "_pro_m6_left_clothing_drag_stop_callback_id"
+
 CONTROLLER_GLOBAL_NAME = "_pro_m6_left_clothing_drag_controller"
+
 OWN_CALLBACK_GLOBAL_NAMES = (
     CALLBACK_GLOBAL_NAME,
     STOP_CALLBACK_GLOBAL_NAME,
@@ -486,11 +1876,6 @@ def build_phase_timeouts(timing: TimingConfig) -> dict[Phase, float]:
             timing.final_verify_stable_seconds + 4.5,
         ),
     }
-
-
-# =============================================================================
-# Pure geometry and numerical helpers
-# =============================================================================
 
 
 def _to_numpy(value) -> np.ndarray:
@@ -1026,6 +2411,7 @@ def solve_pregrasp_ik_42_seeds(
     search_timeout_seconds: float = 30.0,
     ready_seed: np.ndarray | None = None,
     outward_xy: np.ndarray | None = None,
+    waypoint_positions: tuple[np.ndarray, ...] = (),
 ) -> tuple[np.ndarray, dict[str, float | int]]:
     """Select one safe deterministic pregrasp branch using exactly 42 seeds.
 
@@ -1107,6 +2493,10 @@ def solve_pregrasp_ik_42_seeds(
         elbow_outboard = _elbow_outboard_m(kinematics, positions, elbow_axis)
         if elbow_outboard < IK_ELBOW_OUTBOARD_MIN_M:
             continue
+        if not _ik_waypoints_reachable(
+            kinematics, positions, waypoint_positions, target_orientation, safe_lower, safe_upper
+        ):
+            continue
         valid_solution_count += 1
         normalized_margin = np.minimum(
             (positions - lower) / np.maximum(upper - lower, 1.0e-9),
@@ -1148,6 +2538,38 @@ def solve_pregrasp_ik_42_seeds(
     }
 
 
+def _ik_waypoints_reachable(
+    kinematics: UsdArmKinematics,
+    start: np.ndarray,
+    waypoints: tuple[np.ndarray, ...],
+    orientation: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+) -> bool:
+    """Check the approach and lift with the same bounded DLS used during execution."""
+    positions = start.copy()
+    for target in waypoints:
+        for _ in range(IK_MAX_ITERATIONS):
+            point, quaternion, jacobian, _ = kinematics.forward_and_jacobian(positions)
+            error = _pose_error(point, quaternion, target, orientation)
+            if (
+                np.linalg.norm(error[:3]) <= IK_FINAL_POSITION_TOLERANCE_M
+                and np.linalg.norm(error[3:]) <= IK_FINAL_ORIENTATION_TOLERANCE_RAD
+            ):
+                break
+            positions = np.clip(
+                positions
+                + _dls_joint_delta(
+                    jacobian, error, damping=IK_DAMPING, maximum_step=IK_MAX_JOINT_STEP_RAD
+                ),
+                lower,
+                upper,
+            )
+        else:
+            return False
+    return True
+
+
 def get_world_bounds(prim: Usd.Prim) -> tuple[np.ndarray, np.ndarray]:
     """Return one finite world-axis-aligned bounding box."""
     cache = UsdGeom.BBoxCache(
@@ -1180,6 +2602,8 @@ def get_world_bounds(prim: Usd.Prim) -> tuple[np.ndarray, np.ndarray]:
 def calculate_grasp_geometry(
     clothing_bounds: tuple[np.ndarray, np.ndarray],
     support_bounds: tuple[np.ndarray, np.ndarray],
+    *,
+    centered: bool = False,
 ) -> dict[str, np.ndarray]:
     """Calculate a bag-body grasp (near AABB center) and tabletop-center translation."""
     clothing_min, clothing_max = (
@@ -1212,6 +2636,8 @@ def calculate_grasp_geometry(
     half_x = max(float(clothing_half_xy[0]), 0.04)
     grasp_x = float(clothing_center[0]) - LEFT_GRASP_FROM_CENTER_FRAC * half_x
     grasp_y = float(clothing_max[1]) - LEFT_GRASP_Y_INSET_M
+    if centered:
+        grasp_x, grasp_y = (float(v) for v in clothing_center[:2])
     grasp_x = min(max(grasp_x, float(clothing_min[0]) + inset), float(clothing_max[0]) - inset)
     grasp_y = min(max(grasp_y, float(clothing_min[1]) + inset), float(clothing_max[1]) - inset)
     attachment_center = np.array(
@@ -1436,11 +2862,6 @@ def center_exited_belt_negative_x(
     if not np.all(np.isfinite(center)):
         return False
     return bool(center[0] < bounds[0] and bounds[1] <= center[1] <= bounds[3])
-
-
-# =============================================================================
-# Stage preparation and deformable attachment helpers
-# =============================================================================
 
 
 def require_timeline_stopped(stage: Usd.Stage) -> None:
@@ -1675,11 +3096,6 @@ def restore_collision_attributes(
             attr.Clear()
 
 
-# =============================================================================
-# Successful-operation state cache
-# =============================================================================
-
-
 class SuccessfulOperationRecorder:
     """Keep live tensor state in memory and commit only a verified success."""
 
@@ -1878,11 +3294,6 @@ class SuccessfulOperationRecorder:
         return final_path
 
 
-# =============================================================================
-# Embedded deformable conveyor controller
-# =============================================================================
-
-
 class ConveyorState(Enum):
     WAITING_FOR_BELT = auto()
     TRANSPORTING = auto()
@@ -2055,11 +3466,6 @@ class DeformableConveyorController:
         _log("[ProM6ClothingDrag][conveyor] Controller cleaned")
 
 
-# =============================================================================
-# Dual-arm relay task controller
-# =============================================================================
-
-
 def validate_right_lift_height(value: float) -> float:
     value = float(value)
     if not math.isfinite(value) or value < 0.0:
@@ -2082,12 +3488,21 @@ class ProM6LeftClothingDragController:
         stage: Usd.Stage,
         timing: TimingConfig,
         articulation: Articulation | None = None,
+        keep_label_up: bool = False,
+        label_up_min_cos: float = 0.9,
+        left_lift_height_m: float = LOW_LIFT_HEIGHT_M,
+        left_setdown_offset_m: float = LEFT_LOWER_DISTANCE_OFFSET_M,
     ) -> None:
         validate_right_lift_height(RIGHT_LIFT_HEIGHT_M)
         validate_right_drag_lower_distance(RIGHT_DRAG_LOWER_DISTANCE_M)
         if not math.isfinite(float(LEFT_LOWER_DISTANCE_OFFSET_M)):
             raise ValueError("LEFT_LOWER_DISTANCE_OFFSET_M must be finite")
         self.stage = stage
+        self.keep_label_up = keep_label_up
+        self.label_up_min_cos = label_up_min_cos
+        self.left_lift_height_m = left_lift_height_m
+        self.left_setdown_offset_m = left_setdown_offset_m
+        self.label_up_cos_at_handoff: float | None = None
         self.timing = timing.validate()
         self.phase_timeouts = build_phase_timeouts(self.timing)
         self.timeline = omni.timeline.get_timeline_interface()
@@ -2164,6 +3579,7 @@ class ProM6LeftClothingDragController:
         self.clothing_bounds: tuple[np.ndarray, np.ndarray] | None = None
         self.support_bounds: tuple[np.ndarray, np.ndarray] | None = None
         self.grasp_point: np.ndarray | None = None
+        self._left_grasp_offset = np.zeros(3, dtype=np.float64)
         self.pregrasp_point: np.ndarray | None = None
         self.attachment_center: np.ndarray | None = None
         self.right_handoff_anchor_position: np.ndarray | None = None
@@ -2181,6 +3597,10 @@ class ProM6LeftClothingDragController:
         self.drag_start: np.ndarray | None = None
         self.left_lift_start: np.ndarray | None = None
         self.left_lift_target: np.ndarray | None = None
+        self._left_lift_extra_height_m = 0.0
+        self._left_lift_segment_started_at = 0.0
+        self._left_lift_segment_duration = self.timing.left_lift_seconds
+        self._left_lift_endpoint_hold_s = 0.0
         self.drag_target: np.ndarray | None = None
         self.correction_target: np.ndarray | None = None
         self.correction_origin: np.ndarray | None = None
@@ -2200,6 +3620,7 @@ class ProM6LeftClothingDragController:
         self._left_return_clear_target: np.ndarray | None = None
         self._left_return_cartesian_done = False
         self._left_return_joint_elapsed = 0.0
+        self._left_return_stall_s = 0.0
         self._left_retract_hold_s = 0.0
         self._left_close_xy_refreshed = False
         self._right_close_elapsed = 0.0
@@ -2273,10 +3694,6 @@ class ProM6LeftClothingDragController:
                 raise RuntimeError(f"Missing {label} Prim: {path}")
         if not clothing_surface.IsA(UsdGeom.Mesh) or not clothing_surface.IsActive():
             raise RuntimeError(f"Clothing surface must be one active Mesh: {CLOTHING_SURFACE_PATH}")
-        from real2sim2real.planner.newton_sorting import (
-            restore_cached_rest_mesh,
-            strip_clothing_physx,
-        )
 
         restore_cached_rest_mesh(self.stage, CLOTHING_SURFACE_PATH)
         strip_clothing_physx(
@@ -2289,7 +3706,9 @@ class ProM6LeftClothingDragController:
         self.clothing_bounds = get_world_bounds(clothing_root)
         self.support_bounds = get_world_bounds(support)
         self.belt_bounds = get_world_bounds(belt)
-        self.geometry = calculate_grasp_geometry(self.clothing_bounds, self.support_bounds)
+        self.geometry = calculate_grasp_geometry(
+            self.clothing_bounds, self.support_bounds, centered=self.keep_label_up
+        )
         self.grasp_point = self.geometry["grasp_point"].copy()
         self.pregrasp_point = self.geometry["pregrasp_point"].copy()
         self.attachment_center = self.geometry["attachment_center"].copy()
@@ -2330,7 +3749,6 @@ class ProM6LeftClothingDragController:
     def _sync_newton_jaws(self) -> None:
         if self.newton_world is None or self.left_gripper_index is None:
             return
-        from real2sim2real.planner.newton_sorting import jaw_separation_m
 
         q = self._current_dof_positions()
         left_q = float(q[self.left_gripper_index])
@@ -2651,6 +4069,7 @@ class ProM6LeftClothingDragController:
         self._left_return_clear_target = None
         self._left_return_cartesian_done = False
         self._left_return_joint_elapsed = 0.0
+        self._left_return_stall_s = 0.0
         self._left_close_xy_refreshed = False
         self._right_close_elapsed = 0.0
         self._announce_phase()
@@ -2905,7 +4324,11 @@ class ProM6LeftClothingDragController:
             np.asarray(minimum, dtype=np.float64).reshape(3).copy(),
             np.asarray(maximum, dtype=np.float64).reshape(3).copy(),
         )
-        self.geometry = calculate_grasp_geometry(self.clothing_bounds, self.support_bounds)
+        self.geometry = calculate_grasp_geometry(
+            self.clothing_bounds, self.support_bounds, centered=self.keep_label_up
+        )
+        for key in ("grasp_point", "pregrasp_point", "attachment_center"):
+            self.geometry[key] += self._left_grasp_offset
         self.grasp_point = self.geometry["grasp_point"].copy()
         self.pregrasp_point = self.geometry["pregrasp_point"].copy()
         self.attachment_center = self.geometry["attachment_center"].copy()
@@ -3013,21 +4436,55 @@ class ProM6LeftClothingDragController:
             or self.pregrasp_point is None
             or self.left_arm_lower_limits is None
             or self.left_arm_upper_limits is None
+            or self.grasp_point is None
+            or self.clothing_bounds is None
         ):
             raise RuntimeError("Pregrasp IK inputs are unavailable")
         self._write_left_q(self.left_commanded_q)
         self._set_gripper_target(GRIPPER_OPEN_POSITION_RAD)
-        selected, diagnostics = solve_pregrasp_ik_42_seeds(
-            self.usd_kinematics,
-            self.pregrasp_point,
-            self.grasp_orientation,
-            self.left_arm_lower_limits,
-            self.left_arm_upper_limits,
-            IK_JOINT_LIMIT_MARGIN_RAD,
-            search_timeout_seconds=self.timing.ik_search_timeout_seconds,
-            ready_seed=LEFT_IK_ELBOW_OUT_SEED,
-            outward_xy=LEFT_ELBOW_OUTWARD_XY,
-        )
+        # A jittered bag center can be beyond the arm's reach. Search the bag body,
+        # and verify descent/lift as well as the elevated pregrasp pose.
+        offsets = [np.zeros(3)]
+        if self.keep_label_up and self.clothing_bounds is not None:
+            half = 0.5 * (self.clothing_bounds[1] - self.clothing_bounds[0])
+            offsets.extend(
+                np.array([x * half[0], y * half[1], 0.0])
+                for x, y in ((0.0, 0.25), (0.0, 0.5), (-0.2, 0.5), (-0.2, 0.65))
+            )
+        initial_grasp = self.grasp_point.copy()
+        initial_pregrasp = self.pregrasp_point.copy()
+        last_error: RuntimeError | None = None
+        for offset in offsets:
+            grasp = initial_grasp + offset
+            pregrasp = initial_pregrasp + offset
+            waypoints = (
+                (grasp, grasp + np.array([0.0, 0.0, self.left_lift_height_m]))
+                if self.keep_label_up
+                else ()
+            )
+            try:
+                selected, diagnostics = solve_pregrasp_ik_42_seeds(
+                    self.usd_kinematics,
+                    pregrasp,
+                    self.grasp_orientation,
+                    self.left_arm_lower_limits,
+                    self.left_arm_upper_limits,
+                    IK_JOINT_LIMIT_MARGIN_RAD,
+                    search_timeout_seconds=self.timing.ik_search_timeout_seconds,
+                    ready_seed=LEFT_IK_ELBOW_OUT_SEED,
+                    outward_xy=LEFT_ELBOW_OUTWARD_XY,
+                    waypoint_positions=waypoints,
+                )
+            except RuntimeError as exc:
+                last_error = exc
+                _log(f"[ProM6ClothingDrag][IK search] Body grasp rejected: {grasp}: {exc}")
+                continue
+            self._left_grasp_offset = offset.copy()
+            self._apply_live_grasp_geometry(*self.clothing_bounds)
+            _log(f"[ProM6ClothingDrag][IK search] Reachable body offset: {offset}")
+            break
+        else:
+            raise RuntimeError("No reachable left body grasp and lift path") from last_error
         self.pregrasp_joint_target = selected.copy()
         self.pregrasp_start_q = self.left_commanded_q.copy()
         _log(
@@ -3167,8 +4624,12 @@ class ProM6LeftClothingDragController:
             tcp_position, _ = self._current_tcp()
             self.left_lift_start = tcp_position.copy()
             self.left_lift_target = tcp_position + np.array(
-                [0.0, 0.0, LOW_LIFT_HEIGHT_M], dtype=np.float64
+                [0.0, 0.0, self.left_lift_height_m], dtype=np.float64
             )
+            self._left_lift_extra_height_m = 0.0
+            self._left_lift_segment_started_at = 0.0
+            self._left_lift_segment_duration = self.timing.left_lift_seconds
+            self._left_lift_endpoint_hold_s = 0.0
             if self.newton_world is not None:
                 q = self._current_dof_positions()
                 _log(
@@ -3197,7 +4658,8 @@ class ProM6LeftClothingDragController:
     def _step_left_lift(self, dt: float) -> None:
         if self.left_lift_start is None or self.left_lift_target is None:
             raise RuntimeError("Left lift geometry is unavailable")
-        progress = _timed_smoothstep(self.phase_time, self.timing.left_lift_seconds)
+        segment_time = self.phase_time - self._left_lift_segment_started_at
+        progress = _timed_smoothstep(segment_time, self._left_lift_segment_duration)
         target = (1.0 - progress) * self.left_lift_start + progress * self.left_lift_target
         self._command_pose(target, dt)
         self._set_gripper_target(GRIPPER_CLOSED_POSITION_RAD, snap=True)
@@ -3215,11 +4677,19 @@ class ProM6LeftClothingDragController:
                 f"progress={progress:.3f}, position_error={position_error:.5f} m, "
                 f"orientation_error={math.degrees(orientation_error):.3f} deg"
             )
-        if (
-            self.phase_time >= self.timing.left_lift_seconds
+        reached = (
+            segment_time >= self._left_lift_segment_duration
             and position_error <= TCP_LIFT_POSITION_TOLERANCE_M
             and orientation_error <= TCP_LIFT_ORIENTATION_TOLERANCE_RAD
+        )
+        self._left_lift_endpoint_hold_s = _accumulate_stable_time(
+            self._left_lift_endpoint_hold_s, reached, dt
+        )
+        if reached and _stable_time_reached(
+            self._left_lift_endpoint_hold_s, LEFT_LIFT_CLEARANCE_HOLD_S
         ):
+            if self._extend_left_lift_for_clearance(tcp_position):
+                return
             self._require_lifted(self.left_lift_com_z, "left")
             _, _, center = self._node_aabb()
             self.drag_start = tcp_position.copy()
@@ -3232,6 +4702,59 @@ class ProM6LeftClothingDragController:
                 f"target={_array_string(self.drag_target)}"
             )
             self._set_phase(Phase.DRAG)
+
+    def _extend_left_lift_for_clearance(self, tcp_position: np.ndarray) -> bool:
+        """Raise a held parcel in bounded increments until height and clearance pass."""
+        if self.newton_world is None or self.left_lift_com_z is None:
+            return False
+        contacts = self.newton_world.contact_breakdown()
+        world_n = int(contacts.get("world", 0) or 0)
+        lifted = float(self._parcel_com()[2] - self.left_lift_com_z)
+        if world_n <= LEFT_LIFT_MAX_WORLD_CONTACTS and lifted >= self.min_lift_height_m:
+            return False
+        finger_n = int(contacts.get("finger", 0) or 0)
+        # A nearly lifted parcel may still need one clearance step to reach the COM gate.
+        # Keep rejecting a slipped/stuck grasp; final acceptance still checks the full height.
+        if (
+            lifted < max(0.0, self.min_lift_height_m - LEFT_LIFT_CLEARANCE_STEP_M)
+            or finger_n < LEFT_MIN_FINGER_CONTACTS
+        ):
+            return False
+        remaining = min(
+            LEFT_LIFT_MAX_EXTRA_HEIGHT_M - self._left_lift_extra_height_m,
+            LEFT_LIFT_MAX_HEIGHT_M - self.left_lift_height_m - self._left_lift_extra_height_m,
+        )
+        if remaining <= 1.0e-6:
+            return False  # Never bypass the contact check when the recovery budget is exhausted.
+        increment = min(LEFT_LIFT_CLEARANCE_STEP_M, remaining)
+        target = self.left_lift_target.copy()
+        target[2] += increment
+        if not _ik_waypoints_reachable(
+            self.usd_kinematics,
+            self.left_commanded_q,
+            (target,),
+            self.grasp_orientation,
+            self.left_arm_lower_limits + IK_JOINT_LIMIT_MARGIN_RAD,
+            self.left_arm_upper_limits - IK_JOINT_LIMIT_MARGIN_RAD,
+        ):
+            raise RuntimeError(
+                "Left parcel still contacts the infeed; clearance lift is unreachable"
+            )
+        self.left_lift_start = tcp_position.copy()
+        self.left_lift_target = target
+        self._left_lift_extra_height_m += increment
+        self._left_lift_segment_started_at = self.phase_time
+        self._left_lift_segment_duration = max(
+            0.4, self.timing.left_lift_seconds * increment / self.left_lift_height_m
+        )
+        self._left_lift_endpoint_hold_s = 0.0
+        _log(
+            "[ProM6ClothingDrag] Left lift recovery for height/clearance: "
+            f"world={world_n}, finger={finger_n}, delta_z={lifted:.4f} m, "
+            f"extra_height={self._left_lift_extra_height_m:.3f} m, "
+            f"target={_array_string(target)}"
+        )
+        return True
 
     def _step_drag(self, dt: float) -> None:
         progress = _timed_smoothstep(self.phase_time, self.timing.left_drag_seconds)
@@ -3295,7 +4818,7 @@ class ProM6LeftClothingDragController:
             self.stable_time, self.timing.center_stable_seconds
         ):
             _, _, center = self._node_aabb()
-            lower_offset = float(LEFT_LOWER_DISTANCE_OFFSET_M)
+            lower_offset = float(self.left_setdown_offset_m)
             if not math.isfinite(lower_offset):
                 raise ValueError("LEFT_LOWER_DISTANCE_OFFSET_M must be finite")
             desired_center_z = (
@@ -3452,11 +4975,39 @@ class ProM6LeftClothingDragController:
                     "[ProM6ClothingDrag] Left return skip stale contacts: "
                     f"finger={finger_n}, pads_clear={pads_clear}"
                 )
+            previous_q = self.left_commanded_q.copy()
             position_error, _, _ = self._command_pose(self._left_return_clear_target, dt)
-            if position_error <= TCP_LIFT_POSITION_TOLERANCE_M:
+            current_tcp, _ = self._current_tcp()
+            # _write_left_q clips IK commands at the joint limits. Inspect the actual
+            # command change, rather than the unclipped delta returned by _command_pose.
+            stalled = (
+                np.linalg.norm(self.left_commanded_q - previous_q) <= 1.0e-3 * dt
+                and np.linalg.norm(current_tcp - tcp_position) <= 1.0e-4 * dt
+            )
+            self._left_return_stall_s = self._left_return_stall_s + dt if stalled else 0.0
+            residual = self._left_return_clear_target - current_tcp
+            # This is an empty-hand clearance waypoint, not a grasp/placement goal.
+            # Permit joint return only near that waypoint, at the retracted height,
+            # with no bag contact. Keep all manipulation and success checks unchanged.
+            clear_at_limit = (
+                self._left_return_stall_s >= LEFT_RETURN_STALL_HOLD_S
+                and finger_n == 0
+                and pads_clear
+                and abs(float(residual[0])) <= 2.0 * TCP_LIFT_POSITION_TOLERANCE_M
+                and abs(float(residual[1])) <= TCP_LIFT_POSITION_TOLERANCE_M
+                and float(residual[2]) <= TCP_LIFT_POSITION_TOLERANCE_M
+            )
+            if position_error <= TCP_LIFT_POSITION_TOLERANCE_M or clear_at_limit:
                 self._left_return_cartesian_done = True
                 self.left_return_start_q = self.left_commanded_q.copy()
-                _log("[ProM6ClothingDrag] Left return clear reached, joint-slew to ready")
+                if clear_at_limit and position_error > TCP_LIFT_POSITION_TOLERANCE_M:
+                    _log(
+                        "[ProM6ClothingDrag] Left return IK stalled near clearance waypoint; "
+                        f"pads clear, no contact, residual={_array_string(residual)}, "
+                        "joint-slew to ready"
+                    )
+                else:
+                    _log("[ProM6ClothingDrag] Left return clear reached, joint-slew to ready")
             return
         if self.left_return_start_q is None:
             raise RuntimeError("Left return start joints are unavailable after clear")
@@ -3509,10 +5060,50 @@ class ProM6LeftClothingDragController:
             dtype=np.float64,
         )
 
+    def _right_grasp_geometry(
+        self, minimum: np.ndarray, maximum: np.ndarray
+    ) -> dict[str, np.ndarray]:
+        """计算右抓位姿，并把指垫最低点限制在平台顶面之上。"""
+        if self.newton_world is None:
+            raise RuntimeError("右抓平台安全高度需要 Newton 世界")
+        geometry = calculate_shared_attachment_grasp(self._right_grasp_patch(minimum, maximum))
+        floor_z = self.newton_world.top_down_tcp_floor_z("right", RIGHT_PLATFORM_PAD_CLEARANCE_M)
+        delta_z = max(0.0, floor_z - float(geometry["grasp_point"][2]))
+        if delta_z > 0.0:
+            for key in ("attachment_center", "grasp_point", "pregrasp_point"):
+                geometry[key] = geometry[key].copy()
+                geometry[key][2] += delta_z
+            _log(
+                "[ProM6ClothingDrag] Right grasp raised for platform clearance: "
+                f"delta_z={delta_z:.4f} m, tcp_floor_z={floor_z:.4f}"
+            )
+        return geometry
+
+    def _assert_no_right_platform_penetration(self) -> None:
+        """右臂抬升前拒绝已经落到平台碰撞面下方的软体节点。"""
+        if self.newton_world is None:
+            raise RuntimeError("右抓穿模检查需要 Newton 世界")
+        positions = np.asarray(self.newton_world.surface_positions(), dtype=np.float64)
+        limit_z = float(self.newton_world.support_top_z) - RIGHT_PLATFORM_PENETRATION_TOLERANCE_M
+        below = positions[:, 2] < limit_z
+        minimum_z = float(np.min(positions[:, 2]))
+        if np.any(below):
+            raise RuntimeError(
+                "Right grasp pushed the parcel through the platform: "
+                f"minimum_z={minimum_z:.5f}, platform_top_z="
+                f"{self.newton_world.support_top_z:.5f}, "
+                f"deep_nodes={int(np.count_nonzero(below))}"
+            )
+        _log(
+            "[ProM6ClothingDrag] Right grasp platform clearance check: "
+            f"minimum_z={minimum_z:.5f}, platform_top_z="
+            f"{self.newton_world.support_top_z:.5f}"
+        )
+
     def _refresh_right_grasp_from_live_nodes(self, *, xy: bool) -> None:
         """按当前 Newton AABB 更新右抓 TCP;合爪时只跟高度,避免袋瘪后擦顶滑脱."""
         minimum, maximum, _ = self._node_aabb()
-        geometry = calculate_shared_attachment_grasp(self._right_grasp_patch(minimum, maximum))
+        geometry = self._right_grasp_geometry(minimum, maximum)
         grasp = geometry["grasp_point"].copy()
         pregrasp = geometry["pregrasp_point"].copy()
         if xy or self.right_grasp_point is None:
@@ -3532,14 +5123,38 @@ class ProM6LeftClothingDragController:
             f"nodes_min={_array_string(minimum)}, nodes_max={_array_string(maximum)}"
         )
 
+    def _check_label_up(self) -> None:
+        """松爪并撤离后检查真实标签表面，翻折时拒绝进入右臂接力。"""
+        if not self.keep_label_up:
+            return
+        if self.newton_world is None:
+            raise RuntimeError("标签朝向检查需要 Newton 包裹表面")
+        try:
+            normal = surface_patch_normal(
+                self.newton_world.surface_positions(), self.newton_world.label_triangles
+            )
+        except ValueError as exc:
+            raise RuntimeError(f"标签朝向不可判定: {exc}") from exc
+        self.label_up_cos_at_handoff = float(normal[2])
+        _log(
+            "[ProM6ClothingDrag] Platform label-up check: "
+            f"normal={_array_string(normal)}, min_cos={self.label_up_min_cos:.3f}"
+        )
+        if self.label_up_cos_at_handoff < self.label_up_min_cos:
+            raise RuntimeError(
+                "Package label is not facing up on the platform: "
+                f"normal_z={self.label_up_cos_at_handoff:.4f} < {self.label_up_min_cos:.4f}"
+            )
+
     def _step_prepare_right_handoff(self) -> None:
+        self._check_label_up()
         self._teleport_pad_retract(0.0)
         self._write_left_q(LEFT_READY_JOINTS)
         self._write_right_ready()
         self._set_gripper_target(GRIPPER_OPEN_POSITION_RAD)
         self._set_right_gripper_target(GRIPPER_OPEN_POSITION_RAD)
         minimum, maximum, center = self._node_aabb()
-        geometry = calculate_shared_attachment_grasp(self._right_grasp_patch(minimum, maximum))
+        geometry = self._right_grasp_geometry(minimum, maximum)
         self.right_handoff_anchor_position = geometry["attachment_center"].copy()
         self.right_grasp_point = geometry["grasp_point"].copy()
         self.right_pregrasp_point = geometry["pregrasp_point"].copy()
@@ -3740,13 +5355,28 @@ class ProM6LeftClothingDragController:
         ):
             step = min(RIGHT_GRASP_DIP_STEP_M, RIGHT_GRASP_DIP_MAX_M - self._right_grasp_dip_m)
             self.right_grasp_point = np.asarray(self.right_grasp_point, dtype=np.float64).copy()
-            self.right_grasp_point[2] -= step
-            self._right_grasp_dip_m += step
-            _log(
-                "[ProM6ClothingDrag] Right grasp dip: "
-                f"finger={finger_n}, dip={self._right_grasp_dip_m:.3f} m, "
-                f"z={self.right_grasp_point[2]:.4f}"
+            if self.newton_world is None:
+                raise RuntimeError("右抓下探限制需要 Newton 世界")
+            floor_z = self.newton_world.top_down_tcp_floor_z(
+                "right", RIGHT_PLATFORM_PAD_CLEARANCE_M
             )
+            requested_z = float(self.right_grasp_point[2] - step)
+            safe_z = max(requested_z, floor_z)
+            actual_step = float(self.right_grasp_point[2] - safe_z)
+            self.right_grasp_point[2] = safe_z
+            if actual_step > 1.0e-6:
+                self._right_grasp_dip_m += actual_step
+                _log(
+                    "[ProM6ClothingDrag] Right grasp dip: "
+                    f"finger={finger_n}, dip={self._right_grasp_dip_m:.3f} m, "
+                    f"z={self.right_grasp_point[2]:.4f}"
+                )
+            else:
+                self._right_grasp_dip_m = RIGHT_GRASP_DIP_MAX_M
+                _log(
+                    "[ProM6ClothingDrag] Right grasp dip stopped at platform clearance: "
+                    f"finger={finger_n}, tcp_floor_z={floor_z:.4f}"
+                )
         position_error, orientation_error, _ = self._command_right_pose(self.right_grasp_point, dt)
         self._set_right_gripper_target(GRIPPER_CLOSED_POSITION_RAD, snap=True)
         target = float(
@@ -3780,6 +5410,7 @@ class ProM6LeftClothingDragController:
             and self.phase_time >= self.timing.right_grip_settle_seconds
             and _stable_time_reached(self.stable_time, self.timing.right_grip_stable_seconds)
         ):
+            self._assert_no_right_platform_penetration()
             self.right_handoff_tcp_position, _ = self._current_right_tcp()
             self.right_handoff_anchor_position = self.right_grasp_point.copy()
             self.right_lift_start = self.right_handoff_tcp_position.copy()
@@ -4228,3 +5859,382 @@ class ProM6LeftClothingDragController:
                     pass
                 setattr(self, attribute, None)
             globals()[global_name] = None
+
+
+class SortingPlanner(BasePlanner):
+    """Pro-M6 双臂分拣:入带抓包裹 → 平台 → 出带,Newton 接触承重.
+
+    ``place_robot``::
+
+        init_planner(robot)                    # 配 GPU 物理 + 去 PhysX 柔性 + 建 Newton 软袋
+
+    每集 ``run_episode``::
+
+        begin_episode(ep, attempt)             # 注册物理回调,状态机开始跑
+        loop: on_physics_step(robot)           # 读阶段/动作,判断本集是否结束
+        reset()                                # 重试前清回调,再重新装配
+    """
+
+    config_cls = SortingPlannerConfig
+
+    def __init__(self, config: SortingPlannerConfig | Any | None = None, **kwargs: Any) -> None:
+        """写入 ``[planner]`` 配置;控制器留到 ``init_planner`` 再建.
+
+        Args:
+            config: 已构造配置;None 则从 ``[planner]`` 加载.
+            **kwargs: 工厂多余字段,丢弃.
+
+        Returns:
+            None.
+        """
+        super().__init__()
+        self.attached = False
+        self.place_pose: Any | None = None
+        del kwargs
+        self.config: SortingPlannerConfig = config or self.config_cls.from_settings("planner")
+        self.state["timeout_s"] = float(self.config.timeout_s)
+
+        self._controller: Any | None = None  # 分拣控制器实例
+        self._robot: Any | None = None  # 已 arrange 的 ProM6Robot
+        self._callback_ids: list[int] = []  # 已注册的 SimulationManager 回调
+        self._physics_dt = 1.0 / float(self.config.physics_hz)  # manual 模式下的步长
+
+    # ============= 规划流水线 <==========
+
+    def init_planner(self, robot: Any) -> None:
+        """``place_robot`` 末尾:配 GPU 物理,去掉袋子 PhysX 柔性,建 Newton 接触世界.
+
+        Args:
+            robot: 已 ``arrange`` 的 Pro-M6 机器人.
+
+        Returns:
+            None.
+        """
+        _load_runtime_dependencies()
+
+        self._robot = robot
+        sim_world = robot.sim_world
+        assert sim_world is not None, "robot 尚未绑定 sim_world"
+        stage = sim_world.stage
+        assert stage is not None, "stage 未初始化"
+
+        cfg = self.config
+        apply_settings(
+            robot_path=cfg.robot_prim_path,
+            clothing_root_path=cfg.clothing_root_prim_path,
+            clothing_surface_path=cfg.clothing_surface_prim_path,
+            clothing_volume_proxy_path=cfg.clothing_volume_proxy_prim_path,
+            support_path=cfg.support_prim_path,
+            belt_path=cfg.belt_prim_path,
+            left_gripper_path=cfg.left_gripper_prim_path,
+            right_gripper_path=cfg.right_gripper_prim_path,
+            runtime_root_path=cfg.runtime_root_prim_path,
+            replay_cache_dir=cfg.replay_cache_dir,
+            physics_device=cfg.physics_device,
+            physics_hz=cfg.physics_hz,
+        )
+
+        sim_world.stop()
+        require_timeline_stopped(stage)
+        require_uninitialized_physics()
+        remove_owned_runtime_prims(stage)
+        configure_gpu_physics(stage)
+
+        timing = self._build_timing()
+        self._controller = ProM6LeftClothingDragController(
+            stage,
+            timing,
+            articulation=getattr(robot, "articulation", None),
+            keep_label_up=cfg.keep_label_up,
+            label_up_min_cos=cfg.label_up_min_cos,
+            left_lift_height_m=cfg.left_lift_height_m,
+            left_setdown_offset_m=cfg.left_setdown_offset_m,
+        )
+        self._controller.prepare_before_play()
+
+        finger_paths = list(cfg.left_finger_prim_paths) + list(cfg.right_finger_prim_paths)
+        if not finger_paths:
+            try:
+                finger_paths = discover_finger_meshes(
+                    stage, LEFT_GRIPPER_PATH
+                ) + discover_finger_meshes(stage, RIGHT_GRIPPER_PATH)
+            except RuntimeError:
+                finger_paths = []
+        left_tcp, right_tcp = discover_tool_centers(stage, ROBOT_PATH)
+        tcp_jaws = [(left_tcp, "left"), (right_tcp, "right")]
+        infeed_path = resolve_infeed_prim_path(stage, cfg.infeed_prim_path)
+        params = NewtonSortingParams(
+            youngs_modulus=float(cfg.youngs_modulus),
+            poisson_ratio=float(cfg.poisson_ratio),
+            density=float(cfg.density),
+            particle_radius=float(cfg.particle_radius),
+            soft_contact_mu=float(cfg.soft_contact_mu),
+            shape_mu=float(cfg.shape_mu),
+            physics_hz=float(cfg.physics_hz),
+            sim_substeps=int(cfg.newton_substeps),
+            vbd_iterations=int(cfg.vbd_iterations),
+            device=str(cfg.physics_device),
+            belt_speed_mps=float(cfg.belt_speed_mps),
+            min_lift_height_m=float(cfg.min_lift_height_m),
+        )
+        newton_world = NewtonSortingWorld(
+            stage,
+            params,
+            clothing_surface_path=cfg.clothing_surface_prim_path,
+            support_prim_path=cfg.support_prim_path,
+            belt_prim_path=cfg.belt_prim_path,
+            infeed_prim_path=infeed_path,
+            finger_prim_paths=finger_paths,
+            tcp_jaw_prims=tcp_jaws,
+            label_uv_bounds=cfg.label_uv_bounds if cfg.keep_label_up else None,
+        )
+        self._controller.bind_newton(newton_world, min_lift_height_m=float(cfg.min_lift_height_m))
+        self.state["ready"] = True
+        self._physics_dt = 1.0 / float(cfg.physics_hz)
+        self.log.info(
+            "分拣规划器已就绪",
+            drive_mode=cfg.drive_mode,
+            grasp_point=self._controller.grasp_point.tolist(),
+            support_center=self._controller.support_center.tolist(),
+            newton_particles=int(newton_world.model.particle_count),
+            infeed=infeed_path,
+            fingers=len(finger_paths),
+            left_tcp=left_tcp,
+            right_tcp=right_tcp,
+        )
+
+    def begin_episode(self, episode_index: int, *, attempt: int = 1) -> None:
+        """每集 Play 之后调用:注册物理回调,状态机从 SETTLE 开始跑.
+
+        Args:
+            episode_index: 0-based 集号,仅用于日志.
+            attempt: 1-based 尝试序号,仅用于日志.
+
+        Returns:
+            None.
+        """
+        if self._controller is None:
+            self.log.warning("尚未 init_planner,跳过 begin_episode")
+            return
+        if self.config.drive_mode == "callback":
+            self._register_callbacks()
+        self.log.info(
+            "分拣本集开始",
+            episode=episode_index,
+            attempt=attempt,
+            drive_mode=self.config.drive_mode,
+        )
+
+    def on_physics_step(self, robot: Any) -> bool:
+        """每步:manual 模式推进状态机,并把阶段/动作同步给 Job.
+
+        Args:
+            robot: 当前机器人;关节由控制器直接写,这里不用.
+
+        Returns:
+            本集是否已结束(DONE / FAILED).
+        """
+        del robot  # 关节由控制器经 Articulation 直接下发
+        controller = self._controller
+        if controller is None:
+            return True
+        if self.config.drive_mode == "manual" and not controller.cleaned:
+            try:
+                controller.step(self._physics_dt, None)
+            except Exception as exc:  # noqa: BLE001  # 与原脚本一致:失败即收尾
+                controller.fail(exc)
+        self.state["last_action"] = self._read_commanded_action(controller)
+        return self.phase in ("done", "failed")
+
+    # ============= 辅助函数 <==========
+
+    @property
+    def phase(self) -> str:
+        """控制器当前阶段;Job 用它判定 success / failed;控制器未建时取 ``state``.
+
+        Returns:
+            ``done`` / ``failed`` / 小写阶段名;控制器未建时为占位阶段.
+        """
+        controller = self._controller
+        if controller is None:
+            return str(self.state["phase"])
+        return str(controller.phase.name).lower()
+
+    def _build_timing(self) -> Any:
+        """按 ``timing_overrides`` 覆盖默认时长表.
+
+        Returns:
+            校验过的 ``TimingConfig``.
+
+        Raises:
+            ValueError: 覆盖了不存在的时长字段.
+        """
+        overrides = dict(self.config.timing_overrides)
+        if not overrides:
+            return TASK_TIMING
+        known = set(TimingConfig.__dataclass_fields__)
+        unknown = sorted(set(overrides) - known)
+        if unknown:
+            raise ValueError(f"timing_overrides 含未知字段 {unknown};可选: {sorted(known)}")
+        return replace(TASK_TIMING, **{k: float(v) for k, v in overrides.items()})
+
+    def _register_callbacks(self) -> None:
+        """注册 ``PHYSICS_POST_STEP`` 与 ``SIMULATION_STOPPED`` 回调.
+
+        与原脚本一致:物理步后推进状态机,时间轴停止时收尾.
+
+        Returns:
+            None.
+        """
+        from isaacsim.core.simulation_manager import SimulationEvent, SimulationManager
+
+        self._deregister_callbacks()
+        controller = self._controller
+        assert controller is not None
+
+        def physics_callback(dt: float, context: object) -> None:
+            try:
+                controller.step(dt, context)
+            except Exception as exc:  # noqa: BLE001  # 单帧异常转为 FAILED,不炸进程
+                controller.fail(exc)
+
+        def stopped_callback(*_args: Any, **_kwargs: Any) -> None:
+            if controller.cleaned:
+                return
+            controller.cleanup(hold_left=True)
+
+        self._callback_ids = [
+            SimulationManager.register_callback(
+                physics_callback, event=SimulationEvent.PHYSICS_POST_STEP
+            ),
+            SimulationManager.register_callback(
+                stopped_callback, event=SimulationEvent.SIMULATION_STOPPED
+            ),
+        ]
+        controller.callback_id = self._callback_ids[0]
+        controller.stop_callback_id = self._callback_ids[1]
+
+    def _deregister_callbacks(self) -> None:
+        """注销本规划器注册过的回调;重复调用安全.
+
+        Returns:
+            None.
+        """
+        if not self._callback_ids:
+            return
+        from isaacsim.core.simulation_manager import SimulationManager
+
+        for callback_id in self._callback_ids:
+            try:
+                SimulationManager.deregister_callback(callback_id)
+            except Exception:  # noqa: BLE001  # 已随时间轴停止注销过
+                pass
+        self._callback_ids = []
+
+    @staticmethod
+    def _read_commanded_action(controller: Any) -> np.ndarray | None:
+        """本步下发的双臂关节目标(左 7 + 右 7),供 recorder 落盘.
+
+        Args:
+            controller: 分拣控制器.
+
+        Returns:
+            长度 14 的关节目标;状态机尚未初始化则为 ``None``.
+        """
+        left = getattr(controller, "left_commanded_q", None)
+        right = getattr(controller, "right_commanded_q", None)
+        if left is None and right is None:
+            return None
+        parts = [np.asarray(q, dtype=float).reshape(-1) for q in (left, right) if q is not None]
+        return np.concatenate(parts)
+
+    def reset(self) -> None:
+        """重试前:收掉旧控制器与回调,再按同一配置重新装配.
+
+        Returns:
+            None.
+        """
+        self.state["phase"] = "idle"
+        self.state["last_action"] = None
+        self.attached = False
+        robot = self._robot
+        self.cleanup()
+        if robot is not None:
+            self.init_planner(robot)
+
+    def cleanup(self) -> None:
+        """Job ``close`` / 重试时调用:清临时 prim、碰撞覆盖与回调.
+
+        Returns:
+            None.
+        """
+        controller = self._controller
+        if controller is not None:
+            try:
+                controller.cleanup(hold_left=False)
+            except Exception as exc:  # noqa: BLE001  # 收尾失败不阻断 Job 退出
+                self.log.warning("清理分拣控制器失败", error=str(exc))
+        self._deregister_callbacks()
+        self._controller = None
+        self.state["ready"] = False
+
+    def get_meta(self) -> dict[str, Any]:
+        """并入 ``last_stats`` 的规划器快照.
+
+        Returns:
+            阶段、右臂拖拽距离与回放帧数.
+        """
+        controller = self._controller
+        if controller is None:
+            return {"planner_phase": self.phase}
+        recorder = getattr(controller, "replay_recorder", None)
+        return {
+            "planner_phase": self.phase,
+            "right_drag_distance_m": float(
+                getattr(controller, "right_actual_drag_distance", 0.0) or 0.0
+            ),
+            "replay_frames": int(getattr(recorder, "frame_count", 0) or 0),
+            "label_up_cos_at_handoff": controller.label_up_cos_at_handoff,
+        }
+
+    @property
+    def timeout_s(self) -> float:
+        """Job 墙钟超时(秒)."""
+        return float(self.state["timeout_s"])
+
+    @property
+    def ready(self) -> bool:
+        """求解器是否已加载成功."""
+        return bool(self.state["ready"])
+
+    @property
+    def last_action(self) -> np.ndarray | None:
+        """最近一次下发的动作副本;尚未规划时为 None."""
+        action = self.state["last_action"]
+        return None if action is None else np.asarray(action).copy()
+
+    def pick_and_place(
+        self,
+        pick_pos: np.ndarray,
+        place_pos: np.ndarray,
+        start_joint_angles: np.ndarray,
+    ) -> bool:
+        """编排抓放并规划第一段轨迹;默认不支持,返回 False.
+
+        Args:
+            pick_pos: 抓取点世界坐标.
+            place_pos: 放置点世界坐标.
+            start_joint_angles: 规划起点关节角.
+
+        Returns:
+            True 表示已编排并规划成功;默认不支持.
+        """
+        del pick_pos, place_pos, start_joint_angles
+        return False
+
+    @property
+    def log(self) -> Any:
+        """返回绑定组件名的日志器。"""
+        return get_logger(f"{type(self).__module__}.{type(self).__qualname__}").bind(
+            component=type(self).__qualname__
+        )

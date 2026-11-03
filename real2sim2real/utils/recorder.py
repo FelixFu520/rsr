@@ -26,7 +26,7 @@ from typing import Any  # parquet table / 运行时 dict
 import numpy as np  # 状态向量与图像统计
 
 from real2sim2real.core.logger import LoggerMixin  # self.log
-from real2sim2real.job.config_sorting import JobRecorderConfig  # [job.recorder] 选型
+from real2sim2real.utils.recorder_config import JobRecorderConfig  # [job.recorder] 选型
 
 # 每个 chunk 目录最多多少条 episode;与官方 DEFAULT_CHUNKS_SIZE 一致
 _CHUNKS_SIZE = 1000

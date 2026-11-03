@@ -12,7 +12,7 @@ log_file = "outputs/sorting_pro_m6/rsr.log"
 
 [sim_world]
 backend = "isaacsim"
-headless = false
+headless = true
 renderer = "RayTracedLighting"
 rt_subframes = 8
 background_usd_path = "assets/Background/Factory/factory_002/Factory_Interior.usd"
@@ -95,6 +95,13 @@ shape_mu = 1.5
 newton_substeps = 10
 vbd_iterations = 10
 min_lift_height_m = 0.08
+# 入带时标签朝上：主体中部抓取 + 较低提起 + 避免过压下放，平台松爪后校验真实标签法线。
+keep_label_up = true
+label_uv_bounds = [0.14, 0.50, 0.32, 0.615]
+label_up_min_cos = 0.9
+left_lift_height_m = 0.14
+# 若仍有袋尾接触入带，稳握后按 0.02 m 小步补抬，最多额外 0.06 m；离带检查保持开启。
+left_setdown_offset_m = 0.0
 belt_speed_mps = 0.5
 
 [job]

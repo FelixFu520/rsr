@@ -1,15 +1,4 @@
-"""Isaac Sim 仿真世界:环境检查、``SimulationApp`` / ``World`` 生命周期与步进同步.
-
-分层:
-- ``BaseSimWorld`` — 抽象生命周期接口
-- ``IsaacsimSimWorld``(本模块) — Kit App/World 启停、步进、视口辅助
-
-职责边界:
-- 本模块只负责世界建立:``SimulationApp`` + ``World``
-- 场景 / 机器人 由 Scene / Robot 在后续流水线挂入,不在此加载
-
-Job 调用顺序:``init_world`` → (Scene/Robot 摆放) → ``play``/``step`` → ``destroy_world``.
-"""
+"""Isaac Sim 世界配置与生命周期实现。"""
 
 from __future__ import annotations
 
@@ -17,9 +6,11 @@ import select
 import sys
 from typing import Any
 
-from real2sim2real.core.logger import LoggerMixin
+from pydantic import Field
+
+from real2sim2real.core.config import BaseConfig
+from real2sim2real.core.logger import get_logger
 from real2sim2real.simworld.base import BaseSimWorld
-from real2sim2real.simworld.config_isaacsim import IsaacsimSimWorldConfig
 from real2sim2real.utils.isaacsim_utils import (
     WORLD_BACKGROUND_PRIM,
     ensure_world_mount_roots,
@@ -27,7 +18,60 @@ from real2sim2real.utils.isaacsim_utils import (
 )
 
 
-class IsaacsimSimWorld(BaseSimWorld, LoggerMixin):
+class IsaacsimSimWorldConfig(BaseConfig):
+    """``[sim_world]``:仿真世界配置."""
+
+    headless: bool = Field(default=True, description="是否无头模式.")
+    renderer: str = Field(
+        default="RayTracedLighting", description="RayTracedLighting速度快, PathTracing渲染效果逼真"
+    )
+    rt_subframes: int = Field(default=8, description="光线追踪渲染器会在后台迭代多少次子步.")
+    physics_dt: float = Field(default=1.0 / 60.0, description="物理步长.")
+    rendering_dt: float = Field(default=1.0 / 30.0, description="渲染步长.")
+    device: str = Field(
+        default="",
+        description="物理设备,如 cuda / cpu;空则沿用 Isaac 默认.人形策略须 cuda",
+    )
+    physics_backend: str = Field(
+        default="",
+        description="SimulationManager backend,如 torch;空则沿用默认",
+    )
+    stage_usd_path: str = Field(
+        default="",
+        description=(
+            "整份环境 USD:直接 open 成 stage,prim 路径与原文件一致(分拣台等成品场景用);"
+            "非空时忽略 background_usd_path"
+        ),
+    )
+    background_usd_path: str = Field(default="", description="背景 USD 路径.")
+    background_prim_path: str = Field(
+        default="/World/background",
+        description=(
+            "背景引用挂到的 prim.默认 /World/background,"
+            "与 /World/scene、/World/robots 互为兄弟,避免背景尺度传到工位和机器人"
+        ),
+    )
+    background_gravity: bool = Field(
+        default=False,
+        description="背景是否受重力影响. False 时将背景刚体设为 kinematic,保留碰撞但不掉落.",
+    )
+    background_skip_metrics_assembler: bool = Field(
+        default=False,
+        description=(
+            "True 时用 pxr AddReference 挂背景,不走 Isaac Metrics Assembler."
+            "SimReady 工厂常标 metersPerUnit=0.01 但几何已是米,Assembler 会再缩 100 倍."
+        ),
+    )
+    wait_init_time: int = Field(default=30, description="仿真世界初始化后等待时间.")
+    dlss: bool = Field(default=False, description="是否启用 DLSS.")
+    auto_exposure: bool = Field(default=False, description="是否启用自动曝光.")
+    enable_newton: bool = Field(
+        default=False,
+        description=("启动后启用 Isaac 自带 isaacsim.pip.newton."),
+    )
+
+
+class IsaacsimSimWorld(BaseSimWorld):
     """Isaac Sim 世界:管理 ``SimulationApp`` / ``World`` 生命周期.
 
     职责:
@@ -50,7 +94,7 @@ class IsaacsimSimWorld(BaseSimWorld, LoggerMixin):
         Returns:
             None.
         """
-        super().__init__()  # 初始化 ABC / LoggerMixin
+        super().__init__()
         del kwargs
         self.config: IsaacsimSimWorldConfig = config or self.config_cls.from_settings("sim_world")
 
@@ -648,7 +692,7 @@ class IsaacsimSimWorld(BaseSimWorld, LoggerMixin):
             self.log.debug("相机视口已停靠", n=n, replaced="Viewport")  # 已顶替默认透视槽
         except Exception as exc:  # noqa: BLE001  # 停靠失败仍可拖浮窗,不阻断采集
             self.log.warning("停靠相机视口失败", error=str(exc))
-    
+
     def _make_background_static(self) -> None:
         """给背景补静态碰撞,并锁刚体/关节,避免 Play 后整座厂房下落.
 
@@ -693,7 +737,7 @@ class IsaacsimSimWorld(BaseSimWorld, LoggerMixin):
             joints=n_joints,
             articulations=n_art,
         )
-    
+
     def _wait_stage_loaded(self, *, max_frames: int = 600) -> None:
         """泵 Kit 直到背景引用/payload 加载完.
 
@@ -765,3 +809,10 @@ class IsaacsimSimWorld(BaseSimWorld, LoggerMixin):
             settings.set_float("/persistent/app/viewport/gizmo/constantScale", 10.0)  # 相机图标放大
         except Exception as exc:  # noqa: BLE001  # 无头或旧 Kit 没有这些键
             self.log.warning("enable_camera_gizmos_failed", error=str(exc))  # gizmo 失败不影响仿真
+
+    @property
+    def log(self) -> Any:
+        """返回绑定组件名的日志器。"""
+        return get_logger(f"{type(self).__module__}.{type(self).__qualname__}").bind(
+            component=type(self).__qualname__
+        )

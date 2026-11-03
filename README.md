@@ -102,12 +102,42 @@ uv build
      init_world -> arrange_scene -> place_robot -> start_simulation -> close
 ```
 
+### 分拣包裹采集后端
+
+采集配置为 `configs/arm-sorting-package_pro-m6-696_curobo_factory002.toml`。
+各后端将专用配置与实现放在同一文件，直接继承对应的 `Base*`：
+
+| 后端 | 实现文件 | 公开导入 |
+|------|----------|----------|
+| Job | `job/job_sorting_packages.py` | `from real2sim2real.job.job_sorting_packages import SortingJob` |
+| Planner | `planner/planner_sorting_packages.py` | `from real2sim2real.planner.planner_sorting_packages import SortingPlanner` |
+| Robot | `robot/robot_pro_m6.py` | `from real2sim2real.robot.robot_pro_m6 import ProM6Robot` |
+| Scene | `scene/scene_sorting_packages.py` | `from real2sim2real.scene.scene_sorting_packages import SortingScene` |
+| SimWorld | `simworld/isaacsim.py` | `from real2sim2real.simworld.isaacsim import IsaacsimSimWorld` |
+
+表中文件路径均相对于 `real2sim2real/`。entry points 直接指向各实现模块中的类。配置中的 `sorting`、`pro_m6`、`isaacsim` 后端名保持不变。
+Kit、USD 和控制器运行时依赖在世界初始化后加载，构造组件不会启动仿真资源。
+通用录制配置位于 `utils/recorder_config.py`，相机标注常量位于
+`utils/isaacsim_utils/camera_utils.py`。
+
+分拣示例启用了 `[planner].keep_label_up`：包裹入带时须已标签朝上。
+左臂从主体中部夹取，使用 `left_lift_height_m = 0.14` 和
+`left_setdown_offset_m = 0.0` 减少悬垂与过压翻折。平台松爪、左臂撤离后，
+按 `label_uv_bounds` 跟踪实际标签三角面；其面积加权法线的世界 Z 分量
+须达到 `label_up_min_cos = 0.9`，否则本次尝试失败，不进入右臂接力。
+默认 UV 范围对应 `bagged_clothing_000`，更换包裹纹理时须重新标定，
+这项功能不负责将入带时标签朝下的包裹主动翻面。
+
+```bash
+./app/python.sh -m real2sim2real.core.cli collect run -c configs/arm-sorting-package_pro-m6-696_curobo_factory002.toml
+```
+
 ### 核心层
 
 | 层 | 路径 | 职责 |
 |----|------|------|
 | 抽象接口 | 各模块 `{domain}/base.py` | `BaseSimWorld` / `BaseScene` / `BaseRobot` / `BasePlanner` / `BaseJob` |
-| 模块实现 | `real2sim2real/{simworld,scene,robot,planner,job}/` | ABC + section `config.py`；工厂合并在 `base.py`，后端通过 `config_cls` 指定配置类 |
+| 模块实现 | `real2sim2real/{simworld,scene,robot,planner,job}/` | ABC 与工厂位于 `base.py`；job/planner/robot/scene 的配置与各后端实现在同一文件，SimWorld 保留 `config.py`；后端通过 `config_cls` 指定配置类 |
 | 基础设施 | `real2sim2real/core/` | 配置、Registry、CLI、日志、运行时路径 |
 | 辅助函数 | `real2sim2real/utils/` | pose、recorder、validate、isaacsim_utils |
 

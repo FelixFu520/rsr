@@ -621,3 +621,22 @@ def open_robot_cameras(robot: Any, stage: Any, sim_world: Any) -> None:
         apply_camera_intrinsics(stage, cam)
         emit_log(robot, "info", "open_robot_camera", name=cam.name, prim_path=cam.prim_path)
         pump_frames(sim_world, 1)
+
+
+CAMERA_ANNOTATORS = frozenset(
+    {
+        "rgb",  # 彩色图,采集主通路
+        "rgba",
+        "distance_to_image_plane",  # 针孔深度
+        "distance_to_camera",
+        "normals",
+        "motion_vectors",
+        "semantic_segmentation",
+        "instance_segmentation",
+        "instance_id_segmentation",
+        "bounding_box_2d_tight",
+        "bounding_box_2d_loose",
+        "bounding_box_3d",
+        "pointcloud",
+    }
+)

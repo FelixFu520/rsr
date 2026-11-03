@@ -1,19 +1,15 @@
-"""分拣台场景:把场景包 USD 引用到 ``/World/scene``,登记位姿并绑第三人称相机.
-
-由 ``SortingJob.arrange_scene`` 调用.工厂背景由 SimWorld 挂到 ``/World/background``;
-本模块只挂传送带 / 平台 / 包裹所在的场景包,不改引用资产的内部尺度.
-场景包里若仍带机器人,经 ``hide_prim_paths`` 关掉,改由 Robot 模块挂到 ``/World/robots``.
-"""
+"""分拣包裹后端：配置与实现。"""
 
 from __future__ import annotations
 
 from typing import Any
 
 import numpy as np
+from pydantic import BaseModel, Field, field_validator
 
-from real2sim2real.core.logger import LoggerMixin
-from real2sim2real.scene.config_sorting import SortingSceneConfig, StagePrimConfig
-from real2sim2real.scene.scene_stage import StageScene
+from real2sim2real.core.config import BaseConfig
+from real2sim2real.core.logger import get_logger
+from real2sim2real.scene.base import BaseScene
 from real2sim2real.simworld.base import BaseSimWorld
 from real2sim2real.utils.isaacsim_utils import (
     bind_camera_sensor,
@@ -27,14 +23,158 @@ from real2sim2real.utils.isaacsim_utils import (
     spawn_camera,
     spawn_reference,
 )
+from real2sim2real.utils.isaacsim_utils.camera_utils import CAMERA_ANNOTATORS
 from real2sim2real.utils.misc import jitter_world_xy
+from real2sim2real.utils.pose import PoseConfig as Pose
 from real2sim2real.utils.pose import read_prim_world_pose
 
+
+class SceneCameraConfig(BaseModel):
+    """场景相机配置(``[[scene.cameras]]``)."""
+
+    name: str = Field(..., description="相机名称")
+    usd_path: str = Field(default="", description="相机 USD;空则创建 Camera prim")
+    prim_path: str = Field(..., description="相机实例根 prim;壳体 USD 的 Camera 可在子树")
+    authored_prim_path: str = Field(
+        default="",
+        description="TOML 里写的 prim_path;运行时改挂后仍用它做 job 视口/落盘筛选",
+    )
+    pose: Pose = Field(..., description="相机位姿")
+    pose_relative_to: str = Field(..., description="相机相对参考 prim")
+    resolution: list[int] = Field(
+        default_factory=lambda: [640, 480],
+        description="采集分辨率 [width, height]",
+    )
+    annotators: list[str] = Field(
+        default_factory=lambda: ["rgb"],
+        description="CameraSensor 采集项,如 rgb / distance_to_image_plane",
+    )
+    tick_rate: float | None = Field(
+        default=None,
+        description="传感器 Hz;空则保留 USD 内 omni:sensor:tickRate",
+    )
+    clipping_range: list[float] | None = Field(
+        default=None,
+        description="近/远裁剪面 [near, far];空则保留 USD 内 clippingRange",
+    )
+    hide_visuals: bool = Field(
+        default=True,
+        description="隐藏壳体 Mesh,避免相机自己的外观进入采集画面;视口仍显示 Camera gizmo",
+    )
+    focal_length: float | None = Field(
+        default=None,
+        description="裸相机(usd_path 为空时)焦距 mm;空则用 USD Camera 默认值",
+    )
+    horizontal_aperture: float | None = Field(
+        default=None,
+        description="裸相机水平感光尺寸 mm,与 focal_length 一起决定视场角",
+    )
+    vertical_aperture: float | None = Field(
+        default=None,
+        description="裸相机垂直感光尺寸 mm",
+    )
+
+    @field_validator("resolution")
+    @classmethod
+    def _check_resolution(cls, value: list[int]) -> list[int]:
+        """分辨率必须是两个正整数 ``[width, height]``.
+
+        Args:
+            value: TOML 里的 ``resolution``;须长度为 2 且均为正整数.
+
+        Returns:
+            规范化后的 ``[width, height]`` 整数列表.
+        """
+        if len(value) != 2 or int(value[0]) <= 0 or int(value[1]) <= 0:  # 防 0/负数让传感器崩
+            raise ValueError("resolution 须为 [width, height],且均为正整数")
+        return [int(value[0]), int(value[1])]  # 统一成 int,避免 toml 读成 float
+
+    @field_validator("annotators")
+    @classmethod
+    def _check_annotators(cls, value: list[str]) -> list[str]:
+        """至少一项,且必须在 ``CAMERA_ANNOTATORS`` 白名单内.
+
+        Args:
+            value: ``CameraSensor`` 采集项列表,如 ``rgb``.
+
+        Returns:
+            采集项列表的浅拷贝.
+        """
+        if not value:  # 空列表会导致 CameraSensor 无输出
+            raise ValueError("annotators 不能为空")
+        unknown = [item for item in value if item not in CAMERA_ANNOTATORS]  # 不在白名单的项
+        if unknown:  # 拼写错误尽早失败,不要等到 Isaac 绑 sensor
+            allowed = ", ".join(sorted(CAMERA_ANNOTATORS))  # 给调用方可读白名单
+            raise ValueError(f"未知 annotators {unknown};可选: {allowed}")
+        return list(value)  # 拷贝,避免调用方事后改原 list
+
+    @field_validator("clipping_range")
+    @classmethod
+    def _check_clipping_range(cls, value: list[float] | None) -> list[float] | None:
+        """None 表示沿用 USD;否则须 ``0 < near < far``.
+
+        Args:
+            value: ``[near, far]`` 或 None;未写则保留资产原值.
+
+        Returns:
+            ``[near, far]`` 浮点列表;未配置则为 ``None``.
+        """
+        if value is None:  # 未配置则保留资产 clippingRange
+            return None
+        # near 须为正且严格小于 far,否则 USD Camera 裁剪非法
+        if len(value) != 2 or float(value[0]) <= 0 or float(value[1]) <= float(value[0]):
+            raise ValueError("clipping_range 须为 [near, far],且 0 < near < far")
+        return [float(value[0]), float(value[1])]  # 统一 float,避免 int/str 混入 USD
+
+
+class StagePrimConfig(BaseModel):
+    """场景包里已有的 prim(``[[scene.objects]]`` 等),只记名字与路径.
+
+    分拣台把场景 USD 引用到 ``[scene].prim_path`` 下,本配置只登记子树里的物体路径.
+    """
+
+    name: str = Field(..., description="物体名称,写入 episode meta")
+    prim_path: str = Field(..., description="环境 USD 里已存在的 prim 路径")
+    grasp_type: str = Field(default="other", description="target=本轮搬运目标;other=其它")
+
+
+class SortingSceneConfig(BaseConfig):
+    """``[scene]``:分拣台场景,把场景包 USD 引用到 ``prim_path`` 下."""
+
+    usd_path: str = Field(
+        default="assets/Scene/sorting_station/composed/scene.usdc",
+        description="分拣台场景包 USD;挂到 prim_path,不改资产内部尺度",
+    )
+    prim_path: str = Field(
+        default="/World/scene", description="场景引用根;传送带/平台/包裹都在此子树"
+    )
+    hide_prim_paths: list[str] = Field(
+        default_factory=list,
+        description="引用后关掉的 prim(如场景包自带的机器人,改由 [robot] 单独引用)",
+    )
+    platform_prim_path: str = Field(
+        default="/World/scene/platform/Empty/Plane/Plane_002", description="平台支撑面 prim"
+    )
+    conveyor_in_prim_path: str = Field(
+        default="/World/scene/ConveyorBelt_A06_01", description="入带 prim;包裹初始位置"
+    )
+    conveyor_out_prim_path: str = Field(
+        default="/World/scene/ConveyorBelt_A06", description="出带 prim;包裹终点"
+    )
+    objects: list[StagePrimConfig] = Field(
+        default_factory=list, description="要跟踪位姿的物体,第一个 target 作为搬运目标"
+    )
+    cameras: list[SceneCameraConfig] = Field(
+        default_factory=list, description="第三人称等场景相机;机载相机写在 [[robot.cameras]]"
+    )
+
+
 _INFEED_JITTER_MARGIN_M = 0.02
+
 _INFEED_JITTER_MAX_TRIES = 24
 
 
-class SortingScene(StageScene, LoggerMixin):
+class SortingScene(BaseScene):
     """分拣台场景:``init_scene`` 挂 USD,``arrange`` 按 pose 摆位.
 
     ``arrange_scene``(分拣 Job)::
@@ -58,6 +198,7 @@ class SortingScene(StageScene, LoggerMixin):
             None.
         """
         super().__init__()
+        self._teleport_poses: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         del kwargs
         self.config: SortingSceneConfig = config or self.config_cls.from_settings("scene")
         self.embedded_robot_pose: tuple[np.ndarray, np.ndarray] | None = None
@@ -334,3 +475,125 @@ class SortingScene(StageScene, LoggerMixin):
         if sensor is None:
             return None
         return read_sensor_data(sensor, annotator=annotator, name=name)
+
+    def seed_poses_realtime(self) -> None:
+        """用 ``poses`` 覆盖 ``poses_realtime``;``arrange`` 结束时调用.
+
+        Returns:
+            None.
+        """
+        self.poses_realtime = dict(self.poses)
+
+    def get_prim_pose(self, prim_path: str) -> tuple[np.ndarray, np.ndarray]:
+        """返回 ``arrange`` 后缓存的世界位姿.
+
+        Args:
+            prim_path: USD prim 路径;会先 ``normalize_prim_path`` 再查 ``poses``.
+
+        Returns:
+            ``(世界 pos, wxyz)`` 元组.
+
+        Raises:
+            KeyError: 该 prim 尚未摆放.
+        """
+        pose = self.poses.get(normalize_prim_path(prim_path))  # 键与 arrange 写入时一致
+        if pose is None:
+            raise KeyError(f"尚未摆放: {prim_path}")  # 调用方应先 arrange
+        return pose  # (世界 pos, wxyz)
+
+    def set_object_world_xy(
+        self, prim_path: str, xy: np.ndarray, *, z: float | None = None
+    ) -> None:
+        """``arrange_scene`` 首次、每集重采样后、以及 ``_run_episode`` 的 reset 之后调用.
+
+        Args:
+            prim_path: 物体 USD prim 路径.
+            xy: 世界系 ``[x, y]``.
+            z: 显式世界 z;None 则沿用缓存高度或 ``floor_z``.
+        """
+        del prim_path, xy, z  # 基类无物体,子类覆盖真正挪物
+        return None
+
+    def teleport_object(
+        self,
+        prim_path: str,
+        pos: np.ndarray,
+        quat: np.ndarray | None = None,
+    ) -> None:
+        """把物体写到世界位姿,只更新 ``poses_realtime``,不改 arrange 快照.
+
+        Args:
+            prim_path: 物体 USD prim 路径.
+            pos: 世界平移 ``(x, y, z)``.
+            quat: 世界朝向 ``wxyz``;``None`` 则沿用 realtime / arrange 缓存.
+        """
+        from real2sim2real.utils.isaacsim_utils import apply_pose
+
+        path = normalize_prim_path(prim_path)
+        if quat is None:
+            cached = self.poses_realtime.get(path) or self.poses.get(path)
+            if cached is None:
+                raise KeyError(f"尚未摆放: {prim_path}")
+            quat = cached[1]
+        pos_arr = np.asarray(pos, dtype=float).reshape(3).copy()
+        quat_arr = np.asarray(quat, dtype=float).reshape(4).copy()
+        stage = None if self.sim_world is None else getattr(self.sim_world, "stage", None)
+        if stage is not None:
+            apply_pose(stage, path, pos_arr, quat_arr)
+        pose = (pos_arr, quat_arr)
+        self.poses_realtime[path] = pose
+        self._teleport_poses[path] = pose
+
+    def restore_teleported_object(self, prim_path: str) -> None:
+        """写回最近一次 ``teleport_object``;没有则退回 ``poses`` 摆放位.
+
+        Args:
+            prim_path: 物体 USD prim 路径.
+        """
+        path = normalize_prim_path(prim_path)
+        pose = self._teleport_poses.get(path) or self.poses.get(path)
+        if pose is None:
+            return
+        self.teleport_object(path, pose[0], pose[1])
+
+    def refresh_poses_realtime(self, prim_paths: list[str] | None = None) -> None:
+        """从 stage 读世界位姿写入 ``poses_realtime``.
+
+        Args:
+            prim_paths: 要刷新的 prim;``None`` 则刷新 ``poses`` 的全部键.
+        """
+        if self.sim_world is None or getattr(self.sim_world, "stage", None) is None:
+            return
+        from real2sim2real.utils.pose import read_prim_world_pose
+
+        keys = prim_paths if prim_paths is not None else list(self.poses.keys())
+        for raw in keys:
+            path = normalize_prim_path(raw)
+            pose = read_prim_world_pose(self.sim_world.stage, path)
+            if pose is not None:
+                self.poses_realtime[path] = pose
+
+    def get_prim_pose_realtime(self, prim_path: str) -> tuple[np.ndarray, np.ndarray]:
+        """返回 play 中的当前世界位姿;缺 realtime 则回退 ``poses``.
+
+        Args:
+            prim_path: USD prim 路径;会先 ``normalize_prim_path``.
+
+        Returns:
+            ``(世界 pos, wxyz)`` 元组.
+
+        Raises:
+            KeyError: ``poses_realtime`` 与 ``poses`` 都没有该 prim.
+        """
+        path = normalize_prim_path(prim_path)
+        pose = self.poses_realtime.get(path) or self.poses.get(path)
+        if pose is None:
+            raise KeyError(f"尚未摆放: {prim_path}")
+        return pose
+
+    @property
+    def log(self) -> Any:
+        """返回绑定组件名的日志器。"""
+        return get_logger(f"{type(self).__module__}.{type(self).__qualname__}").bind(
+            component=type(self).__qualname__
+        )

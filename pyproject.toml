@@ -37,11 +37,11 @@ select = ["E", "F", "I", "UP", "B"]
 
 [project.entry-points."real2sim2real.job.backends"]
 stub = "real2sim2real.job.job_stub:StubJob"
-sorting = "real2sim2real.job.job_sorting:SortingJob"
+sorting = "real2sim2real.job.job_sorting_packages:SortingJob"
 
 [project.entry-points."real2sim2real.planner.backends"]
 stub = "real2sim2real.planner.planner_stub:StubPlanner"
-sorting = "real2sim2real.planner.planner_sorting:SortingPlanner"
+sorting = "real2sim2real.planner.planner_sorting_packages:SortingPlanner"
 
 [project.entry-points."real2sim2real.robot.backends"]
 stub = "real2sim2real.robot.robot_stub:StubRobot"
@@ -49,7 +49,7 @@ pro_m6 = "real2sim2real.robot.robot_pro_m6:ProM6Robot"
 
 [project.entry-points."real2sim2real.scene.backends"]
 stub = "real2sim2real.scene.scene_stub:StubScene"
-sorting = "real2sim2real.scene.scene_sorting:SortingScene"
+sorting = "real2sim2real.scene.scene_sorting_packages:SortingScene"
 
 [project.entry-points."real2sim2real.simworld.backends"]
 stub = "real2sim2real.simworld.stub:StubSimWorld"

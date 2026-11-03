@@ -1,17 +1,4 @@
-"""``CollectJob``:在 ``BaseJob`` 固定流水线上实现按集采集的 ``simulate``.
-
-``BaseJob.simulate`` 是空接口;需要 recorder / 多集 / 重试 / 校验的采集任务继承本类,
-只覆盖做法不同的 ``*_hook``.阶段顺序仍由 ``BaseJob.run`` 固定,本类不改.
-
-``simulate`` 流程::
-
-    assert_ready_hook → show_layout_cameras → open_camera_viewports
-      → _setup_recorder                    # 无 [job.recorder] 则整轮返回
-      → collect_target_hook                # None 则整轮返回
-      → collect_episodes                   # 按集 / 尝试循环
-          └─ _collect_one_episode → run_episode → _run_collect_loop
-      → 汇总日志 → after_collect_hook
-"""
+"""分拣包裹后端：配置与实现。"""
 
 from __future__ import annotations
 
@@ -20,35 +7,306 @@ import time
 from typing import Any
 
 import numpy as np
+from pydantic import Field
 
 from real2sim2real.core.config import BaseConfig
 from real2sim2real.job.base import BaseJob
+from real2sim2real.planner.planner_sorting_packages import restore_cached_rest_mesh
+from real2sim2real.scene.scene_sorting_packages import SortingScene
 from real2sim2real.utils.recorder import LeRobotRecorder, create_recorder
+from real2sim2real.utils.recorder_config import JobRecorderConfig
 from real2sim2real.utils.validate import validate_episode
 
 
-class CollectJob(BaseJob):
-    """按集采集的 Job:开盘 → 执行 → 校验 → 成功 / 验收 / 重试."""
+class SortingJobConfig(BaseConfig):
+    """``[job]``:分拣台双臂搬运采集配置."""
 
-    # 单次 Job 运行内最多重试几次(不重启仿真)
-    _MAX_ATTEMPTS = 2
-    # 落盘校验:每路相机至少要有这么多帧
-    _MIN_CAMERA_FRAMES = 5
+    inspect_gui: bool = Field(default=False, description="是否在各流水线阶段后进入 GUI 可编辑等待")
+    num_episodes: int = Field(default=1, ge=1, description="本轮连续采集多少条 episode")
+    object_jitter_xy: float = Field(
+        default=0.06,
+        ge=0.0,
+        description="每集包裹相对入带摆放位的 XY 随机偏移半边长(m);0 则不抖",
+    )
+    object_jitter_seed: int = Field(default=0, description="偏移 RNG 种子;0 表示不固定")
+    camera_warmup_steps: int = Field(
+        default=30, description="Play 后热身步数;关节由规划器接管,这里只等相机出帧"
+    )
+    max_steps: int = Field(
+        default=6000, description="落盘帧数硬上限;分拣一趟约需数千物理步,按抽帧后计"
+    )
+    record_stride: int = Field(
+        default=0,
+        ge=0,
+        description="落盘抽帧间隔(物理步);0 表示按 physics_hz / recorder.fps 自动计算",
+    )
+    physics_hz: float = Field(
+        default=60.0, gt=0.0, description="物理频率,自动抽帧时与 [sim_world].physics_dt 对齐"
+    )
+    viewport_camera_prims: list[str] = Field(
+        default_factory=list,
+        description="GUI 视口相机 prim/名;空=全部已绑定传感器",
+    )
+    recorder: JobRecorderConfig = Field(
+        default_factory=lambda: JobRecorderConfig(
+            output_dir="outputs/sorting_pro_m6", robot_type="pro_m6"
+        ),
+        description="落盘配置,见 [job.recorder]",
+    )
 
-    def __init__(self, config: BaseConfig | None = None) -> None:
-        """加载配置并创建组件;recorder 在 ``simulate`` 里按 ``[job.recorder]`` 创建.
+
+class SortingJob(BaseJob):
+    """分拣台采集:入带 → 平台 → 出带的双臂中继,逐步落盘并校验.
+
+    ``BaseJob.run`` 固定五段;采集逻辑与任务钩子均在本类中实现。
+
+    完整流程::
+
+        run
+          ├─ (构造) IsaacsimSimWorld / SortingScene / ProM6Robot / SortingPlanner 由 BaseJob 装配
+          ├─ 1. init_world  # 基类: 工厂背景挂到 /World/background
+          ├─ 2. arrange_scene  # SortingScene: 场景包挂到 /World/scene,关掉包内机器人
+          ├─ 3. place_robot
+          │    ├─ before_place_robot_hook       # [本类] 写入场景包原机位
+          │    ├─ robot.init_robot / arrange    # ProM6Robot: 机器人 USD 挂到 /World/robots
+          │    └─ planner.init_planner
+          ├─ 4. start_simulation  # simulate 循环;本类覆盖目标与开集钩子
+          │    ├─ assert_ready_hook          # [本类] 须是 SortingScene
+          │    ├─ collect_target_hook        # [本类] 第一个 grasp_type=target
+          │    └─ for episode / attempt:
+          │         ├─ before_episode_hook            # [本类] 入带 XY 抖动 + 重建 Newton
+          │         ├─ after_reset_hook                # [本类] Play 前写回本集抖动
+          │         ├─ before_plan_hook                # [本类] 注册物理回调 + 相机热身
+          │         ├─ plan_hook               # [本类] 控制器已就绪即可进循环
+          │         ├─ stride_hook              # [本类] 按 physics_hz / fps 抽帧
+          │         ├─ playing_hook   # [本类] 状态机 DONE 会 Stop 时间轴
+          │         └─ retry_hook            # [本类] 恢复静止袋 + 同集抖动 + 重建 Newton
+          └─ 5. close  # [本类] 先清控制器再 destroy_world
+    """
+
+    config_cls = SortingJobConfig
+
+    def __init__(self, config: SortingJobConfig | Any | None = None, **kwargs: Any) -> None:
+        """占位组件;``run`` 的 finally 总会 close.
 
         Args:
-            config: 任务配置;None 则按 ``config_cls`` 从 settings 加载.
+            config: 分拣 job 配置;None 则从 settings 加载.
+            **kwargs: 丢弃.
 
         Returns:
             None.
         """
+        del kwargs
         super().__init__(config=config)
-        self.recorder: LeRobotRecorder | None = None  # simulate 按 [job.recorder] 创建
-        self.last_stats: dict[str, Any] = {}  # 最近一集步数 / 耗时等,写入 finalize.extra
+        self.recorder: LeRobotRecorder | None = None
+        self.last_stats: dict[str, Any] = {}
+        self.config: SortingJobConfig
+        seed = int(self.config.object_jitter_seed)
+        self._jitter_rng = np.random.default_rng(None if seed == 0 else seed)
+        self._object_xy_offset = np.zeros(2, dtype=float)
+        self._jitter_prim_path = ""
 
-    # ============= 采集流水线 <==========
+    # ============= 采集流水线钩子 <==========
+
+    def before_place_robot_hook(self) -> None:
+        """``place_robot`` 开头:把场景包里原机位写进机器人配置,再 ``init_robot`` / ``arrange``.
+
+        Returns:
+            None.
+        """
+        assert isinstance(self.scene, SortingScene), "sorting 需要 SortingScene"
+        assert self.robot is not None
+        if (getattr(self.robot.config, "usd_prim_path", "") or "").strip():
+            return  # 子 prim 引用已带场景包原机位,再写会叠平移
+        pose = getattr(self.scene, "embedded_robot_pose", None)
+        if pose is None:
+            return
+        from real2sim2real.utils.pose import PoseConfig
+
+        pos, quat = pose
+        self.robot.config.pose = PoseConfig(
+            position=[float(v) for v in np.asarray(pos, dtype=float).reshape(3)],
+            orientation_wxyz=[float(v) for v in np.asarray(quat, dtype=float).reshape(4)],
+        )
+        self.robot.config.pose_relative_to = "/World"
+
+    def assert_ready_hook(self) -> None:
+        """``start_simulation`` 开头:分拣采集须是 ``SortingScene``.
+
+        Returns:
+            None.
+        """
+        assert isinstance(self.scene, SortingScene), "sorting 需要 SortingScene"
+
+    def collect_target_hook(self) -> Any | None:
+        """配置里第一个 ``grasp_type=target`` 的物体;没有则整轮放弃.
+
+        Returns:
+            搬运目标;场景没有物体则为 ``None``.
+        """
+        assert isinstance(self.scene, SortingScene)
+        target = self.scene.grasp_target()
+        if target is None:
+            self.log.error("场景没有可搬运的包裹")
+            return None
+        return target
+
+    def before_episode_hook(self, target: Any, episode: int) -> None:
+        """``collect_episodes``:每集开盘之前,相对入带摆放位 XY 抖动包裹.
+
+        必须先恢复静止网格再量 AABB / 重建 Newton:上一集写回的变形表面
+        不能再做星形四面体.
+
+        Args:
+            target: 本轮搬运目标.
+            episode: 1-based 集号;抖动只吃 RNG,不吃集号.
+
+        Returns:
+            None.
+        """
+        del episode
+        self._place_clothing_for_episode(target, resample=True)
+
+    def _place_clothing_for_episode(self, target: Any, *, resample: bool) -> None:
+        """恢复静止袋 → 入带抖动(或写回本集偏移) → 停时间轴 → 重建 Newton.
+
+        Args:
+            target: 本轮搬运目标.
+            resample: True 时抽新的 XY 偏移;False 时重试本集已有偏移.
+
+        Returns:
+            None.
+        """
+
+        assert isinstance(self.scene, SortingScene)
+        assert self.planner is not None
+        assert self.sim_world is not None and self.sim_world.stage is not None
+        surface = str(self.planner.config.clothing_surface_prim_path)
+        restore_cached_rest_mesh(self.sim_world.stage, surface)
+        self._jitter_prim_path = target.prim_path
+        if resample:
+            self._object_xy_offset = self.scene.apply_object_jitter(
+                target.prim_path,
+                float(self.config.object_jitter_xy),
+                self._jitter_rng,
+                clothing_surface_prim_path=surface,
+            )
+        else:
+            self.scene.restore_teleported_object(target.prim_path)
+        self.sim_world.stop()
+        self.planner.reset()
+
+    def after_reset_hook(self) -> None:
+        """``reset`` 可能把包裹 xform 打回 USD 原位,Play 前写回本集抖动.
+
+        Returns:
+            None.
+        """
+        if self._jitter_prim_path and self.scene is not None:
+            self.scene.restore_teleported_object(self._jitter_prim_path)
+
+    def before_plan_hook(self, target: Any, *, episode: int, attempt: int) -> None:
+        """``reset_and_play`` 之后:先注册状态机回调,再热身相机.
+
+        顺序不能反:回调注册后双臂立刻被写到 ready 位,热身期间才不会因重力下垂.
+
+        Args:
+            target: 本轮搬运目标;热身不依赖它.
+            episode: 1-based 集号.
+            attempt: 1-based 尝试序号.
+
+        Returns:
+            None.
+        """
+        del target
+        assert self.planner is not None
+        assert self.robot is not None
+        self.planner.begin_episode(episode - 1, attempt=attempt)  # 规划器要 0-based 集号
+        self.robot.post_physics_init(warmup_steps=self.config.camera_warmup_steps)
+
+    def plan_hook(self, target: Any, *, episode: int, attempt: int) -> bool:
+        """本任务无独立规划段:控制器已装配即可进入执行循环.
+
+        Args:
+            target: 本轮搬运目标.
+            episode: 1-based 集号.
+            attempt: 1-based 尝试序号.
+
+        Returns:
+            规划器已就绪则为 True.
+        """
+        del target, episode, attempt
+        assert self.planner is not None
+        if not self.planner.ready:
+            self.log.error("分拣规划器未就绪")
+            return False
+        return True
+
+    def stride_hook(self) -> int:
+        """抽帧间隔:显式配置优先,否则按 ``physics_hz / recorder.fps`` 计算.
+
+        Returns:
+            至少 1 的物理步间隔.
+        """
+        if self.config.record_stride > 0:
+            return self.config.record_stride
+        fps = max(1, int(self.config.recorder.fps))
+        return max(1, round(float(self.config.physics_hz) / fps))
+
+    def playing_hook(self) -> bool:
+        """状态机 DONE / FAILED 时会 Stop 时间轴,据此结束本集.
+
+        Returns:
+            True.
+        """
+        return True
+
+    def episode_fields_hook(self, target: Any, episode: int, attempt: int) -> dict[str, Any]:
+        """写入 recorder meta / extra 的任务字段.
+
+        Args:
+            target: 本轮搬运目标.
+            episode: 1-based 集号.
+            attempt: 1-based 尝试序号.
+
+        Returns:
+            ``sorting_object`` 与 ``object_xy_offset``;集号/尝试由外层补.
+        """
+        del episode, attempt
+        return {"sorting_object": target.name, "object_xy_offset": self._object_xy_offset.tolist()}
+
+    def retry_hook(self, target: Any) -> None:
+        """校验失败或未验收时:恢复静止袋、写回本集抖动、重建 Newton.
+
+        Args:
+            target: 本轮搬运目标.
+
+        Returns:
+            None.
+        """
+        self._place_clothing_for_episode(target, resample=False)
+
+    def close(self) -> None:
+        """先清控制器留下的临时 prim 与碰撞覆盖,再销毁 World.
+
+        Returns:
+            None.
+        """
+        planner = self.planner
+        cleanup = getattr(planner, "cleanup", None)
+        if callable(cleanup):
+            try:
+                cleanup()
+            except Exception as exc:  # noqa: BLE001  # 收尾失败不阻断 destroy_world
+                self.log.warning("清理分拣规划器失败", error=str(exc))
+        exc = sys.exc_info()[1]
+        if exc is not None:
+            self.log.error("采集流程异常", error=str(exc), exc_info=exc)
+        super().close()
+
+    _MAX_ATTEMPTS = 2
+
+    _MIN_CAMERA_FRAMES = 5
 
     def simulate(self) -> None:
         """视口 → recorder → 目标 → 按集 / 尝试循环 → 汇总.
@@ -74,30 +332,6 @@ class CollectJob(BaseJob):
         n_ok, n_timeout, n_ep = self.collect_episodes(target)
         self._log_collect_finished(n_ok=n_ok, n_timeout=n_timeout, n_ep=n_ep)
         self.after_collect_hook(n_ok=n_ok, n_timeout=n_timeout, n_ep=n_ep)
-
-    def close(self) -> None:
-        """记录 ``run`` 的未处理异常,再销毁世界.
-
-        Isaac ``SimulationApp.close`` 会结束进程,异常若不在此先记日志就看不到堆栈.
-
-        Returns:
-            None.
-        """
-        exc = sys.exc_info()[1]
-        if exc is not None:
-            self.log.error("采集流程异常", error=str(exc), exc_info=exc)
-        super().close()
-
-    # ============= 采集钩子与辅助函数 <==========
-
-    def assert_ready_hook(self) -> None:
-        """``start_simulation`` 开头,公共断言之后调用.默认空.
-
-        子类检查 occupancy / 场景类型等.
-
-        Returns:
-            None.
-        """
 
     def show_layout_cameras(self) -> None:
         """把场景 / 机器人相关 prim 框进默认视口,便于 GUI 检查布局.
@@ -159,16 +393,6 @@ class CollectJob(BaseJob):
             )
         )
 
-    def collect_target_hook(self) -> Any | None:
-        """``start_simulation``:recorder 就绪后、按集循环前.
-
-        默认 None(整轮放弃).没有可采目标时返回 None 并自行打日志.
-
-        Returns:
-            目标物;没有可采目标时返回 None.
-        """
-        return None  # 基类无目标;子类返回抓取物/终点物,否则整轮放弃
-
     def collect_episodes(self, target: Any) -> tuple[int, int, int]:
         """按集开盘、尝试、计数.子类不覆盖本方法.
 
@@ -228,18 +452,6 @@ class CollectJob(BaseJob):
             True 则停下,且计数前停下时本集不计入成功或 timeout.
         """
         return False  # 搜拍在对话退出时返回 True
-
-    def before_episode_hook(self, target: Any, episode: int) -> None:
-        """``collect_episodes``:每集 ``_collect_one_episode`` 之前.默认空.
-
-        Args:
-            target: ``collect_target_hook`` 的返回值.
-            episode: 1-based 集号.
-
-        Returns:
-            None.
-        """
-        del target, episode  # 基类不用;子类按目标做抖动或重采样
 
     def _collect_one_episode(self, target: Any, ep_i: int) -> str:
         """单集:打开 recorder → 执行 → 落盘校验 → 成功 / 验收 / 重试.
@@ -328,22 +540,6 @@ class CollectJob(BaseJob):
             self.log.error("采集本集失败", episode=ep_i, attempts=self._MAX_ATTEMPTS)
         return "failed"  # 用尽 attempt 或不验收且无更多重试
 
-    def episode_fields_hook(self, target: Any, episode: int, attempt: int) -> dict[str, Any]:
-        """``_collect_one_episode``:``recorder.open`` 之前.默认空.
-
-        写入 recorder ``open.meta`` 与 ``finalize.extra`` 的任务字段.
-
-        Args:
-            target: 本轮目标物.
-            episode: 1-based 集号.
-            attempt: 1-based 尝试序号.
-
-        Returns:
-            任务侧键值(如抖动 offset / 起终点 XY);不要重复写 ``episode`` / ``attempt``.
-        """
-        del target, episode, attempt  # 基类无任务字段;子类写抖动/起终点
-        return {}  # 不要在此重复写 episode/attempt,外层会补
-
     def episode_meta(self) -> dict[str, Any]:
         """写入 recorder 的任务快照:后端、输出目录、相机,以及 scene/robot/planner.
 
@@ -408,13 +604,6 @@ class CollectJob(BaseJob):
         self.after_reset_hook()  # 默认空;分拣写回抖动位,KR210 恢复工位
         self.sim_world.play()  # 启动物理,后续 step 才推进
 
-    def after_reset_hook(self) -> None:
-        """``reset_and_play``:``reset`` 之后、``play`` 之前.默认空.
-
-        Returns:
-            None.
-        """
-
     def episode_world_hook(self, target: Any) -> None:
         """``run_episode``:``reset_and_play`` 之后、``before_plan_hook`` 之前.默认空.
 
@@ -425,37 +614,6 @@ class CollectJob(BaseJob):
             None.
         """
         del target  # 基类不用;桌面回写抖动位,导航把目标物放到 goal_xy
-
-    def before_plan_hook(self, target: Any, *, episode: int, attempt: int) -> None:
-        """``run_episode``:``episode_world_hook`` 之后、``plan_hook`` 之前.
-
-        规划前准备(热身 / ``begin_episode``);默认空.
-
-        Args:
-            target: 本轮目标物.
-            episode: 1-based 集号.
-            attempt: 1-based 尝试序号.
-
-        Returns:
-            None.
-        """
-        del target, episode, attempt  # 基类空;桌面热身 + begin_episode
-
-    def plan_hook(self, target: Any, *, episode: int, attempt: int) -> bool:
-        """``run_episode``:``before_plan_hook`` 之后、``after_plan_hook`` 之前.
-
-        本集规划;默认失败.子类写抓放或 A*.
-
-        Args:
-            target: 本轮目标物.
-            episode: 1-based 集号.
-            attempt: 1-based 尝试序号.
-
-        Returns:
-            True 表示可进执行循环.
-        """
-        del target, episode, attempt  # 基类无规划;子类写抓放或 A*
-        return False  # False → run_episode 直接记 failed,不进循环
 
     def after_plan_hook(self, target: Any) -> None:
         """``run_episode``:``plan_hook`` 成功之后、``_run_collect_loop`` 之前.
@@ -574,14 +732,6 @@ class CollectJob(BaseJob):
         """
         del target  # 基类空;导航清轨迹/抖动,桌面清抬升/合爪
 
-    def stride_hook(self) -> int:
-        """``_run_collect_loop`` 循环开始前计算抽帧间隔;默认每步都录.
-
-        Returns:
-            至少 1.
-        """
-        return 1  # 默认每物理步都录;导航按 fps/physics_dt 抽帧
-
     def episode_loop_running(self) -> bool:
         """``_run_collect_loop`` while 条件;默认看 ``is_running``.
 
@@ -595,14 +745,6 @@ class CollectJob(BaseJob):
         if self.playing_hook() and not self.sim_world.is_playing():  # 桌面 Stop 即结束
             return False
         return True  # 继续 step
-
-    def playing_hook(self) -> bool:
-        """``episode_loop_running`` 每步检查;默认 False.桌面抓放覆盖为 True.
-
-        Returns:
-            True 则 Stop 后立刻结束本集.
-        """
-        return False  # 默认不因 Stop 结束;桌面抓放覆盖为 True
 
     def command_hook(self, target: Any, *, done: bool) -> None:
         """``_run_collect_loop``:``on_physics_step`` 之后、``step`` 之前.默认空.
@@ -769,17 +911,6 @@ class CollectJob(BaseJob):
             True 则校验要求 ``status == success``.
         """
         return True  # 桌面抓放:失败/超时集不算合格;导航覆盖为 False
-
-    def retry_hook(self, target: Any) -> None:
-        """``_collect_one_episode``:校验失败或未验收时,下一 attempt 之前.默认空.
-
-        Args:
-            target: 本轮目标物.
-
-        Returns:
-            None.
-        """
-        del target  # 基类空;导航回起点,桌面回写抖动位并 planner.reset
 
     def accept_hook(self, status: str) -> bool:
         """``_collect_one_episode``:校验通过但非 success 时;默认 False.

@@ -8,9 +8,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from real2sim2real.core.config import BaseConfig
 from real2sim2real.planner.base import BasePlanner
-from real2sim2real.planner.config import StubPlannerConfig
 from real2sim2real.robot.base import BaseRobot
+
+
+class StubPlannerConfig(BaseConfig):
+    """``[planner]``:stub 规划器配置."""
 
 
 class StubPlanner(BasePlanner):
