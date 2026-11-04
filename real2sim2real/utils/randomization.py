@@ -1,4 +1,4 @@
-"""有界且可复现的包裹主体抓点采样。"""
+"""可复现的场景位置抖动与包裹主体抓点采样。"""
 
 from __future__ import annotations
 
@@ -32,3 +32,28 @@ def sample_grasp_offsets(
         if len(offsets) >= count:
             break
     return offsets
+
+
+def jitter_world_xy(
+    base_xyz: np.ndarray,
+    radius: float,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, float, float]:
+    """在 XY 上均匀抖动,Z 不变;radius<=0 则不偏移.
+
+    Args:
+        base_xyz: 世界位置 ``(x, y, z)``.
+        radius: XY 半边长(米);<=0 则原样返回.
+        rng: 随机数生成器,保证可复现.
+
+    Returns:
+        ``(pos, dx, dy)``:抖动后世界坐标与实际 XY 偏移(米).
+    """
+    pos = np.asarray(base_xyz, dtype=float).reshape(-1).copy()  # copy,避免改调用方缓存
+    dx = dy = 0.0  # radius<=0 时调用方仍要写 offset
+    if radius > 0:  # 均匀方框抖动,不是圆盘
+        dx = float(rng.uniform(-radius, radius))
+        dy = float(rng.uniform(-radius, radius))  # 与 dx 独立均匀,方框而非圆盘
+        pos[0] += dx  # 只动 XY,Z 保持原高度
+        pos[1] += dy
+    return pos, dx, dy

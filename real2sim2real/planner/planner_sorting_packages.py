@@ -23,8 +23,11 @@ from pydantic import Field, field_validator
 from real2sim2real.core.config import BaseConfig
 from real2sim2real.core.logger import get_logger
 from real2sim2real.planner.base import BasePlanner
-from real2sim2real.utils.randomization import sample_grasp_offsets
-from real2sim2real.utils.surface import surface_patch_normal, uv_patch_triangles
+from real2sim2real.utils import (
+    sample_grasp_offsets,
+    surface_patch_normal,
+    uv_patch_triangles,
+)
 
 
 def _load_runtime_dependencies() -> None:

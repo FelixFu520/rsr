@@ -21,12 +21,42 @@ import shutil  # which(ffmpeg) / rmtree
 import subprocess  # 调 ffmpeg
 from abc import ABC, abstractmethod  # 落盘器公共接口
 from pathlib import Path  # 数据集根与相对 chunk 路径
-from typing import Any  # parquet table / 运行时 dict
+from typing import Any, Literal  # parquet table / 运行时 dict / 格式白名单
 
 import numpy as np  # 状态向量与图像统计
+from pydantic import BaseModel, ConfigDict, Field
 
 from real2sim2real.core.logger import LoggerMixin  # self.log
-from real2sim2real.utils.recorder_config import JobRecorderConfig  # [job.recorder] 选型
+
+RecorderFormat = Literal["lerobot_v2", "lerobot_v3"]
+
+
+class JobRecorderConfig(BaseModel):
+    """``[job.recorder]``:采集落盘格式与路径.
+
+    ``format`` 决定实现类(``lerobot_v2``; ``lerobot_v3`` 预留).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    format: RecorderFormat = Field(
+        default="lerobot_v2",
+        description="lerobot_v2: v2.1 parquet+mp4; lerobot_v3: 预留",
+    )
+    output_dir: str = Field(default="outputs/tabletop", description="LeRobot 数据集根目录")
+    task: str = Field(default="pick and place", description="LeRobot 任务语言描述")
+    robot_type: str = Field(default="franka", description="LeRobot info.json 的 robot_type")
+    save_rgb: bool = Field(default=True, description="是否落盘 RGB")
+    save_depth: bool = Field(default=False, description="是否落盘深度;lerobot_* 暂不写")
+    export_video: bool = Field(default=True, description="是否导出各相机 mp4")
+    fps: int = Field(default=15, description="数据集 fps,同时用于导出 mp4")
+    record_camera_prims: list[str] = Field(
+        default_factory=list,
+        description=(
+            "落盘相机,按 prim/名筛选;空=全部.写组内 Camera prim 只录那一路;写壳体根则组内全录"
+        ),
+    )
+
 
 # 每个 chunk 目录最多多少条 episode;与官方 DEFAULT_CHUNKS_SIZE 一致
 _CHUNKS_SIZE = 1000
@@ -537,92 +567,6 @@ class LeRobotV2Recorder(LeRobotRecorder):
 
 class LeRobotV3Recorder(LeRobotRecorder):
     """LeRobot v3 落盘器占位;``create_recorder`` 尚未接线."""
-
-
-def is_lerobot_v2_dataset(path: str | Path) -> bool:
-    """目录下有 ``meta/info.json`` 即视为 LeRobot v2 数据集根.
-
-    Args:
-        path: 候选数据集根;可以是 str 或 ``Path``.
-
-    Returns:
-        ``True`` 当且仅当 ``meta/info.json`` 存在.
-    """
-    return (Path(path) / "meta" / "info.json").is_file()  # validate/replay 据此认 v2 根
-
-
-def list_lerobot_episodes(root: str | Path) -> list[int]:
-    """按 parquet 文件名列出数据集中的 episode_index,不依赖可能过期的 info.json.
-
-    Args:
-        root: 数据集根,其下应有 ``data/chunk-*/episode_*.parquet``.
-
-    Returns:
-        按文件名解析出的 ``episode_index`` 升序列表;无 data 目录则为空.
-    """
-    root_path = Path(root)
-    indices: list[int] = []
-    data_dir = root_path / "data"
-    if not data_dir.is_dir():
-        return indices  # 空数据集 / 尚未 finalize
-    for path in sorted(data_dir.glob("chunk-*/episode_*.parquet")):
-        try:
-            indices.append(int(path.stem.split("_")[1]))  # episode_000012 → 12
-        except (IndexError, ValueError):
-            continue  # 非约定文件名跳过,不炸整个列表
-    return indices
-
-
-def load_lerobot_episode(root: str | Path, episode_index: int) -> tuple[np.ndarray, np.ndarray]:
-    """读取一集 ``observation.state`` 与 ``action``.
-
-    Args:
-        root: 数据集根.
-        episode_index: 0-based 集号;chunk 由 ``_CHUNKS_SIZE`` 推算.
-
-    Returns:
-        ``(state, action)`` 形状 ``(T, Ds)`` / ``(T, Da)`` 的 float32.
-
-    Raises:
-        FileNotFoundError: parquet 不存在.
-        ValueError: 表中缺少必要列.
-    """
-    import pyarrow.parquet as pq  # noqa: PLC0415  # 延迟导入,CI stub 不必装 pyarrow
-
-    root_path = Path(root)
-    chunk = int(episode_index) // _CHUNKS_SIZE
-    path = root_path / _DATA_PATH.format(episode_chunk=chunk, episode_index=int(episode_index))
-    if not path.is_file():
-        raise FileNotFoundError(f"episode parquet 不存在: {path}")  # 调用方(replay)需区分缺集
-    table = pq.read_table(path, columns=["observation.state", "action"])  # 只读需要的列
-    names = set(table.column_names)
-    if "observation.state" not in names or "action" not in names:
-        raise ValueError(f"parquet 缺少 state/action 列: {path}")  # 旧格式/写盘中断
-    state = _parquet_list_column(table, "observation.state")
-    action = _parquet_list_column(table, "action")
-    return state, action
-
-
-def _parquet_list_column(table: Any, name: str) -> np.ndarray:
-    """把 parquet list 列堆成 ``(T, D)`` float32.
-
-    Args:
-        table: ``pyarrow.Table``.
-        name: 列名,如 ``observation.state``.
-
-    Returns:
-        ``(T, D)`` float32;空表为 ``(0, 0)``,变长 list 按最宽 pad.
-    """
-    rows = table.column(name).to_pylist()  # list[list[float]]
-    if not rows:
-        return np.zeros((0, 0), dtype=np.float32)  # 空表仍给二维,调用方按 shape[1] 取维
-    max_n = max((len(r or []) for r in rows), default=0)  # 变长 list pad 到最宽
-    out = np.zeros((len(rows), max_n), dtype=np.float32)
-    for i, row in enumerate(rows):
-        if row:
-            arr = np.asarray(row, dtype=np.float32).reshape(-1)
-            out[i, : arr.size] = arr[:max_n]  # 超宽截断,与 pad 对称
-    return out
 
 
 def _video_key(name: str) -> str:

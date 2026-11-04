@@ -1,145 +1,58 @@
-"""Isaac 机器人装配:夹爪臂、贴桌.
+"""机器人工具：关节、articulation 及其关联刚体的控制与配置。
 
-机型策略绑定在 ``robot_franka`` / ``robot_g1`` / ``robot_teleavatar``.
-pxr / isaacsim 仅在函数内 import,避免 stub 通路被重依赖拖垮.
+当前提供子树木偶模式切换；通用碰撞、刚体及摩擦属性工具放在 physics_utils。
+pxr / PhysxSchema 仅在函数内 import，避免 stub 通路被重依赖拖垮。
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
-
 from real2sim2real.utils.isaacsim_utils.openusd_utils import normalize_prim_path
 
 
-def add_parallel_gripper_manipulator(
-    world: Any,
-    *,
-    prim_path: str,
-    name: str,
-    ee_prim_path: str,
-    finger_joint_names: list[str],
-    open_position: float,
-    closed_position: float,
-    action_delta: float = 0.02,
-) -> Any:
-    """把已摆好的臂包成 ``SingleManipulator`` + ``ParallelGripper`` 并加入 scene.
+def set_subtree_puppet(stage: Any, root_path: str, *, enabled: bool) -> tuple[int, int, int]:
+    """拆 articulation / 关节并锁 kinematic,把子树当木偶挪根位姿.
 
-    须在 pose 摆好之后调用;真正 ``initialize`` 要等 ``world.reset()``.
+    只标 kinematic 时 PhysX 仍会解析 ArticulationRootAPI 和关节;
+    导航不需要关节动力学,关掉后只保留碰撞与 xform.
 
     Args:
-        world: Isaac ``World``;None 则返回 None.
-        prim_path: 机械臂根 prim.
-        name: World 内物体名,须唯一.
-        ee_prim_path: 末端 prim.
-        finger_joint_names: 两指关节名.
-        open_position: 单指张开位置(m).
-        closed_position: 单指闭合位置(m).
-        action_delta: 每步开合增量(m).
+        stage: 当前 USD stage;None 则返回 ``(0, 0, 0)``.
+        root_path: 子树根 prim.
+        enabled: True 拆 articulation / 关节并锁 kinematic;False 恢复.
 
     Returns:
-        ``SingleManipulator``;``world`` 为 None 则为 ``None``.
+        ``(刚体数, 关节数, 被拆/恢复的 articulation 根数)``.
     """
-    if world is None:
-        return None
-    from isaacsim.robot.manipulators import SingleManipulator
-    from isaacsim.robot.manipulators.grippers import ParallelGripper
+    if stage is None:
+        return 0, 0, 0
+    from pxr import Usd, UsdPhysics
 
-    root = normalize_prim_path(prim_path)
-    ee_prim = normalize_prim_path(ee_prim_path)
-    gripper = ParallelGripper(
-        end_effector_prim_path=ee_prim,
-        joint_prim_names=list(finger_joint_names),
-        joint_opened_positions=np.array([open_position, open_position]),
-        joint_closed_positions=np.array([closed_position, closed_position]),
-        action_deltas=np.array([action_delta, action_delta]),
-    )
-    return world.scene.add(
-        SingleManipulator(
-            prim_path=root,
-            name=name,
-            end_effector_prim_path=ee_prim,
-            gripper=gripper,
-        )
-    )
+    try:
+        from pxr import PhysxSchema
+    except ImportError:
+        PhysxSchema = None  # type: ignore[misc, assignment]
 
-
-MANIPULATOR_BASE_SUFFIXES: tuple[str, ...] = (
-    "panda_link0",
-    "g_link0",
-    "link0",
-    "base_link",
-    "panda/panda_link0",
-)
-MANIPULATOR_BASE_NAMES: frozenset[str] = frozenset(
-    {"panda_link0", "g_link0", "link0", "base_link", "base"}
-)
-
-
-def snap_base_to_support(
-    robot: Any,
-    world_pos: np.ndarray,
-    world_quat: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """把底座底面落到桌面,并把底座 XY 收进桌面 AABB.
-
-    Args:
-        robot: 机械臂实例,用 ``support_z`` / ``config`` / ``sim_world``.
-        world_pos: ``place_asset`` 合成的世界位置.
-        world_quat: ``place_asset`` 合成的世界朝向 ``wxyz``.
-
-    Returns:
-        贴合后的 ``(世界 pos, wxyz)``;量不到底座则原样返回.
-    """
-    from real2sim2real.utils.isaacsim_utils.openusd_utils import (
-        apply_pose,
-        find_prim_path,
-        get_stage,
-        is_world_frame,
-        prim_aabb,
-        prim_aabb_z_max,
-    )
-    from real2sim2real.utils.isaacsim_utils.physics_utils import pump_frames
-    from real2sim2real.utils.misc import emit_log
-    from real2sim2real.utils.pose import snap_aabb_onto_support
-
-    cfg = robot.config
-    if is_world_frame(cfg.pose_relative_to):
-        return world_pos, world_quat
-    stage = get_stage(robot.sim_world)
-    support_z = robot.support_z
-    if support_z is not None:
-        support_z = float(support_z)
-    else:
-        support_z = prim_aabb_z_max(stage, cfg.pose_relative_to)
-    table_bounds = prim_aabb(stage, cfg.pose_relative_to, gprims_only=True)
-    root = normalize_prim_path(cfg.prim_path)
-    base_path = (
-        find_prim_path(
-            stage,
-            root,
-            suffixes=MANIPULATOR_BASE_SUFFIXES,
-            names=MANIPULATOR_BASE_NAMES,
-        )
-        or root
-    )
-    apply_pose(stage, cfg.prim_path, world_pos, world_quat)
-    pump_frames(robot.sim_world, 2)
-    base_bounds = prim_aabb(stage, base_path, gprims_only=True)
-    if base_bounds is None:
-        emit_log(robot, "warning", "robot_base_aabb_missing", base_path=base_path)
-        return world_pos, world_quat
-    tmin = tmax = None
-    if table_bounds is not None:
-        tmin, tmax = table_bounds
-    snapped = snap_aabb_onto_support(
-        world_pos,
-        base_bounds[0],
-        base_bounds[1],
-        support_z=support_z,
-        rel_z=float(cfg.pose.position[2]),
-        table_min=tmin,
-        table_max=tmax,
-    )
-    return snapped, world_quat
+    root = stage.GetPrimAtPath(normalize_prim_path(root_path))
+    if root is None or not root.IsValid():
+        return 0, 0, 0
+    n_bodies = 0
+    n_joints = 0
+    n_art = 0
+    for prim in Usd.PrimRange(root):
+        if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+            if enabled:
+                prim.RemoveAPI(UsdPhysics.ArticulationRootAPI)
+                n_art += 1
+            else:
+                UsdPhysics.ArticulationRootAPI.Apply(prim)
+        if PhysxSchema is not None and prim.HasAPI(PhysxSchema.PhysxArticulationAPI):
+            PhysxSchema.PhysxArticulationAPI(prim).CreateArticulationEnabledAttr(not enabled)
+        if prim.IsA(UsdPhysics.Joint):
+            UsdPhysics.Joint(prim).CreateJointEnabledAttr(not enabled)
+            n_joints += 1
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            UsdPhysics.RigidBodyAPI(prim).CreateKinematicEnabledAttr(bool(enabled))
+            n_bodies += 1
+    return n_bodies, n_joints, n_art

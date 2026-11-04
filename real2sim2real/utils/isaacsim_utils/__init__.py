@@ -1,9 +1,12 @@
-"""Isaac Sim / USD 舞台辅助:prim 路径、挂引用、写位姿、查 AABB、绑/筛相机.
+"""Isaac Sim / USD 工具，按职责组织并在包入口统一导出常用符号。
 
-``normalize_prim_path`` / ``resolve_usd_path`` 不依赖 Kit;
-pxr / isaacsim 仅在函数内 import,避免 stub 通路被重依赖拖垮.
+- material_utils：材质 UV、网格表面区域和法线计算。
+- physics_utils：碰撞、刚体及摩擦等物理属性工具。
+- robot_utils：关节、articulation 及关联刚体控制。
+- camera_utils：相机配置、传感器与 RGB / 深度 / 点云等数据。
+- openusd_utils：USD 路径、舞台、引用、位姿、加载同步与包围盒。
 
-按处理类型拆到子模块,本包继续导出原有符号,旧 import 路径不用改.
+pxr / isaacsim 仅在函数内 import，纯 NumPy 工具可在未启动 Kit 时使用。
 """
 
 from __future__ import annotations
@@ -12,21 +15,19 @@ from real2sim2real.utils.isaacsim_utils.camera_utils import (
     apply_camera_clipping,
     apply_camera_intrinsics,
     bind_camera_sensor,
-    bind_camera_sensors,
     camera_matches_prims,
-    camera_mount_pose,
     camera_prim_path,
-    camera_stream_suffix,
     filter_camera_targets,
     hide_camera_visuals,
     iter_bound_cameras,
-    list_camera_prims,
     normalize_camera_key,
-    open_robot_cameras,
     read_sensor_data,
-    remount_camera_parent,
     resolve_annotator,
     spawn_camera,
+)
+from real2sim2real.utils.isaacsim_utils.material_utils import (
+    surface_patch_normal,
+    uv_patch_triangles,
 )
 from real2sim2real.utils.isaacsim_utils.openusd_utils import (
     WORLD_BACKGROUND_PRIM,
@@ -38,100 +39,62 @@ from real2sim2real.utils.isaacsim_utils.openusd_utils import (
     ensure_prim_loaded,
     ensure_world_mount_roots,
     ensure_xform,
-    find_prim_path,
     get_stage,
     is_descendant,
     is_world_frame,
     mark_ignore_metrics_assembler,
     normalize_prim_path,
-    open_robot_usd,
     parent_pose,
     place_asset,
     prim_aabb,
-    prim_aabb_z_max,
-    prim_aabb_z_min,
-    read_link_world_pose,
+    pump_frames,
     read_prim_world_pose,
     resolve_usd_path,
-    snap_prim_to_floor_z,
     spawn_reference,
     spawn_subprim_reference,
 )
 from real2sim2real.utils.isaacsim_utils.physics_utils import (
-    apply_joint_drive_targets,
     disable_subtree_collision,
     ensure_static_collider,
-    is_physics_tensor_ready,
-    link_pose_from_articulation,
-    pump_frames,
-    read_articulation_dof_vectors,
-    read_articulation_link_pose,
-    read_articulation_world_pose,
-    resolve_articulation_link_index,
-    set_kinematic,
-    set_subtree_puppet,
 )
-from real2sim2real.utils.isaacsim_utils.robot_utils import (
-    add_parallel_gripper_manipulator,
-    snap_base_to_support,
-)
+from real2sim2real.utils.isaacsim_utils.robot_utils import set_subtree_puppet
 
 __all__ = [
-    "add_parallel_gripper_manipulator",
     "add_usd_reference",
     "apply_camera_clipping",
     "apply_camera_intrinsics",
-    "apply_joint_drive_targets",
     "apply_pose",
     "bind_camera_sensor",
-    "bind_camera_sensors",
     "camera_matches_prims",
-    "camera_mount_pose",
     "camera_prim_path",
-    "camera_stream_suffix",
     "disable_subtree_collision",
     "ensure_prim_loaded",
     "ensure_static_collider",
     "ensure_world_mount_roots",
     "ensure_xform",
     "filter_camera_targets",
-    "find_prim_path",
     "get_stage",
     "hide_camera_visuals",
     "is_descendant",
-    "is_physics_tensor_ready",
     "is_world_frame",
     "iter_bound_cameras",
-    "link_pose_from_articulation",
-    "list_camera_prims",
     "mark_ignore_metrics_assembler",
     "normalize_camera_key",
     "normalize_prim_path",
-    "open_robot_cameras",
-    "open_robot_usd",
     "parent_pose",
     "place_asset",
     "prim_aabb",
-    "prim_aabb_z_max",
-    "prim_aabb_z_min",
     "pump_frames",
-    "read_articulation_dof_vectors",
-    "read_articulation_link_pose",
-    "read_articulation_world_pose",
-    "read_link_world_pose",
     "read_prim_world_pose",
     "read_sensor_data",
-    "remount_camera_parent",
     "resolve_annotator",
-    "resolve_articulation_link_index",
     "resolve_usd_path",
-    "set_kinematic",
     "set_subtree_puppet",
-    "snap_base_to_support",
-    "snap_prim_to_floor_z",
     "spawn_camera",
     "spawn_reference",
     "spawn_subprim_reference",
+    "surface_patch_normal",
+    "uv_patch_triangles",
     "WORLD_BACKGROUND_PRIM",
     "WORLD_MOUNT_ROOTS",
     "WORLD_ROBOTS_PRIM",

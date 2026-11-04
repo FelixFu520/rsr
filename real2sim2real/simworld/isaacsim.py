@@ -11,7 +11,7 @@ from pydantic import Field
 from real2sim2real.core.config import BaseConfig
 from real2sim2real.core.logger import get_logger
 from real2sim2real.simworld.base import BaseSimWorld
-from real2sim2real.utils.isaacsim_utils import (
+from real2sim2real.utils import (
     WORLD_BACKGROUND_PRIM,
     ensure_world_mount_roots,
     resolve_usd_path,
@@ -217,7 +217,7 @@ class IsaacsimSimWorld(BaseSimWorld):
         raw_background = "" if self.config.stage_usd_path else self.config.background_usd_path
         usd_path = resolve_usd_path(raw_background) if raw_background else ""
         if usd_path:  # 空字符串表示不要背景,只留空挂载点
-            from real2sim2real.utils.isaacsim_utils import (
+            from real2sim2real.utils import (
                 add_usd_reference,
                 ensure_prim_loaded,
                 mark_ignore_metrics_assembler,
@@ -707,7 +707,7 @@ class IsaacsimSimWorld(BaseSimWorld):
             return
         from pxr import Usd, UsdPhysics
 
-        from real2sim2real.utils.isaacsim_utils import (
+        from real2sim2real.utils import (
             ensure_static_collider,
             normalize_prim_path,
             set_subtree_puppet,

@@ -127,7 +127,7 @@ uv build
 
 表中文件路径均相对于 `real2sim2real/`。entry points 直接指向各实现模块中的类。配置中的 `sorting`、`pro_m6`、`isaacsim` 后端名保持不变。
 Kit、USD 和控制器运行时依赖在世界初始化后加载，构造组件不会启动仿真资源。
-通用录制配置位于 `utils/recorder_config.py`，相机标注常量位于
+通用录制配置与落盘实现位于 `utils/recorder.py`，相机标注常量位于
 `utils/isaacsim_utils/camera_utils.py`。
 
 分拣示例启用了 `[planner].keep_label_up`：包裹入带时须已标签朝上。
@@ -150,6 +150,8 @@ Kit、USD 和控制器运行时依赖在世界初始化后加载，构造组件�
 | 模块实现 | `real2sim2real/{simworld,scene,robot,planner,job}/` | ABC 与工厂位于 `base.py`；job/planner/robot/scene 的配置与各后端实现在同一文件，SimWorld 保留 `config.py`；后端通过 `config_cls` 指定配置类 |
 | 基础设施 | `real2sim2real/core/` | 配置、Registry、CLI、日志、运行时路径 |
 | 辅助函数 | `real2sim2real/utils/` | pose、recorder、validate、isaacsim_utils |
+
+工具的公共符号统一在 `utils/__init__.py` 导出，外部使用 `from real2sim2real.utils import ...`；实现仍按职责保留在子模块中。
 
 ### 设计约定
 

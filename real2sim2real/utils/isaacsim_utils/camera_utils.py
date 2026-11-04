@@ -1,4 +1,6 @@
-"""相机辅助:挂 Camera / 壳体、绑 Rtx 传感器、筛 prim、读 RGB / 深度等.
+"""相机工具：Camera/壳体挂载、内参与裁剪、RTX 传感器绑定、筛选及数据读取。
+
+统一负责 RGB、深度、点云和分割等相机 annotator 数据；通用 USD 操作放在 openusd_utils。
 
 pxr / isaacsim 仅在函数内 import,避免 stub 通路被重依赖拖垮.
 """
@@ -17,34 +19,9 @@ from real2sim2real.utils.isaacsim_utils.openusd_utils import (
     resolve_usd_path,
     spawn_reference,
 )
-from real2sim2real.utils.isaacsim_utils.physics_utils import (
-    disable_subtree_collision,
-    pump_frames,
-)
+from real2sim2real.utils.isaacsim_utils.physics_utils import disable_subtree_collision
 
 _LOG = get_logger(__name__)
-
-# D455 Color 看壳体 +X、画面上是壳体 +Z;配置 orientation 仍按裸 USD Camera(-Z) 写。
-_D455_FROM_USD_CAMERA_WXYZ = (0.5, -0.5, 0.5, 0.5)
-
-
-def camera_mount_pose(cam: Any) -> Any:
-    """把配置里的裸 Camera 朝向换成壳体根该写的朝向.
-
-    D455 内部 Color 不是根的 ``-Z``,直接把 look-at 四元数写到壳体上会看天。
-    其它 USD / 裸 Camera 原样返回 ``cam.pose``.
-    """
-    from real2sim2real.utils.pose import PoseConfig, quat_multiply
-
-    usd = (getattr(cam, "usd_path", None) or "").lower()
-    pose = cam.pose
-    if "d455" not in usd and "rsd455" not in usd:
-        return pose
-    pos, quat = pose.as_arrays()
-    return PoseConfig(
-        position=pos.tolist(),
-        orientation_wxyz=quat_multiply(quat, _D455_FROM_USD_CAMERA_WXYZ).tolist(),
-    )
 
 
 def spawn_camera(
@@ -77,62 +54,6 @@ def spawn_camera(
     if parent and parent != "/":
         ensure_xform(stage, parent)
     UsdGeom.Camera.Define(stage, path)
-
-
-def camera_stream_suffix(prim_name: str) -> str:
-    """把壳体里的 Camera prim 名收成落盘后缀.
-
-    Args:
-        prim_name: 如 ``Camera_OmniVision_OV9782_Color``.
-
-    Returns:
-        ``color`` / ``left`` / ``right`` / ``depth``;认不出则用小写短名.
-    """
-    name = prim_name.lower()
-    if "color" in name or name.endswith("_rgb"):
-        return "color"
-    if "left" in name:
-        return "left"
-    if "right" in name:
-        return "right"
-    if "depth" in name or "pseudo" in name:
-        return "depth"
-    cleaned = prim_name.rsplit("/", 1)[-1]
-    return cleaned.lower().replace("camera_", "").replace("camera", "cam") or "cam"
-
-
-def list_camera_prims(stage: Any, root_path: str) -> list[tuple[str, str]]:
-    """列出壳体下全部 Camera prim,``(路径, 落盘后缀)``.
-
-    Args:
-        stage: 当前 USD stage.
-        root_path: 相机实例根(壳体 Xform).
-
-    Returns:
-        Color 优先的 ``(prim_path, suffix)``;无 Camera 则为空列表.
-    """
-    path = normalize_prim_path(root_path)
-    if stage is None:
-        return []
-    from pxr import Usd
-
-    root = stage.GetPrimAtPath(path)
-    if root is None or not root.IsValid():
-        return []
-    cameras = [prim for prim in Usd.PrimRange(root) if prim.GetTypeName() == "Camera"]
-    cameras.sort(key=lambda prim: _camera_prim_priority(prim.GetName()))
-    used: set[str] = set()
-    out: list[tuple[str, str]] = []
-    for prim in cameras:
-        suffix = camera_stream_suffix(prim.GetName())
-        base = suffix
-        n = 2
-        while suffix in used:
-            suffix = f"{base}_{n}"
-            n += 1
-        used.add(suffix)
-        out.append((str(prim.GetPath()), suffix))
-    return out
 
 
 def _camera_prim_priority(prim_name: str) -> int:
@@ -350,42 +271,6 @@ def bind_camera_sensor(
     return sensor
 
 
-def bind_camera_sensors(
-    stage: Any,
-    cam: Any,
-    *,
-    disable_collision: bool = False,
-) -> dict[str, Any]:
-    """按配置绑一路或多路 CameraSensor.
-
-    ``collect_all_cameras`` 时壳体下每个 Camera 一路,名是 ``{name}_{suffix}``.
-
-    Args:
-        stage: 当前 USD stage.
-        cam: 相机配置.
-        disable_collision: True 时关掉壳体子树碰撞.
-
-    Returns:
-        传感器名到 ``CameraSensor``.
-    """
-    if getattr(cam, "collect_all_cameras", False):
-        listed = list_camera_prims(stage, cam.prim_path)
-        if listed:
-            out: dict[str, Any] = {}
-            for i, (path, suffix) in enumerate(listed):
-                stream = f"{cam.name}_{suffix}"
-                out[stream] = bind_camera_sensor(
-                    stage,
-                    cam,
-                    disable_collision=disable_collision,
-                    camera_prim=path,
-                    sensor_name=stream,
-                    apply_visuals=i == 0,
-                )
-            return out
-    return {cam.name: bind_camera_sensor(stage, cam, disable_collision=disable_collision)}
-
-
 # 读帧时的短名 → CameraSensor annotator;配置里仍写官方名
 _ANNOTATOR_ALIASES = {
     "image": "rgb",
@@ -562,65 +447,6 @@ def filter_camera_targets(
         命中条目的有序字典.
     """
     return {name: prim for name, prim, aliases in entries if camera_matches_prims(aliases, filters)}
-
-
-def remount_camera_parent(
-    stage: Any,
-    cam: Any,
-    root_path: str,
-    suffixes: tuple[str, ...],
-) -> str | None:
-    """``pose_relative_to`` 不存在时,改绑到 ``root`` 下第一个匹配的 link.
-
-    只改跟随用的绑定 link,不改光学 ``prim_path``(移动机已在 ``/World/Cameras``).
-
-    Args:
-        stage: 当前 USD stage.
-        cam: 只改写 ``pose_relative_to``.
-        root_path: 机器人根.
-        suffixes: 候选相对路径,按优先级.
-
-    Returns:
-        新的绑定 prim 路径;父节点本来就有效或找不到则为 ``None``.
-    """
-    from real2sim2real.utils.isaacsim_utils.openusd_utils import find_prim_path
-
-    if stage is None:
-        return None
-    parent = normalize_prim_path(cam.pose_relative_to)
-    prim = stage.GetPrimAtPath(parent)
-    if prim is not None and prim.IsValid():
-        return None
-    found = find_prim_path(stage, root_path, suffixes=suffixes)
-    if found is None:
-        return None
-    cam.pose_relative_to = found
-    return found
-
-
-def open_robot_cameras(robot: Any, stage: Any, sim_world: Any) -> None:
-    """按配置挂相机 USD.移动机 prim 已在 ``/World/Cameras``,不再运行时改挂.
-
-    Args:
-        robot: 移动机可覆盖 ``_prepare_camera_prim``.
-        stage: 当前 USD stage.
-        sim_world: 用来泵帧.
-
-    Returns:
-        None.
-    """
-    from isaacsim.core.utils.stage import add_reference_to_stage
-
-    from real2sim2real.utils.misc import emit_log
-
-    for cam in getattr(robot.config, "cameras", None) or []:
-        prepare = getattr(robot, "_prepare_camera_prim", None)
-        if callable(prepare):
-            prepare(cam)
-        spawn_camera(stage, cam.prim_path, cam.usd_path, add_reference_to_stage)
-        apply_camera_intrinsics(stage, cam)
-        emit_log(robot, "info", "open_robot_camera", name=cam.name, prim_path=cam.prim_path)
-        pump_frames(sim_world, 1)
 
 
 CAMERA_ANNOTATORS = frozenset(

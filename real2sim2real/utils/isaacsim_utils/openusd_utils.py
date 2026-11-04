@@ -1,4 +1,6 @@
-"""OpenUSD 舞台辅助:路径解析、挂引用、写位姿、加载 payload、查 AABB / link 位姿.
+"""OpenUSD 工具：路径解析、舞台与引用、位姿变换、payload 加载同步及 AABB 查询。
+
+相机传感器放在 camera_utils，物理属性放在 physics_utils，关节与 articulation 放在 robot_utils。
 
 ``normalize_prim_path`` / ``resolve_usd_path`` 不依赖 Kit;
 pxr / isaacsim 仅在函数内 import,避免 stub 通路被重依赖拖垮.
@@ -199,36 +201,6 @@ def prim_aabb(
         return None
 
 
-def prim_aabb_z_min(stage: Any, prim_path: str) -> float | None:
-    """返回 prim 世界 AABB 的 z 下界;算不出则 None.
-
-    Args:
-        stage: 当前 USD stage.
-        prim_path: 任意已在 stage 上的 prim.
-
-    Returns:
-        世界 AABB 的 z 最小值(米);算不出则为 ``None``.
-    """
-    bounds = prim_aabb(stage, prim_path)
-    return None if bounds is None else float(bounds[0][2])
-
-
-def prim_aabb_z_max(stage: Any, prim_path: str) -> float | None:
-    """返回 prim 世界 AABB 的 z 上界;算不出则 None.
-
-    桌子用这个当桌面高度;几何原点常在桌腿,不能当支撑面.
-
-    Args:
-        stage: 当前 USD stage.
-        prim_path: 任意已在 stage 上的 prim.
-
-    Returns:
-        世界 AABB 的 z 最大值(米);算不出则为 ``None``.
-    """
-    bounds = prim_aabb(stage, prim_path)
-    return None if bounds is None else float(bounds[1][2])
-
-
 def read_prim_world_pose(stage: object, prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
     """从 USD stage 读取 prim 当前世界位姿(含物理驱动后的实时变换);无效则 ``None``.
 
@@ -262,107 +234,6 @@ def read_prim_world_pose(stage: object, prim_path: str) -> tuple[np.ndarray, np.
         return pos, ori  # 与 poses 缓存同约定 (pos, wxyz)
     except Exception:  # noqa: BLE001  # 非 Xformable 等
         return None  # 读失败不当致命错误,Job 可跳过该 prim
-
-
-def read_link_world_pose(stage: Any, prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
-    """读 articulation link 的世界位姿;优先 Fabric,读不到再退回 USD.
-
-    Fabric 是运行时场景缓存;PhysX / 渲染读它,USD 是编辑用的源.
-    走路时 PhysX 只把 link 变换写进 Fabric,USD ``ComputeLocalToWorld``
-    仍是站姿,用 USD 去跟相机会停在出生点.``fabric=True`` 才是真机位.
-
-    Args:
-        stage: 当前 USD stage;Fabric 失败时的退路.
-        prim_path: link prim,如 ``/World/robots/G1/head_link``.
-
-    Returns:
-        世界 ``(pos, quat_wxyz)``;都读不到则为 ``None``.
-    """
-    path = normalize_prim_path(prim_path)
-    try:
-        from isaacsim.core.utils.xforms import get_world_pose
-
-        pos, quat = get_world_pose(path, fabric=True)
-        pos_a = np.asarray(pos, dtype=float).reshape(-1)
-        quat_a = np.asarray(quat, dtype=float).reshape(-1)
-        if pos_a.size >= 3 and quat_a.size >= 4:
-            return pos_a[:3].copy(), quat_a[:4].copy()
-    except Exception:  # noqa: BLE001
-        pass
-    return read_prim_world_pose(stage, path)
-
-
-def find_prim_path(
-    stage: Any,
-    root_path: str,
-    *,
-    suffixes: tuple[str, ...] = (),
-    names: set[str] | frozenset[str] | None = None,
-    ignore_case: bool = True,
-) -> str | None:
-    """在 ``root`` 下找 prim:先试 ``root/suffix``,再按名字扫子树.
-
-    Args:
-        stage: 当前 USD stage;None 则返回 None.
-        root_path: 搜索根.
-        suffixes: 相对根的候选路径,如 ``panda_link0`` / ``Geometry/base_link``.
-        names: 子树里按 ``GetName()`` 匹配的名字集合;None 则从 suffixes 末段推断.
-        ignore_case: 按名扫描时是否忽略大小写.
-
-    Returns:
-        命中的 prim 路径;都找不到则为 ``None``.
-    """
-    if stage is None:
-        return None
-    root = normalize_prim_path(root_path)
-    for suffix in suffixes:
-        path = f"{root}/{suffix.lstrip('/')}"
-        prim = stage.GetPrimAtPath(path)
-        if prim is not None and prim.IsValid():
-            return path
-    want = names if names is not None else {s.rsplit("/", 1)[-1] for s in suffixes if s}
-    if ignore_case:
-        want = {n.lower() for n in want}
-    root_prim = stage.GetPrimAtPath(root)
-    if root_prim is None or not root_prim.IsValid() or not want:
-        return None
-    from pxr import Usd
-
-    for prim in Usd.PrimRange(root_prim):
-        name = prim.GetName()
-        if (name.lower() if ignore_case else name) in want:
-            return str(prim.GetPath())
-    return None
-
-
-def snap_prim_to_floor_z(
-    stage: Any,
-    prim_path: str,
-    world_pos: np.ndarray,
-    world_quat: np.ndarray,
-    floor_z: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """把 prim 当前 AABB 底面落到 ``floor_z``;量不到包围盒则只改 z.
-
-    Args:
-        stage: 当前 USD stage.
-        prim_path: 要贴地的根 prim.
-        world_pos: 当前世界位置.
-        world_quat: 当前世界朝向 ``wxyz``.
-        floor_z: 地面世界 z.
-
-    Returns:
-        贴地后的 ``(世界 pos, wxyz)``;朝向不变.
-    """
-    snapped = np.asarray(world_pos, dtype=float).copy()
-    apply_pose(stage, prim_path, snapped, world_quat)
-    bounds = prim_aabb(stage, prim_path)
-    if bounds is None:
-        snapped[2] = float(floor_z)
-        return snapped, world_quat
-    snapped = snapped.copy()
-    snapped[2] += float(floor_z) - float(bounds[0][2])
-    return snapped, world_quat
 
 
 def ensure_xform(stage: Any, prim_path: str) -> None:
@@ -672,28 +543,19 @@ def ensure_prim_loaded(stage: Any, prim_path: str, *, select_mesh_variant: bool 
         _LOG.warning("select_mesh_variant_failed", error=str(exc))
 
 
-def open_robot_usd(robot: Any, sim_world: Any, *, mesh_variant: bool = False) -> Any:
-    """绑定 sim world,挂机器人 USD,返回 stage.
+def pump_frames(sim_world: Any, frames: int) -> None:
+    """泵若干帧 Kit 主循环,让刚挂上的 USD 完成加载与同步.
+
+    走 ``BaseSimWorld.update``(Isaac 泵 App,stub no-op).不跑物理.
 
     Args:
-        robot: 须有 ``config.usd_path`` / ``config.prim_path``.
-        sim_world: 已 init_world 的世界.
-        mesh_variant: True 时选中 Mesh variant(桌面臂贴合需要).
+        sim_world: 已绑定的仿真世界;None 则什么都不做.
+        frames: 要泵的帧数;<=0 则什么都不做.
 
     Returns:
-        当前 USD stage.
+        None.
     """
-    from isaacsim.core.utils.stage import add_reference_to_stage
-
-    from real2sim2real.utils.isaacsim_utils.physics_utils import pump_frames
-    from real2sim2real.utils.misc import emit_log
-
-    robot.sim_world = sim_world
-    stage = get_stage(sim_world)
-    assert stage is not None, "Stage is not initialized"
-    usd = resolve_usd_path(getattr(robot.config, "usd_path", "") or "")
-    spawn_reference(stage, robot.config.prim_path, usd, add_reference_to_stage)
-    ensure_prim_loaded(stage, robot.config.prim_path, select_mesh_variant=mesh_variant)
-    emit_log(robot, "info", "open_robot_usd", prim_path=robot.config.prim_path, usd=usd)
-    pump_frames(sim_world, 2)
-    return stage
+    if sim_world is None:
+        return
+    for _ in range(max(0, frames)):
+        sim_world.update()
