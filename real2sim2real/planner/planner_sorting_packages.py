@@ -23,6 +23,7 @@ from pydantic import Field, field_validator
 from real2sim2real.core.config import BaseConfig
 from real2sim2real.core.logger import get_logger
 from real2sim2real.planner.base import BasePlanner
+from real2sim2real.utils.randomization import sample_grasp_offsets
 from real2sim2real.utils.surface import surface_patch_normal, uv_patch_triangles
 
 
@@ -131,7 +132,7 @@ class SortingPlannerConfig(BaseConfig):
         default=0.28,
         gt=0.0,
         le=0.35,
-        description="左臂起始提起高度；稳握后仍接触入带时最多补抬 0.06 m，总高度不超过 0.35 m",
+        description="左臂起始提起高度；稳握后仍接触入带时最多补抬 0.12 m，总高度不超过 0.35 m",
     )
     left_setdown_offset_m: float = Field(
         default=0.025,
@@ -139,6 +140,27 @@ class SortingPlannerConfig(BaseConfig):
         le=0.05,
         description="平台下放额外向下偏移；标签朝上采集用 0，避免过度挤压翻折",
     )
+
+    grasp_jitter_fraction_xy: tuple[float, float] = Field(
+        default=(0.25, 0.3),
+        description="抓点相对包裹半宽/半长的随机范围；[0, 0] 关闭，最多 0.5，保留主体抓取",
+    )
+    grasp_random_candidates: int = Field(default=12, ge=1, le=64, description="每侧抓点采样数")
+    grasp_random_seed: int = Field(default=0, ge=0, description="抓点种子；0 每轮随机")
+    grasp_min_distance_m: float = Field(
+        default=0.01,
+        ge=0.0,
+        le=0.05,
+        allow_inf_nan=False,
+        description="随机抓点离中心、上一成功集抓点的最小 XY 距离(m)",
+    )
+
+    @field_validator("grasp_jitter_fraction_xy")
+    @classmethod
+    def _grasp_jitter_range(cls, value: tuple[float, float]) -> tuple[float, float]:
+        if any(not math.isfinite(v) or not 0.0 <= v <= 0.5 for v in value):
+            raise ValueError("grasp_jitter_fraction_xy 必须是 [0, 0.5] 内的有限数")
+        return value
 
     @field_validator("label_uv_bounds")
     @classmethod
@@ -1427,8 +1449,6 @@ LEFT_GRASP_DIP_MAX_M = 0.020
 
 RIGHT_GRASP_EDGE_INSET_M = 0.035  # 右爪从 -X 边再往里探,避开变形后的空边
 
-RIGHT_GRASP_FROM_CENTER_FRAC = 0.20  # 从袋心往 -X 偏半宽的这一比例,咬实体而不是薄边
-
 RIGHT_GRASP_BITE_M = 0.008  # 相对当前 AABB 顶再往下咬,合爪时袋会瘪
 
 RIGHT_MIN_FINGER_CONTACTS = 80  # 右提之前 Newton 指垫接触数;不够就继续下压
@@ -2666,6 +2686,24 @@ def _xy_center_error(center: np.ndarray, target: np.ndarray) -> float:
     return float(np.linalg.norm(center_xy - target_xy))
 
 
+def _center_out_grasp_offsets(half_extents: np.ndarray) -> list[np.ndarray]:
+    """按距包裹中心的实际 XY 距离排列抓点,先中心再逐步向机器人侧搜索."""
+    half = np.asarray(half_extents, dtype=np.float64).reshape(3)
+    fractions = (
+        (0.0, 0.0),
+        (0.0, 0.125),
+        (0.0, 0.25),
+        (0.0, 0.375),
+        (0.0, 0.5),
+        (-0.2, 0.0),
+        (-0.2, 0.25),
+        (-0.2, 0.5),
+        (-0.2, 0.65),
+    )
+    offsets = [np.array([x * half[0], y * half[1], 0.0]) for x, y in fractions]
+    return sorted(offsets, key=lambda offset: float(np.linalg.norm(offset[:2])))
+
+
 def _center_is_within_tolerance(
     center: np.ndarray,
     target: np.ndarray,
@@ -3481,7 +3519,7 @@ def validate_right_drag_lower_distance(value: float) -> float:
 
 
 class ProM6LeftClothingDragController:
-    """Deterministic dual-arm relay modeled after the source demo."""
+    """Dual-arm relay with seeded, reachability-constrained grasp sampling."""
 
     def __init__(
         self,
@@ -3581,6 +3619,14 @@ class ProM6LeftClothingDragController:
         self.support_bounds: tuple[np.ndarray, np.ndarray] | None = None
         self.grasp_point: np.ndarray | None = None
         self._left_grasp_offset = np.zeros(3, dtype=np.float64)
+        self._right_grasp_offset = np.zeros(3, dtype=np.float64)
+        self.grasp_jitter_fraction_xy = (0.0, 0.0)
+        self.grasp_random_candidates = 12
+        self.grasp_min_distance_m = 0.01
+        self.grasp_rngs: dict[str, np.random.Generator] = {}
+        self.previous_grasp_offsets: dict[str, np.ndarray] = {}
+        self.left_grasp_position: np.ndarray | None = None
+        self.right_grasp_position: np.ndarray | None = None
         self.pregrasp_point: np.ndarray | None = None
         self.attachment_center: np.ndarray | None = None
         self.right_handoff_anchor_position: np.ndarray | None = None
@@ -3709,7 +3755,7 @@ class ProM6LeftClothingDragController:
         self.support_bounds = get_world_bounds(support)
         self.belt_bounds = get_world_bounds(belt)
         self.geometry = calculate_grasp_geometry(
-            self.clothing_bounds, self.support_bounds, centered=self.keep_label_up
+            self.clothing_bounds, self.support_bounds, centered=True
         )
         self.grasp_point = self.geometry["grasp_point"].copy()
         self.pregrasp_point = self.geometry["pregrasp_point"].copy()
@@ -4330,7 +4376,7 @@ class ProM6LeftClothingDragController:
             np.asarray(maximum, dtype=np.float64).reshape(3).copy(),
         )
         self.geometry = calculate_grasp_geometry(
-            self.clothing_bounds, self.support_bounds, centered=self.keep_label_up
+            self.clothing_bounds, self.support_bounds, centered=True
         )
         for key in ("grasp_point", "pregrasp_point", "attachment_center"):
             self.geometry[key] += self._left_grasp_offset
@@ -4437,6 +4483,52 @@ class ProM6LeftClothingDragController:
             self._apply_live_grasp_geometry(minimum, maximum)
             self._set_phase(Phase.WAITING)
 
+    def _grasp_offsets(
+        self, minimum: np.ndarray, maximum: np.ndarray, side: str
+    ) -> list[np.ndarray]:
+        """在近中心区域随机采样；关闭随机化时沿用中心优先候选."""
+        fractions = getattr(self, "grasp_jitter_fraction_xy", (0.0, 0.0))
+        if not any(fractions):
+            return _center_out_grasp_offsets(0.5 * (maximum - minimum))
+        candidates = sample_grasp_offsets(
+            minimum,
+            maximum,
+            fractions,
+            self.grasp_random_candidates,
+            self.grasp_rngs[side],
+            min_distance_m=self.grasp_min_distance_m,
+            previous_offset=self.previous_grasp_offsets.get(side),
+        )
+        if not candidates:
+            raise RuntimeError(f"{side} 无法在主体范围内产生足够差异的抓点，请调整扰动范围")
+        return candidates
+
+    def _screen_random_grasp(
+        self,
+        kinematics: UsdArmKinematics,
+        pregrasp: np.ndarray,
+        waypoints: tuple[np.ndarray, ...],
+        lower: np.ndarray,
+        upper: np.ndarray,
+        preferred: np.ndarray,
+        ready: np.ndarray,
+    ) -> bool:
+        """先用有限种子筛掉不可达随机点；通过后仍执行完整 42 种子验收."""
+        if not any(getattr(self, "grasp_jitter_fraction_xy", (0.0, 0.0))):
+            return True
+        seeds = _build_ik_candidate_seeds(lower, upper, preferred, ready)[:6]
+        return any(
+            _ik_waypoints_reachable(
+                kinematics,
+                seed,
+                (pregrasp, *waypoints),
+                self.grasp_orientation,
+                lower + IK_JOINT_LIMIT_MARGIN_RAD,
+                upper - IK_JOINT_LIMIT_MARGIN_RAD,
+            )
+            for seed in seeds
+        )
+
     def _step_search_pregrasp_ik(self) -> None:
         if (
             self.usd_kinematics is None
@@ -4451,24 +4543,25 @@ class ProM6LeftClothingDragController:
         self._set_gripper_target(GRIPPER_OPEN_POSITION_RAD)
         # A jittered bag center can be beyond the arm's reach. Search the bag body,
         # and verify descent/lift as well as the elevated pregrasp pose.
-        offsets = [np.zeros(3)]
-        if self.keep_label_up and self.clothing_bounds is not None:
-            half = 0.5 * (self.clothing_bounds[1] - self.clothing_bounds[0])
-            offsets.extend(
-                np.array([x * half[0], y * half[1], 0.0])
-                for x, y in ((0.0, 0.25), (0.0, 0.5), (-0.2, 0.5), (-0.2, 0.65))
-            )
+        offsets = self._grasp_offsets(*self.clothing_bounds, "left")
         initial_grasp = self.grasp_point.copy()
         initial_pregrasp = self.pregrasp_point.copy()
         last_error: RuntimeError | None = None
         for offset in offsets:
             grasp = initial_grasp + offset
             pregrasp = initial_pregrasp + offset
-            waypoints = (
-                (grasp, grasp + np.array([0.0, 0.0, self.left_lift_height_m]))
-                if self.keep_label_up
-                else ()
-            )
+            waypoints = (grasp, grasp + np.array([0.0, 0.0, self.left_lift_height_m]))
+            if not self._screen_random_grasp(
+                self.usd_kinematics,
+                pregrasp,
+                waypoints,
+                self.left_arm_lower_limits,
+                self.left_arm_upper_limits,
+                IK_PREFERRED_SEED,
+                LEFT_IK_ELBOW_OUT_SEED,
+            ):
+                _log(f"[ProM6ClothingDrag][IK search] Random grasp unreachable: {grasp}")
+                continue
             try:
                 selected, diagnostics = solve_pregrasp_ik_42_seeds(
                     self.usd_kinematics,
@@ -4657,6 +4750,7 @@ class ProM6LeftClothingDragController:
                 f"start={_array_string(self.left_lift_start)}, "
                 f"target={_array_string(self.left_lift_target)}"
             )
+            self.left_grasp_position = self.grasp_point.copy()
             self.left_lift_com_z = float(self._parcel_com()[2])
             self._set_phase(Phase.LEFT_LIFT)
         elif self.phase_time >= max(
@@ -5047,14 +5141,13 @@ class ProM6LeftClothingDragController:
             self._set_phase(Phase.PREPARE_RIGHT_HANDOFF)
 
     def _right_grasp_patch(self, minimum: np.ndarray, maximum: np.ndarray) -> np.ndarray:
-        """右抓点:X 从袋心偏 -X;Y 收向平台中心/袋 +Y 边,避免过深 -Y 让右 IK 无解."""
+        """右抓点优先取包裹中心,保留 IK 选出的偏移并跟踪包裹漂移."""
         min_x = float(minimum[0])
         max_x = float(maximum[0])
         min_y = float(minimum[1])
         max_y = float(maximum[1])
         center_x = 0.5 * (min_x + max_x)
-        half_x = 0.5 * (max_x - min_x)
-        grasp_x = center_x - RIGHT_GRASP_FROM_CENTER_FRAC * max(half_x, 0.04)
+        grasp_x = center_x + self._right_grasp_offset[0]
         grasp_x = min(grasp_x, max_x - 0.03)
         grasp_x = max(grasp_x, min_x + RIGHT_GRASP_EDGE_INSET_M)
         inset_y = RIGHT_GRASP_EDGE_INSET_M
@@ -5062,9 +5155,7 @@ class ProM6LeftClothingDragController:
         y_hi = max_y - inset_y
         if y_hi < y_lo:
             y_lo, y_hi = y_hi, y_lo
-        preferred_y = y_hi
-        if self.support_center is not None:
-            preferred_y = float(self.support_center[1])
+        preferred_y = 0.5 * (min_y + max_y) + self._right_grasp_offset[1]
         grasp_y = float(np.clip(preferred_y, y_lo, y_hi))
         return np.array(
             [
@@ -5169,6 +5260,7 @@ class ProM6LeftClothingDragController:
         self._set_gripper_target(GRIPPER_OPEN_POSITION_RAD)
         self._set_right_gripper_target(GRIPPER_OPEN_POSITION_RAD)
         minimum, maximum, center = self._node_aabb()
+        self._right_grasp_offset = np.zeros(3, dtype=np.float64)
         geometry = self._right_grasp_geometry(minimum, maximum)
         self.right_handoff_anchor_position = geometry["attachment_center"].copy()
         self.right_grasp_point = geometry["grasp_point"].copy()
@@ -5192,23 +5284,34 @@ class ProM6LeftClothingDragController:
         self._set_phase(Phase.RIGHT_SEARCH_IK)
 
     def _right_pregrasp_candidates(self) -> list[np.ndarray]:
-        """主抓点 + 袋上更靠 +Y 的备选,给右 IK 一次退路."""
+        """从包裹中心逐步向外搜索,按实际 XY 距离优先选靠近中心的点."""
         if self.right_pregrasp_point is None:
             raise RuntimeError("Right pregrasp point is unavailable")
         primary = np.asarray(self.right_pregrasp_point, dtype=np.float64).reshape(3)
-        candidates = [primary.copy()]
         minimum, maximum, _ = self._node_aabb()
+        randomized = any(getattr(self, "grasp_jitter_fraction_xy", (0.0, 0.0)))
+        offsets = self._grasp_offsets(minimum, maximum, "right")
         inset = RIGHT_GRASP_EDGE_INSET_M
+        x_lo, x_hi = float(minimum[0]) + inset, float(maximum[0]) - inset
         y_hi = float(maximum[1]) - inset
         y_lo = float(minimum[1]) + inset
         if y_hi < y_lo:
             y_lo, y_hi = y_hi, y_lo
-        for y in (y_hi, 0.5 * (y_lo + y_hi)):
-            alt = primary.copy()
-            alt[1] = float(np.clip(y, y_lo, y_hi))
-            if min(float(np.linalg.norm(alt[:2] - item[:2])) for item in candidates) > 0.02:
+        candidates = [] if randomized else [primary.copy()]
+        if not randomized:
+            offsets.append(np.array([0.0, y_hi - primary[1], 0.0]))
+        for offset in offsets:
+            alt = primary + offset
+            alt[0] = float(np.clip(alt[0], min(x_lo, x_hi), max(x_lo, x_hi)))
+            alt[1] = float(np.clip(alt[1], y_lo, y_hi))
+            if (
+                not candidates
+                or min(float(np.linalg.norm(alt[:2] - item[:2])) for item in candidates) > 1.0e-6
+            ):
                 candidates.append(alt)
-        return candidates
+        if randomized:
+            return candidates
+        return sorted(candidates, key=lambda point: float(np.linalg.norm(point[:2] - primary[:2])))
 
     def _step_right_search_ik(self) -> None:
         if (
@@ -5224,7 +5327,23 @@ class ProM6LeftClothingDragController:
         last_error = "Right pregrasp IK search found no solution"
         selected: np.ndarray | None = None
         diagnostics: dict[str, float | int] | None = None
+        initial_pregrasp = self.right_pregrasp_point.copy()
         for index, pregrasp in enumerate(self._right_pregrasp_candidates()):
+            waypoints = (
+                pregrasp - np.array([0.0, 0.0, PREGRASP_CLEARANCE_M]),
+                pregrasp + np.array([0.0, 0.0, RIGHT_LIFT_HEIGHT_M - PREGRASP_CLEARANCE_M]),
+            )
+            if not self._screen_random_grasp(
+                self.right_usd_kinematics,
+                pregrasp,
+                waypoints,
+                self.right_arm_lower_limits,
+                self.right_arm_upper_limits,
+                RIGHT_IK_PREFERRED_SEED,
+                RIGHT_IK_ELBOW_OUT_SEED,
+            ):
+                _log(f"[ProM6ClothingDrag][right IK search] Random grasp unreachable: {pregrasp}")
+                continue
             try:
                 selected, diagnostics = solve_pregrasp_ik_42_seeds(
                     self.right_usd_kinematics,
@@ -5237,6 +5356,7 @@ class ProM6LeftClothingDragController:
                     self.timing.ik_search_timeout_seconds,
                     ready_seed=RIGHT_IK_ELBOW_OUT_SEED,
                     outward_xy=RIGHT_ELBOW_OUTWARD_XY,
+                    waypoint_positions=waypoints,
                 )
             except RuntimeError as exc:
                 last_error = str(exc)
@@ -5245,13 +5365,13 @@ class ProM6LeftClothingDragController:
                     f"index={index}, pregrasp={_array_string(pregrasp)}, error={last_error}"
                 )
                 continue
-            if index > 0:
-                self.right_pregrasp_point = pregrasp.copy()
-                if self.right_grasp_point is not None:
-                    grasp = np.asarray(self.right_grasp_point, dtype=np.float64).reshape(3).copy()
-                    grasp[0] = float(pregrasp[0])
-                    grasp[1] = float(pregrasp[1])
-                    self.right_grasp_point = grasp
+            self._right_grasp_offset = pregrasp - initial_pregrasp
+            self._right_grasp_offset[2] = 0.0
+            self.right_pregrasp_point = pregrasp.copy()
+            if self.right_grasp_point is not None:
+                grasp = np.asarray(self.right_grasp_point, dtype=np.float64).reshape(3).copy()
+                grasp[:2] = pregrasp[:2]
+                self.right_grasp_point = grasp
             _log(
                 "[ProM6ClothingDrag][right IK search] selected branch: "
                 f"candidate={index}, "
@@ -5428,6 +5548,7 @@ class ProM6LeftClothingDragController:
             self._assert_no_right_platform_penetration()
             self.right_handoff_tcp_position, _ = self._current_right_tcp()
             self.right_handoff_anchor_position = self.right_grasp_point.copy()
+            self.right_grasp_position = self.right_grasp_point.copy()
             self.right_lift_start = self.right_handoff_tcp_position.copy()
             self.right_lift_target = self.right_lift_start + np.array(
                 [0.0, 0.0, RIGHT_LIFT_HEIGHT_M], dtype=np.float64
@@ -5914,6 +6035,9 @@ class SortingPlanner(BasePlanner):
         self._robot: Any | None = None  # 已 arrange 的 ProM6Robot
         self._callback_ids: list[int] = []  # 已注册的 SimulationManager 回调
         self._physics_dt = 1.0 / float(self.config.physics_hz)  # manual 模式下的步长
+        self._grasp_seed = self.config.grasp_random_seed or int(np.random.SeedSequence().entropy)
+        self._previous_grasp_offsets: dict[str, np.ndarray] = {}
+        self._episode_grasp_seed: int | None = None
 
     # ============= 规划流水线 <==========
 
@@ -6032,6 +6156,19 @@ class SortingPlanner(BasePlanner):
         if self._controller is None:
             self.log.warning("尚未 init_planner,跳过 begin_episode")
             return
+        sequence = np.random.SeedSequence([self._grasp_seed, episode_index, attempt])
+        self._episode_grasp_seed = int(sequence.generate_state(1)[0])
+        controller = self._controller
+        controller.grasp_jitter_fraction_xy = self.config.grasp_jitter_fraction_xy
+        controller.grasp_random_candidates = self.config.grasp_random_candidates
+        controller.grasp_min_distance_m = self.config.grasp_min_distance_m
+        controller.grasp_rngs = {
+            side: np.random.default_rng(child)
+            for side, child in zip(("left", "right"), sequence.spawn(2), strict=True)
+        }
+        controller.previous_grasp_offsets = {
+            side: offset.copy() for side, offset in self._previous_grasp_offsets.items()
+        }
         if self.config.drive_mode == "callback":
             self._register_callbacks()
         self.log.info(
@@ -6039,7 +6176,16 @@ class SortingPlanner(BasePlanner):
             episode=episode_index,
             attempt=attempt,
             drive_mode=self.config.drive_mode,
+            grasp_seed=self._episode_grasp_seed,
         )
+
+    def remember_successful_grasps(self) -> None:
+        """保留上一成功集的相对抓点,下一集采样时避开其邻域."""
+        if self._controller is not None and self.phase == "done":
+            self._previous_grasp_offsets = {
+                side: getattr(self._controller, f"_{side}_grasp_offset").copy()
+                for side in ("left", "right")
+            }
 
     def on_physics_step(self, robot: Any) -> bool:
         """每步:manual 模式推进状态机,并把阶段/动作同步给 Job.
@@ -6207,6 +6353,21 @@ class SortingPlanner(BasePlanner):
         return {
             "planner_phase": self.phase,
             "failure_reason": getattr(controller, "failure_reason", None),
+            "grasp_seed": self._episode_grasp_seed,
+            "grasp_run_seed": self._grasp_seed,
+            "grasp_jitter_fraction_xy": list(self.config.grasp_jitter_fraction_xy),
+            **{
+                f"{side}_grasp_position": (
+                    value.tolist()
+                    if (value := getattr(controller, f"{side}_grasp_position", None)) is not None
+                    else None
+                )
+                for side in ("left", "right")
+            },
+            **{
+                f"{side}_grasp_offset_xy": getattr(controller, f"_{side}_grasp_offset")[:2].tolist()
+                for side in ("left", "right")
+            },
             "right_drag_distance_m": float(
                 getattr(controller, "right_actual_drag_distance", 0.0) or 0.0
             ),

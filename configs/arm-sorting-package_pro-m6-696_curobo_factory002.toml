@@ -96,6 +96,11 @@ newton_substeps = 10
 vbd_iterations = 10
 min_lift_height_m = 0.08
 # 入带时标签朝上：主体中部抓取 + 较低提起 + 避免过压下放，平台松爪后校验真实标签法线。
+# 双臂在主体中心区域随机抓取，候选需通过下探和提起 IK；[0, 0] 恢复中心优先。
+grasp_jitter_fraction_xy = [0.3, 0.35]
+grasp_random_candidates = 12
+grasp_random_seed = 0
+grasp_min_distance_m = 0.01
 keep_label_up = true
 label_uv_bounds = [0.14, 0.50, 0.32, 0.615]
 label_up_min_cos = 0.9
@@ -108,8 +113,10 @@ belt_speed_mps = 0.5
 backend = "sorting"
 inspect_gui = false
 num_episodes = 2
-object_jitter_xy = 0.06
+object_jitter_xy = 0.08
 object_jitter_seed = 0
+object_jitter_min_distance_m = 0.05
+max_attempts = 6
 camera_warmup_steps = 30
 max_steps = 6000
 record_stride = 0

@@ -7,13 +7,13 @@ import time
 from typing import Any
 
 import numpy as np
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from real2sim2real.core.config import BaseConfig
 from real2sim2real.job.base import BaseJob
 from real2sim2real.planner.planner_sorting_packages import restore_cached_rest_mesh
 from real2sim2real.scene.scene_sorting_packages import SortingScene
-from real2sim2real.utils.recorder import LeRobotRecorder, create_recorder
+from real2sim2real.utils.recorder import LeRobotRecorder, LeRobotV2Recorder, create_recorder
 from real2sim2real.utils.recorder_config import JobRecorderConfig
 from real2sim2real.utils.validate import validate_episode
 
@@ -26,9 +26,26 @@ class SortingJobConfig(BaseConfig):
     object_jitter_xy: float = Field(
         default=0.06,
         ge=0.0,
+        allow_inf_nan=False,
         description="每集包裹相对入带摆放位的 XY 随机偏移半边长(m);0 则不抖",
     )
     object_jitter_seed: int = Field(default=0, description="偏移 RNG 种子;0 表示不固定")
+    object_jitter_min_distance_m: float = Field(
+        default=0.04,
+        ge=0.0,
+        allow_inf_nan=False,
+        description="本轮相邻成功集初始包裹位置最小 XY 间距(m);0 关闭",
+    )
+    max_attempts: int = Field(default=4, ge=1, le=20, description="每集重采样/执行次数上限")
+
+    @model_validator(mode="after")
+    def _sampling_distance(self) -> SortingJobConfig:
+        if self.object_jitter_xy > 0 and self.object_jitter_min_distance_m >= (
+            2 * np.sqrt(2) * self.object_jitter_xy
+        ):
+            raise ValueError("初始位置最小间距不能大于扰动区域的直径")
+        return self
+
     camera_warmup_steps: int = Field(
         default=30, description="Play 后热身步数;关节由规划器接管,这里只等相机出帧"
     )
@@ -80,7 +97,7 @@ class SortingJob(BaseJob):
           │         ├─ plan_hook               # [本类] 控制器已就绪即可进循环
           │         ├─ stride_hook              # [本类] 按 physics_hz / fps 抽帧
           │         ├─ playing_hook   # [本类] 状态机 DONE 会 Stop 时间轴
-          │         └─ retry_hook            # [本类] 恢复静止袋 + 同集抖动 + 重建 Newton
+          │         └─ retry_hook            # [本类] 恢复静止袋 + 重采样位置 + 重建 Newton
           └─ 5. close  # [本类] 先清控制器再 destroy_world
     """
 
@@ -104,6 +121,8 @@ class SortingJob(BaseJob):
         seed = int(self.config.object_jitter_seed)
         self._jitter_rng = np.random.default_rng(None if seed == 0 else seed)
         self._object_xy_offset = np.zeros(2, dtype=float)
+        self._previous_object_xy_offset: np.ndarray | None = None
+        self._object_initial_pose: dict[str, Any] = {}
         self._jitter_prim_path = ""
 
     # ============= 采集流水线钩子 <==========
@@ -190,9 +209,20 @@ class SortingJob(BaseJob):
                 float(self.config.object_jitter_xy),
                 self._jitter_rng,
                 clothing_surface_prim_path=surface,
+                previous_offset=self._previous_object_xy_offset,
+                min_distance_m=self.config.object_jitter_min_distance_m,
+                max_tries=128,
             )
         else:
             self.scene.restore_teleported_object(target.prim_path)
+        position, orientation = self.scene.get_prim_pose_realtime(target.prim_path)
+        orientation_norm = float(np.linalg.norm(orientation))
+        if not np.isfinite(orientation_norm) or orientation_norm < 1e-12:
+            raise RuntimeError("初始包裹朝向不是有效四元数")
+        self._object_initial_pose = {
+            "object_initial_position": position.tolist(),
+            "object_initial_orientation_wxyz": (orientation / orientation_norm).tolist(),
+        }
         self.sim_world.stop()
         self.planner.reset()
 
@@ -273,10 +303,14 @@ class SortingJob(BaseJob):
             ``sorting_object`` 与 ``object_xy_offset``;集号/尝试由外层补.
         """
         del episode, attempt
-        return {"sorting_object": target.name, "object_xy_offset": self._object_xy_offset.tolist()}
+        return {
+            "sorting_object": target.name,
+            "object_xy_offset": self._object_xy_offset.tolist(),
+            **self._object_initial_pose,
+        }
 
     def retry_hook(self, target: Any) -> None:
-        """校验失败或未验收时:恢复静止袋、写回本集抖动、重建 Newton.
+        """校验失败或未验收时:恢复静止袋、重采样初始位置、重建 Newton.
 
         Args:
             target: 本轮搬运目标.
@@ -284,7 +318,7 @@ class SortingJob(BaseJob):
         Returns:
             None.
         """
-        self._place_clothing_for_episode(target, resample=False)
+        self._place_clothing_for_episode(target, resample=True)
 
     def close(self) -> None:
         """先清控制器留下的临时 prim 与碰撞覆盖,再销毁 World.
@@ -303,8 +337,6 @@ class SortingJob(BaseJob):
         if exc is not None:
             self.log.error("采集流程异常", error=str(exc), exc_info=exc)
         super().close()
-
-    _MAX_ATTEMPTS = 2
 
     _MIN_CAMERA_FRAMES = 5
 
@@ -426,6 +458,7 @@ class SortingJob(BaseJob):
                 break
             if outcome == "success":  # 计入成功,进入下一集
                 n_ok += 1
+                self._previous_object_xy_offset = self._object_xy_offset.copy()
             elif outcome == "timeout":  # 仅验收路径会返回 timeout
                 n_timeout += 1
         return n_ok, n_timeout, n_ep  # 计划集数仍是 episode_count_hook 的返回值
@@ -476,7 +509,9 @@ class SortingJob(BaseJob):
         """
         assert self.recorder is not None, "recorder 未初始化"  # start_simulation 已建
         last_error: str | None = None  # 跨 attempt 保留,写入下一份 extra
-        for attempt in range(1, self._MAX_ATTEMPTS + 1):  # 不重启仿真,只复位任务状态
+        max_attempts = self.config.max_attempts
+        for attempt in range(1, max_attempts + 1):
+            self.last_stats = {}
             task_fields = self.episode_fields_hook(target, ep_i, attempt)  # 抖动/起终点等
             episode_dir = self.recorder.open(  # 开新集目录,返回路径供 validate
                 meta={  # 写入本集任务快照
@@ -489,6 +524,8 @@ class SortingJob(BaseJob):
 
             try:
                 status = self.run_episode(target, episode=ep_i, attempt=attempt)
+                if status == "success":
+                    last_error = None
             except Exception as exc:  # noqa: BLE001  # 单次异常不炸整个 Job
                 last_error = f"{type(exc).__name__}: {exc}"  # 留给 finalize.extra
                 status = "error"  # 不当 success,走校验/重试
@@ -498,6 +535,14 @@ class SortingJob(BaseJob):
             extra.update({"episode": ep_i, "attempt": attempt, **task_fields})  # 与 meta 对齐
             if last_error:  # 运行异常或上一轮校验错误
                 extra["error"] = last_error
+            if status != "success" and isinstance(self.recorder, LeRobotV2Recorder):
+                extra["status"] = status
+                extra.update(self.planner.get_meta())
+                self.recorder.discard(extra=extra)
+                self.log.warning("丢弃未成功尝试，重新采样", episode=ep_i, attempt=attempt)
+                if attempt < max_attempts:
+                    self.retry_hook(target)
+                continue
             recorder_cfg = getattr(self.config, "recorder", None)  # 取导出视频开关
             self.recorder.finalize(  # 关本集、写 status/extra
                 status=status,
@@ -532,7 +577,7 @@ class SortingJob(BaseJob):
                     errors=report.errors,
                     failure_reason=extra.get("failure_reason"),
                 )
-                if attempt < self._MAX_ATTEMPTS:  # 还有重试额度才复位
+                if attempt < max_attempts:  # 还有重试额度才复位
                     self.retry_hook(target)  # 子类清 planner / 回起点 / 回写物体
                 continue  # 落盘不合格不走验收,直接下一 attempt
 
@@ -540,11 +585,11 @@ class SortingJob(BaseJob):
                 self.accepted_hook(status, episode=ep_i)  # 打 timeout 警告
                 return status  # 通常是 timeout,计入 n_timeout
 
-            if attempt < self._MAX_ATTEMPTS:  # 未验收且还能重试
+            if attempt < max_attempts:  # 未验收且还能重试
                 self.retry_hook(target)  # 清状态后再跑一次
                 last_error = None  # 本轮无落盘错误,下一 extra 不再带旧 error
         else:  # for 正常走完(未 return),所有 attempt 都失败
-            self.log.error("采集本集失败", episode=ep_i, attempts=self._MAX_ATTEMPTS)
+            self.log.error("采集本集失败", episode=ep_i, attempts=max_attempts)
         return "failed"  # 用尽 attempt 或不验收且无更多重试
 
     def episode_meta(self) -> dict[str, Any]:
@@ -897,7 +942,7 @@ class SortingJob(BaseJob):
         return {}  # 基类只写 steps;子类补 rtf/抬升等,勿重复 steps
 
     def episode_done_hook(self, status: str) -> None:
-        """``_run_collect_loop`` 写完 ``last_stats`` 之后.默认空.
+        """执行成功后保留抓点,供下一集采样时避开其邻域.
 
         导航打 ``collect_episode_done``.
 
@@ -907,7 +952,8 @@ class SortingJob(BaseJob):
         Returns:
             None.
         """
-        del status  # 基类空;导航打 collect_episode_done
+        if status == "success":
+            self.planner.remember_successful_grasps()
 
     def require_success_hook(self) -> bool:
         """``_collect_one_episode`` 里 ``validate_episode`` 调用;默认 True.
@@ -966,7 +1012,7 @@ class SortingJob(BaseJob):
         )
 
     def after_collect_hook(self, *, n_ok: int, n_timeout: int, n_ep: int) -> None:
-        """汇总日志之后.默认空.
+        """汇总之后检查计划集数是否完成,未完成时让 CLI 明确报错.
 
         Args:
             n_ok: 成功集数.
@@ -976,4 +1022,5 @@ class SortingJob(BaseJob):
         Returns:
             None.
         """
-        del n_ok, n_timeout, n_ep  # 基类空;KR210 在此停留视口或因未通过而失败
+        if n_ok + n_timeout < n_ep:
+            raise RuntimeError(f"采集仅成功 {n_ok}/{n_ep} 集；拒绝原因见 rejected_attempts.jsonl")

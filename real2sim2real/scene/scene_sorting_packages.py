@@ -334,6 +334,8 @@ class SortingScene(BaseScene):
         clothing_surface_prim_path: str = "",
         margin_m: float = _INFEED_JITTER_MARGIN_M,
         max_tries: int = _INFEED_JITTER_MAX_TRIES,
+        previous_offset: np.ndarray | None = None,
+        min_distance_m: float = 0.0,
     ) -> np.ndarray:
         """相对 ``poses`` 摆放位做入带 XY 抖动,写入 stage 与 ``poses_realtime``.
 
@@ -347,6 +349,8 @@ class SortingScene(BaseScene):
             clothing_surface_prim_path: 用于量 AABB 的可视 Mesh;空则用根 prim.
             margin_m: 抖动后 AABB 相对入带 XY 的边距(米).
             max_tries: 越界则重采样次数;用尽则退回摆放位.
+            previous_offset: 上一成功集相对原位的 XY 偏移.
+            min_distance_m: 相对上一成功集的最小 XY 间距;不可满足时抛错.
 
         Returns:
             ``(dx, dy)`` 米.
@@ -386,6 +390,11 @@ class SortingScene(BaseScene):
         chosen = (base_pos.copy(), 0.0, 0.0)
         for _ in range(max(1, int(max_tries))):
             pos, dx, dy = jitter_world_xy(base_pos, float(radius), rng)
+            if (
+                previous_offset is not None
+                and np.linalg.norm(np.array([dx, dy]) - previous_offset) < min_distance_m
+            ):
+                continue
             if in_min is not None and in_max is not None:
                 new_min = clothing_min.copy()
                 new_max = clothing_max.copy()
@@ -404,6 +413,8 @@ class SortingScene(BaseScene):
             chosen = (pos, dx, dy)
             break
         else:
+            if previous_offset is not None and min_distance_m > 0:
+                raise RuntimeError("入带范围内未采到满足最小间距的初始位置，请减小最小间距")
             self.log.warning(
                 "入带抖动多次越界,退回摆放位",
                 radius=float(radius),

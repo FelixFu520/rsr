@@ -281,6 +281,21 @@ class LeRobotV2Recorder(LeRobotRecorder):
         )
         return self.root
 
+    def discard(self, *, extra: dict[str, Any] | None = None) -> None:
+        """丢弃未验收尝试,仅保存诊断；不增加训练 episode 索引."""
+        if self.episode_dir is None or self._finalized:
+            return
+        metadata = {**self._meta, **(extra or {})}
+        _append_jsonl(
+            self.root / "rejected_attempts.jsonl",
+            {"episode_index": self._episode_index, "frames": len(self._steps), **metadata},
+        )
+        self._cleanup_tmp_rgb(self._episode_index)
+        self._steps = []
+        self._image_stats = {}
+        self._finalized = True
+        self.log.warning("lerobot_attempt_rejected", metadata=metadata)
+
     def record_step(
         self,
         *,

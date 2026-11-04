@@ -15,6 +15,14 @@ backend = "stub"
 
 [planner]
 backend = "stub"
+# sorting 后端专用默认值（切换 backend 后可取消注释；stub 不接收任务字段）
+# grasp_jitter_fraction_xy = [0.25, 0.3]  # 相对包裹半宽/半长；[0, 0] 关闭随机抓点
+# grasp_random_candidates = 12
+# grasp_random_seed = 0  # 0 为每轮随机，正整数为可复现的每集/每次尝试种子
+# grasp_min_distance_m = 0.01
 
 [job]
 backend = "stub"  # StubJob 只串工厂,不采集
+# sorting 后端专用默认值
+# object_jitter_min_distance_m = 0.04
+# max_attempts = 4  # IK/物理验收失败时重新采样；失败尝试不写入训练索引

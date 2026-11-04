@@ -105,6 +105,16 @@ uv build
 ### 分拣包裹采集后端
 
 采集配置为 `configs/arm-sorting-package_pro-m6-696_curobo_factory002.toml`。
+
+该配置在入带范围内做 ±8 cm 的 XY 初始位置扰动，本轮相邻成功集的初始位置至少相差
+5 cm。双臂抓点在包裹中心附近随机采样，由 `grasp_jitter_fraction_xy` 限制为包裹
+半宽/半长的比例；`[0, 0]` 则恢复确定性的中心优先抓取。每个候选必须通过下探、
+提起的 IK 和关节余量检查，执行后仍检查接触、抬升、离带和标签朝向。不可达或
+验收失败会重新采样，最多 `max_attempts` 次，不保证任意初始位置都能成功。
+失败尝试只写 `rejected_attempts.jsonl` 诊断，成功集才进入 LeRobot 训练索引。
+`meta/episodes.jsonl` 保存初始位姿、左右实际抓点、相对中心偏移和抓点随机种子，
+可直接比较数据差异。固定 `object_jitter_seed` / `grasp_random_seed` 可复现采样序列，
+不同集和重试仍使用不同抓点。
 各后端将专用配置与实现放在同一文件，直接继承对应的 `Base*`：
 
 | 后端 | 实现文件 | 公开导入 |
