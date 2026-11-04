@@ -525,6 +525,13 @@ class SortingJob(BaseJob):
 
             if not report.ok:  # 帧数不够或相机缺失,本 attempt 作废
                 last_error = "; ".join(report.errors)  # 带入下一 attempt extra
+                self.log.warning(
+                    "采集本次验收失败",
+                    episode=ep_i,
+                    attempt=attempt,
+                    errors=report.errors,
+                    failure_reason=extra.get("failure_reason"),
+                )
                 if attempt < self._MAX_ATTEMPTS:  # 还有重试额度才复位
                     self.retry_hook(target)  # 子类清 planner / 回起点 / 回写物体
                 continue  # 落盘不合格不走验收,直接下一 attempt

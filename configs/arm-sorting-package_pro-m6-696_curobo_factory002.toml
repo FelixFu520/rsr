@@ -100,7 +100,7 @@ keep_label_up = true
 label_uv_bounds = [0.14, 0.50, 0.32, 0.615]
 label_up_min_cos = 0.9
 left_lift_height_m = 0.14
-# 若仍有袋尾接触入带，稳握后按 0.02 m 小步补抬，最多额外 0.06 m；离带检查保持开启。
+# 若仍有袋尾接触入带，稳握后按 0.02 m 小步补抬，最多额外 0.12 m；离带检查保持开启。
 left_setdown_offset_m = 0.0
 belt_speed_mps = 0.5
 

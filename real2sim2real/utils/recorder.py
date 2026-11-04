@@ -423,6 +423,7 @@ class LeRobotV2Recorder(LeRobotRecorder):
                 "tasks": [self.task],
                 "length": n_frames,
                 "status": status,
+                "metadata": dict(self._meta),
             },
         )
         _append_jsonl(self.root / "meta" / "episodes_stats.jsonl", stats)  # 与 episodes 同步追加

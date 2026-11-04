@@ -1417,7 +1417,7 @@ LEFT_LIFT_CLEARANCE_HOLD_S = 0.25
 
 LEFT_LIFT_CLEARANCE_STEP_M = 0.02
 
-LEFT_LIFT_MAX_EXTRA_HEIGHT_M = 0.06
+LEFT_LIFT_MAX_EXTRA_HEIGHT_M = 0.12  # 偏心抓取时给悬垂袋尾留足离带高度;逐步检查 IK
 
 LEFT_LIFT_MAX_HEIGHT_M = 0.35
 
@@ -3524,6 +3524,7 @@ class ProM6LeftClothingDragController:
         self.initialized = False
         self.cleaned = False
         self.failed = False
+        self.failure_reason: str | None = None
         self.phase = Phase.SETTLE
         self.phase_time = 0.0
         self.phase_frame = 0
@@ -3623,6 +3624,7 @@ class ProM6LeftClothingDragController:
         self._left_return_stall_s = 0.0
         self._left_retract_hold_s = 0.0
         self._left_close_xy_refreshed = False
+        self._left_close_elapsed = 0.0
         self._right_close_elapsed = 0.0
 
     @staticmethod
@@ -4071,6 +4073,7 @@ class ProM6LeftClothingDragController:
         self._left_return_joint_elapsed = 0.0
         self._left_return_stall_s = 0.0
         self._left_close_xy_refreshed = False
+        self._left_close_elapsed = 0.0
         self._right_close_elapsed = 0.0
         self._announce_phase()
 
@@ -4316,8 +4319,10 @@ class ProM6LeftClothingDragController:
                     f"delta_z={lifted:.4f} m"
                 )
 
-    def _apply_live_grasp_geometry(self, minimum: np.ndarray, maximum: np.ndarray) -> None:
-        """落稳后按 Newton AABB 重算左抓点,TCP 压进当前袋面而不是 USD 静止高度."""
+    def _apply_live_grasp_geometry(
+        self, minimum: np.ndarray, maximum: np.ndarray, *, preserve_height: bool = False
+    ) -> None:
+        """按 Newton AABB 重算左抓点;闭爪时可保留已经验证可达的高度."""
         if self.support_bounds is None:
             raise RuntimeError("Support bounds are unavailable after settle")
         self.clothing_bounds = (
@@ -4329,6 +4334,8 @@ class ProM6LeftClothingDragController:
         )
         for key in ("grasp_point", "pregrasp_point", "attachment_center"):
             self.geometry[key] += self._left_grasp_offset
+            if preserve_height:
+                self.geometry[key][2] = getattr(self, key)[2]
         self.grasp_point = self.geometry["grasp_point"].copy()
         self.pregrasp_point = self.geometry["pregrasp_point"].copy()
         self.attachment_center = self.geometry["attachment_center"].copy()
@@ -4544,27 +4551,35 @@ class ProM6LeftClothingDragController:
     def _step_close_gripper(self, dt: float) -> None:
         if not self._left_close_xy_refreshed:
             minimum, maximum, _ = self._node_aabb()
-            self._apply_live_grasp_geometry(minimum, maximum)
+            # The descending pads compress the bag. Its new AABB top is not a
+            # new approach height: chasing it can move below the reachable path
+            # selected by IK. Track XY drift at the already validated height;
+            # GRIP_SETTLE handles any further contact-seeking descent.
+            self._apply_live_grasp_geometry(minimum, maximum, preserve_height=True)
             self._left_close_xy_refreshed = True
             _log(
                 "[ProM6ClothingDrag] Left grasp refreshed before close: "
                 f"grasp={_array_string(self.grasp_point)}"
             )
         position_error, orientation_error, _ = self._command_pose(self.grasp_point, dt)
-        fraction = _timed_smoothstep(self.phase_time, self.timing.left_close_seconds)
+        # Refreshing the deforming parcel can move the target after approach.
+        # As for the right hand, converge with open jaws before timing closure;
+        # the phase timeout still bounds an unreachable refreshed target.
+        pose_ok = (
+            position_error <= TCP_GRASP_POSITION_TOLERANCE_M
+            and orientation_error <= TCP_GRASP_ORIENTATION_TOLERANCE_RAD
+        )
+        if not pose_ok:
+            self._set_gripper_target(GRIPPER_OPEN_POSITION_RAD)
+            self._left_close_elapsed = 0.0
+            return
+        self._left_close_elapsed += dt
+        fraction = _timed_smoothstep(self._left_close_elapsed, self.timing.left_close_seconds)
         target = GRIPPER_OPEN_POSITION_RAD + fraction * (
             GRIPPER_CLOSED_POSITION_RAD - GRIPPER_OPEN_POSITION_RAD
         )
         self._set_gripper_target(target, snap=True)
-        if self.phase_time >= self.timing.left_close_seconds:
-            if (
-                position_error > TCP_GRASP_POSITION_TOLERANCE_M
-                or orientation_error > TCP_GRASP_ORIENTATION_TOLERANCE_RAD
-            ):
-                raise RuntimeError(
-                    "Grasp pose left tolerance during gripper closure: "
-                    f"position={position_error:.5f}, orientation={orientation_error:.5f}"
-                )
+        if self._left_close_elapsed >= self.timing.left_close_seconds:
             self._set_phase(Phase.GRIP_SETTLE)
 
     def _step_grip_settle(self, dt: float) -> None:
@@ -5837,8 +5852,9 @@ class ProM6LeftClothingDragController:
         if self.failed:
             return
         self.failed = True
+        self.failure_reason = f"{type(error).__name__}: {error}"
         self.phase = Phase.FAILED
-        _log("[ProM6ClothingDrag][ERROR]", error)
+        _LOGGER.error("分拣控制器失败", error=self.failure_reason)
         traceback.print_exc()
         try:
             self.cleanup(hold_left=True)
@@ -6190,6 +6206,7 @@ class SortingPlanner(BasePlanner):
         recorder = getattr(controller, "replay_recorder", None)
         return {
             "planner_phase": self.phase,
+            "failure_reason": getattr(controller, "failure_reason", None),
             "right_drag_distance_m": float(
                 getattr(controller, "right_actual_drag_distance", 0.0) or 0.0
             ),
