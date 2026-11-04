@@ -1,0 +1,4 @@
+interface:
+  display_name: "Isaac 夹爪驱动调参"
+  short_description: "结合 Robotiq 2F-85 示例估算驱动参数，核对单位并验证夹持质量与稳定性"
+  default_prompt: "使用 $isaac-gripper-tuning 检查当前夹爪模型和驱动参数，填写调参工作表并验证夹持表现。"

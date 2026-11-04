@@ -1,0 +1,4 @@
+interface:
+  display_name: "Isaac 关节与机器人稳定性"
+  short_description: "排查机器人关节发散、驱动振荡、闭环与抓取不稳，验证调参质量和代价"
+  default_prompt: "使用 $isaac-articulation-stability 排查当前机器人不稳定问题，记录关节与驱动证据并验证最小改动。"
