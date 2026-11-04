@@ -23,6 +23,8 @@ description: 排查 Isaac Sim / Omniverse PhysX 机器人关节振荡、发散�
 
 力驱动的质量/惯量估算式与 acceleration drive 的增益关系分开使用，不能只复制数值切换类型。物理步长、控制周期与 TGS position iterations 分别记录；迭代数不等于真实物理子步数。
 
+调整 link/articulation 迭代参数时同时检查 PhysicsScene 的全局上下限，确认最终生效值没有被场景限制裁剪。
+
 涉及场景或关节属性时先在当前版本查 schema 所属对象、类型、写入 API 和生效时机。原文示例不是可直接运行的补丁；特别是 solver-order 片段，不能假定通用 USD Prim 具有文中方法。定位已有活动 PhysicsScene，确认受支持的 schema API 后再局部设置，不新建重复场景。
 
 若实验改变执行器能力、物理模型、接触过滤或时间离散，说明它对实际任务和已训练策略的影响。诊断时关闭的业务能力不能悄悄留作最终修复。
