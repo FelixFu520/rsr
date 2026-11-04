@@ -21,8 +21,8 @@ from real2sim2real.utils.isaacsim_utils import (
     spawn_subprim_reference,
 )
 from real2sim2real.utils.isaacsim_utils.camera_utils import CAMERA_ANNOTATORS
+from real2sim2real.utils.isaacsim_utils.openusd_utils import read_prim_world_pose
 from real2sim2real.utils.pose import PoseConfig as Pose
-from real2sim2real.utils.pose import read_prim_world_pose
 
 
 class RobotCameraConfig(BaseModel):

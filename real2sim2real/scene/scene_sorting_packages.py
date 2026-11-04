@@ -24,9 +24,9 @@ from real2sim2real.utils.isaacsim_utils import (
     spawn_reference,
 )
 from real2sim2real.utils.isaacsim_utils.camera_utils import CAMERA_ANNOTATORS
+from real2sim2real.utils.isaacsim_utils.openusd_utils import read_prim_world_pose
 from real2sim2real.utils.misc import jitter_world_xy
 from real2sim2real.utils.pose import PoseConfig as Pose
-from real2sim2real.utils.pose import read_prim_world_pose
 
 
 class SceneCameraConfig(BaseModel):
@@ -575,8 +575,6 @@ class SortingScene(BaseScene):
         """
         if self.sim_world is None or getattr(self.sim_world, "stage", None) is None:
             return
-        from real2sim2real.utils.pose import read_prim_world_pose
-
         keys = prim_paths if prim_paths is not None else list(self.poses.keys())
         for raw in keys:
             path = normalize_prim_path(raw)

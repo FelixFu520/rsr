@@ -11,16 +11,16 @@ from typing import Any
 import numpy as np
 
 from real2sim2real.core.logger import get_logger
-from real2sim2real.utils.isaacsim_utils.modify_stage_utils import (
-    ensure_xform,
-    pump_frames,
-    spawn_reference,
-)
 from real2sim2real.utils.isaacsim_utils.openusd_utils import (
+    ensure_xform,
     normalize_prim_path,
     resolve_usd_path,
+    spawn_reference,
 )
-from real2sim2real.utils.isaacsim_utils.physics_utils import disable_subtree_collision
+from real2sim2real.utils.isaacsim_utils.physics_utils import (
+    disable_subtree_collision,
+    pump_frames,
+)
 
 _LOG = get_logger(__name__)
 

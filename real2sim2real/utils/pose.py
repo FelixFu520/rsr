@@ -166,15 +166,34 @@ def look_at_quat_wxyz(
     target: Sequence[float],
     up: Sequence[float] = (0.0, 0.0, 1.0),
 ) -> np.ndarray:
-    """USD 相机朝向:本地 ``-Z`` 指向 ``target``.
+    """根据相机位置和注视点计算 USD 相机的朝向四元数.
+
+    本地 ``-Z`` 为观察方向,指向 ``target``;本地 ``+Y`` 为画面向上方向,
+    本地 ``+X`` 为画面向右方向. ``up`` 用于确定画面倾斜方向,
+    正常情况下本地 ``+Y`` 对齐其在垂直于观察方向的平面上的投影.
+    本函数只计算姿态,不移动相机,也不直接操作仿真对象.
+
+    计算过程:归一化 ``target - eye`` 得到观察方向,取反作为本地 ``+Z`` 轴;
+    通过 ``up × z_axis`` 得到本地 ``+X`` 轴,再通过 ``z_axis × x_axis``
+    得到本地 ``+Y`` 轴;将三个轴按列组成旋转矩阵,再转换为四元数.
 
     Args:
-        eye: 相机世界位置.
-        target: 注视点世界位置.
-        up: 世界上方向,默认 ``+Z``.
+        eye: 相机在世界坐标系中的位置 ``(x,y,z)``.
+        target: 注视点在世界坐标系中的位置 ``(x,y,z)``.
+        up: 世界坐标中的参考向上方向,默认 ``+Z``.
 
     Returns:
-        单位四元数 ``(w,x,y,z)``.
+        形状为 ``(4,)`` 的单位四元数数组 ``[w,x,y,z]``,
+        表示相机本地坐标系到世界坐标系的旋转.
+
+    Notes:
+        当相机与目标的距离小于 ``1e-8`` 时,返回绕 X 轴旋转 90° 的固定姿态.
+        当 ``up × z_axis`` 的模小于 ``1e-8`` 时,尝试用世界 ``+Y`` 作为备用方向;
+        若观察方向也与世界 ``+Y`` 平行,备用方向仍会退化,当前实现未进一步处理.
+
+    Example:
+        ``look_at_quat_wxyz((3, 0, 2), (0, 0, 0))`` 计算位于 ``(3,0,2)``
+        的相机看向原点时所需的姿态,以世界 ``+Z`` 为参考向上方向.
     """
     eye_v = np.asarray(eye, dtype=float).reshape(-1)[:3]
     tgt = np.asarray(target, dtype=float).reshape(-1)[:3]
@@ -251,17 +270,31 @@ def compose_pose(
 
 
 def quat_multiply(a: Sequence[float], b: Sequence[float]) -> np.ndarray:
-    """Hamilton 积 ``a ⊗ b``,两个四元数均为 ``(w,x,y,z)``.
+    """通过 Hamilton 积 ``a ⊗ b`` 合成两个旋转,四元数顺序均为 ``(w,x,y,z)``.
+
+    对有效的旋转四元数,结果满足 ``R(a ⊗ b) = R(a) @ R(b)``.
+    因此作用于列向量时,先执行 ``b`` 的旋转,再执行 ``a`` 的旋转.
+    四元数乘法通常不满足交换律,交换参数会改变合成后的姿态.
+
+    例如,若 ``a`` 为父坐标系的世界姿态,``b`` 为物体相对父系的姿态,
+    则 ``quat_multiply(a, b)`` 得到物体的世界姿态;本函数不处理平移.
 
     Args:
-        a: 左乘四元数.
-        b: 右乘四元数.
+        a: 左侧旋转四元数 ``(w,x,y,z)``,通常使用单位四元数.
+        b: 右侧旋转四元数 ``(w,x,y,z)``,通常使用单位四元数.
 
     Returns:
-        单位化后的 ``(w,x,y,z)``.
+        形状为 ``(4,)`` 的 NumPy 数组,按 ``[w,x,y,z]`` 返回合成结果.
+        乘积的模不小于 ``1e-12`` 时,结果会被单位化以消除模长偏差.
+
+    Notes:
+        分母下限 ``1e-12`` 仅用于避免除零,不保证退化输入得到有效旋转;
+        例如任一输入为零四元数时,返回零四元数,而非单位四元数.
     """
     aw, ax, ay, az = (float(v) for v in a)
     bw, bx, by, bz = (float(v) for v in b)
+    # 标量部分: aw*bw - dot(a_xyz, b_xyz).
+    # 向量部分: aw*b_xyz + bw*a_xyz + cross(a_xyz, b_xyz).
     q = np.array(
         [
             aw * bw - ax * bx - ay * by - az * bz,
@@ -271,7 +304,7 @@ def quat_multiply(a: Sequence[float], b: Sequence[float]) -> np.ndarray:
         ],
         dtype=float,
     )
-    return q / max(float(np.linalg.norm(q)), 1e-12)
+    return q / max(float(np.linalg.norm(q)), 1e-12)  # 单位化乘积,分母设下限避免除零
 
 
 def quat_rotate(quat_wxyz: Sequence[float], vec: Sequence[float]) -> np.ndarray:
@@ -298,44 +331,6 @@ def quat_inv_rotate(quat_wxyz: Sequence[float], vec: Sequence[float]) -> np.ndar
         逆旋转后的 3D 向量,shape ``(3,)``.
     """
     return quat_wxyz_to_matrix(quat_wxyz).T @ np.asarray(vec, dtype=float)  # R.T ≡ R^{-1}
-
-
-def read_prim_world_pose(stage: object, prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
-    """从 USD stage 读取 prim 当前世界位姿(含物理驱动后的实时变换);无效则 ``None``.
-
-    与摆放阶段缓存的静态位姿不同,本函数每次都重新计算,
-    适合在物理仿真步进过程中轮询被抓物体等动态 prim。
-
-    Args:
-        stage: 当前 USD stage;None 时直接返回 None(stub).
-        prim_path: 目标 prim 路径,会先 ``normalize_prim_path``.
-
-    Returns:
-        世界 ``(position, orientation_wxyz)``;stage/prim 无效或非 Xformable
-        则为 ``None``.
-    """
-    if stage is None:
-        return None  # 未绑定 stage(stub)时无法查
-    # 函数内 import,避免 pose 配置路径拉起整个 isaacsim_utils
-    from real2sim2real.utils.isaacsim_utils import normalize_prim_path  # noqa: PLC0415
-
-    # Kit 运行时对象:用字符串路径取 prim,不存在则后面判 Invalid
-    prim = stage.GetPrimAtPath(normalize_prim_path(prim_path))  # type: ignore[attr-defined]
-    if prim is None or not prim.IsValid():
-        return None  # 路径尚未 spawn 或已被删
-    try:
-        from pxr import Usd, UsdGeom  # noqa: PLC0415  # 仅 Isaac 进程有 pxr
-
-        xf = UsdGeom.Xformable(prim)  # 非 Xformable 会在下面 except
-        mat = xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default())  # 含父链
-        trans = mat.ExtractTranslation()  # 世界平移
-        quat = mat.ExtractRotationQuat()  # pxr 四元数
-        imag = quat.GetImaginary()  # (x, y, z)
-        pos = np.array([trans[0], trans[1], trans[2]], dtype=float)  # pxr → numpy
-        ori = np.array([quat.GetReal(), imag[0], imag[1], imag[2]], dtype=float)  # wxyz
-        return pos, ori  # 与 poses 缓存同约定 (pos, wxyz)
-    except Exception:  # noqa: BLE001  # 非 Xformable 等
-        return None  # 读失败不当致命错误,Job 可跳过该 prim
 
 
 def axis_shift_into_span(

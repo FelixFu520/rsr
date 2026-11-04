@@ -92,14 +92,15 @@ def snap_base_to_support(
     Returns:
         贴合后的 ``(世界 pos, wxyz)``;量不到底座则原样返回.
     """
-    from real2sim2real.utils.isaacsim_utils.modify_stage_utils import apply_pose, pump_frames
     from real2sim2real.utils.isaacsim_utils.openusd_utils import (
+        apply_pose,
         find_prim_path,
         get_stage,
         is_world_frame,
         prim_aabb,
         prim_aabb_z_max,
     )
+    from real2sim2real.utils.isaacsim_utils.physics_utils import pump_frames
     from real2sim2real.utils.misc import emit_log
     from real2sim2real.utils.pose import snap_aabb_onto_support
 

@@ -19,6 +19,24 @@ _SKIP_COLLIDER_NAME_RE = re.compile(
 _MAX_STATIC_COLLIDER_SPAN_M = 250.0
 
 
+def pump_frames(sim_world: Any, frames: int) -> None:
+    """泵若干帧 Kit 主循环,让刚挂上的 USD 完成加载与同步.
+
+    走 ``BaseSimWorld.update``(Isaac 泵 App,stub no-op).不跑物理.
+
+    Args:
+        sim_world: 已绑定的仿真世界;None 则什么都不做.
+        frames: 要泵的帧数;<=0 则什么都不做.
+
+    Returns:
+        None.
+    """
+    if sim_world is None:
+        return
+    for _ in range(max(0, frames)):
+        sim_world.update()
+
+
 def set_kinematic(
     stage: Any,
     root_path: str,
