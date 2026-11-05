@@ -30,13 +30,19 @@ from real2sim2real.utils import (
     uv_patch_triangles,
 )
 from real2sim2real.utils.newton_step import KinematicVBDStepper
-from real2sim2real.utils.volume_mesh import TetEmbedding, orient_tetrahedra, signed_tet_volumes
+from real2sim2real.utils.volume_mesh import (
+    TetEmbedding,
+    clean_tetrahedral_mesh,
+    perimeter_stiffness_scales,
+    signed_tet_volumes,
+    surface_vertex_normals,
+)
 
 
 def _load_runtime_dependencies() -> None:
     """世界初始化后才导入 Kit 与 USD 运行时。"""
     global Articulation, DeformablePrim, Gf, PhysicsScene, PhysxSchema, RigidPrim, Sdf
-    global SimulationManager, Usd, UsdGeom, UsdPhysics, XformPrim, deformableUtils
+    global SimulationManager, Usd, UsdGeom, UsdPhysics, Vt, XformPrim, deformableUtils
     global get_physx_attachment_private_interface, omni
     import omni.timeline
     import omni.usd
@@ -54,7 +60,7 @@ def _load_runtime_dependencies() -> None:
     from omni.physx.scripts.ifaces import (
         get_physx_attachment_private_interface,
     )
-    from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics
+    from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics, Vt
 
 
 class SortingPlannerConfig(BaseConfig):
@@ -483,10 +489,8 @@ _VOLUME_MESH_CACHE: dict[str, tuple[np.ndarray, np.ndarray, TetEmbedding]] = {}
 
 def volume_tetmesh_from_surface(
     vertices: np.ndarray, face_indices: np.ndarray, resolution: int
-) -> tuple[object, TetEmbedding, np.ndarray, np.ndarray]:
+) -> tuple[TetEmbedding, np.ndarray, np.ndarray]:
     """Cook a volume with interior layers and bind the original textured render mesh."""
-    import newton
-
     origin = np.asarray(vertices, dtype=np.float64).mean(axis=0)
     relative = np.asarray(vertices, dtype=np.float64) - origin
     faces = np.asarray(face_indices, dtype=np.int32).reshape(-1, 3)
@@ -503,15 +507,14 @@ def volume_tetmesh_from_surface(
         points, indices = deformableUtils.compute_voxel_tetrahedral_mesh(
             conforming, indices, Gf.Vec3f(1.0), resolution
         )
-        nodes = np.asarray(points, dtype=np.float64)
-        tets = orient_tetrahedra(nodes, np.asarray(indices))
+        nodes, tets = clean_tetrahedral_mesh(np.asarray(points), np.asarray(indices))
         embedding = TetEmbedding.build(relative, nodes, tets)
         if len(_VOLUME_MESH_CACHE) >= 8:
             _VOLUME_MESH_CACHE.clear()
         _VOLUME_MESH_CACHE[key] = nodes, tets, embedding
     nodes, tets, embedding = _VOLUME_MESH_CACHE[key]
     world_nodes = nodes + origin
-    return newton.TetMesh(world_nodes, tets.flatten()), embedding, world_nodes, tets
+    return embedding, world_nodes, tets
 
 
 def restore_cached_rest_mesh(stage: Usd.Stage, mesh_path: str) -> bool:
@@ -919,7 +922,7 @@ class NewtonSortingWorld:
             self.label_triangles = uv_patch_triangles(faces, values, label_uv_bounds)
             if mesh.GetOrientationAttr().Get() == "leftHanded":
                 self.label_triangles = self.label_triangles[:, [0, 2, 1]]
-        tet, self._embedding, rest_nodes, self._tet_indices = volume_tetmesh_from_surface(
+        self._embedding, rest_nodes, self._tet_indices = volume_tetmesh_from_surface(
             world_vertices, faces, params.volume_mesh_resolution
         )
         # Keep the small deformable near the float32 solver origin. USD/FK and all
@@ -942,8 +945,36 @@ class NewtonSortingWorld:
             )
         self._mesh = mesh
         self._world_to_local = self._mesh_world.GetInverse()
+        self._world_to_local_numpy = np.array(self._world_to_local, dtype=np.float64)
+        self._normal_faces = (
+            faces.reshape(-1, 3) if mesh.GetNormalsInterpolation() == "vertex" else None
+        )
+        self._normal_sign = -1.0 if mesh.GetOrientationAttr().Get() == "leftHanded" else 1.0
 
         k_mu, k_lambda = _lame(params.youngs_modulus, params.poisson_ratio)
+        # Asset-local material profile follows the parcel through pose randomization.
+        # Older USD assets without these optional attributes retain uniform stiffness.
+        profile = {}
+        for name, default in (
+            ("perimeterStiffnessScale", 1.0),
+            ("softeningStartRadius", 0.2),
+            ("softeningEndRadius", 0.6),
+        ):
+            attr = mesh.GetPrim().GetAttribute(f"rsr:{name}")
+            value = attr.Get() if attr else None
+            profile[name] = float(value) if value is not None else default
+        centers = rest_nodes[self._tet_indices].mean(axis=1)
+        local_centers = (
+            np.column_stack((centers, np.ones(len(centers)))) @ self._world_to_local_numpy
+        )[:, :3]
+        stiffness = perimeter_stiffness_scales(
+            local_centers,
+            np.asarray(mesh.GetPointsAttr().Get()),
+            profile["perimeterStiffnessScale"],
+            (profile["softeningStartRadius"], profile["softeningEndRadius"]),
+        )
+        self._quality["youngs_modulus_min_pa"] = float(params.youngs_modulus * stiffness.min())
+        self._quality["youngs_modulus_max_pa"] = float(params.youngs_modulus * stiffness.max())
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         builder.default_shape_cfg.mu = float(params.shape_mu)
 
@@ -1099,8 +1130,8 @@ class NewtonSortingWorld:
                 if params.parcel_mass_kg is not None
                 else float(params.density)
             ),
-            k_mu=k_mu,
-            k_lambda=k_lambda,
+            k_mu=k_mu * stiffness,
+            k_lambda=k_lambda * stiffness,
             k_damp=float(params.k_damp),
             particle_radius=float(params.particle_radius),
         )
@@ -1162,6 +1193,7 @@ class NewtonSortingWorld:
             tetrahedra=int(len(self._tet_indices)),
             rest_volume_m3=self._rest_volume,
             mass_kg=self.mass_kg,
+            fill_stiffness_profile=profile,
             self_collision=params.self_collision,
             fingers=len(self._kinematics),
             bodies=int(self.model.body_count),
@@ -1577,13 +1609,17 @@ class NewtonSortingWorld:
         return rows
 
     def write_surface_to_usd(self) -> None:
-        """把 Newton 表面节点变回 Mesh 局部坐标,保留 UV/材质."""
+        """Write deformed points and opted-in smooth normals, retaining UVs and materials."""
         nodes = self.surface_positions()
-        local = [
-            self._world_to_local.Transform(Gf.Vec3d(float(p[0]), float(p[1]), float(p[2])))
-            for p in nodes
-        ]
-        self._mesh.GetPointsAttr().Set([Gf.Vec3f(p[0], p[1], p[2]) for p in local])
+        matrix = self._world_to_local_numpy
+        local = nodes @ matrix[:3, :3] + matrix[3, :3]
+        self._mesh.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(local.astype(np.float32)))
+        self._mesh.GetExtentAttr().Set(
+            [Gf.Vec3f(*local.min(axis=0)), Gf.Vec3f(*local.max(axis=0))]
+        )
+        if self._normal_faces is not None:
+            normals = self._normal_sign * surface_vertex_normals(local, self._normal_faces)
+            self._mesh.GetNormalsAttr().Set(Vt.Vec3fArray.FromNumpy(normals.astype(np.float32)))
 
 
 _LOGGER = get_logger("ProM6Relay")
@@ -4705,6 +4741,23 @@ class ProM6LeftClothingDragController:
                     f"delta_z={lifted:.4f} m"
                 )
 
+    def _check_transfer_grasp(self, side: str, dt: float) -> None:
+        """Reject sustained loss of either jaw while carrying the parcel."""
+        world = getattr(self, "newton_world", None)
+        if world is None:
+            return
+        contacts = world.contact_breakdown()
+        elapsed = getattr(self, "_transfer_contact_loss_s", {})
+        elapsed[side] = (
+            elapsed.get(side, 0.0) + dt if contacts.get(f"{side}_min_jaw", 0) <= 0 else 0.0
+        )
+        self._transfer_contact_loss_s = elapsed
+        peak = getattr(self, "_transfer_max_contact_loss_s", {})
+        peak[side] = max(peak.get(side, 0.0), elapsed[side])
+        self._transfer_max_contact_loss_s = peak
+        if elapsed[side] >= 0.2:
+            raise RuntimeError(f"{side} transfer lost bilateral parcel grasp: contacts={contacts}")
+
     def _apply_live_grasp_geometry(
         self, minimum: np.ndarray, maximum: np.ndarray, *, preserve_height: bool = False
     ) -> None:
@@ -5263,6 +5316,7 @@ class ProM6LeftClothingDragController:
         return True
 
     def _step_drag(self, dt: float) -> None:
+        self._check_transfer_grasp("left", dt)
         progress = _timed_smoothstep(self.phase_time, self.timing.left_drag_seconds)
         target = (1.0 - progress) * self.drag_start + progress * self.drag_target
         position_error, orientation_error, step_norm = self._command_pose(target, dt)
@@ -6087,6 +6141,7 @@ class ProM6LeftClothingDragController:
             previous_error[3:]
         ) > math.radians(12.0):
             raise RuntimeError("Right transfer lost safe Cartesian tracking")
+        self._check_transfer_grasp("right", dt)
         _, _, center = self._node_aabb()
         already_inside = center_is_in_belt_xy(center, self.belt_bounds)
         commanded_distance = self._right_drag_commanded_distance_m
@@ -6865,6 +6920,7 @@ class SortingPlanner(BasePlanner):
             "right_transfer_max_orientation_error_rad": getattr(
                 controller, "_right_transfer_max_orientation_error_rad", None
             ),
+            "transfer_max_contact_loss_s": getattr(controller, "_transfer_max_contact_loss_s", {}),
             "parcel_physics": (
                 controller.newton_world.volume_quality()
                 if controller.newton_world is not None

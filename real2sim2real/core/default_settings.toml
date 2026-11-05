@@ -9,9 +9,6 @@ backend = "stub"  # 不启动 Kit
 
 [scene]
 backend = "stub"
-# sorting 后端专用几何；0 保留源资产厚度，修改仅写入当前 stage
-# parcel_thickness_m = 0.0
-# parcel_mesh_prim_path = "/World/scene/ImportedBaggedClothing/Asset/visual/visual"
 
 [robot]
 backend = "stub"
