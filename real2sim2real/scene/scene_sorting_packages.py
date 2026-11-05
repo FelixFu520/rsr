@@ -167,6 +167,17 @@ class SortingSceneConfig(BaseConfig):
     cameras: list[SceneCameraConfig] = Field(
         default_factory=list, description="第三人称等场景相机;机载相机写在 [[robot.cameras]]"
     )
+    parcel_thickness_m: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=0.2,
+        allow_inf_nan=False,
+        description="目标包裹世界 Z 厚度(m);0 保留原资产，修改仅写入当前 stage",
+    )
+    parcel_mesh_prim_path: str = Field(
+        default="/World/scene/ImportedBaggedClothing/Asset/visual/visual",
+        description="调整厚度的包裹显示 Mesh",
+    )
 
 
 _INFEED_JITTER_MARGIN_M = 0.02
@@ -253,6 +264,7 @@ class SortingScene(BaseScene):
         self.log.info("登记分拣台位姿成功", n_prims=len(self.poses))
 
         self._hide_embedded_robot()
+        self._set_parcel_thickness()
 
         for cam in self.config.cameras:
             pos, _ = place_asset(
@@ -274,6 +286,33 @@ class SortingScene(BaseScene):
         self.seed_poses_realtime()
 
     # ============= 辅助函数 <==========
+
+    def _set_parcel_thickness(self) -> None:
+        """Scale world-space thickness about the lower surface, retaining UVs and XY size."""
+        if not self.config.parcel_thickness_m:
+            return
+        from pxr import Gf, UsdGeom, Vt
+
+        stage = self.sim_world.stage
+        mesh = UsdGeom.Mesh(stage.GetPrimAtPath(self.config.parcel_mesh_prim_path))
+        if not mesh:
+            raise RuntimeError(f"缺少包裹 Mesh: {self.config.parcel_mesh_prim_path}")
+        transform = UsdGeom.XformCache().GetLocalToWorldTransform(mesh.GetPrim())
+        world = np.array([transform.Transform(Gf.Vec3d(*p)) for p in mesh.GetPointsAttr().Get()])
+        bottom = float(world[:, 2].min())
+        height = float(np.ptp(world[:, 2]))
+        if height < 1e-6:
+            raise RuntimeError("包裹原始厚度为零")
+        world[:, 2] = bottom + (world[:, 2] - bottom) * self.config.parcel_thickness_m / height
+        inverse = transform.GetInverse()
+        local = np.array([inverse.Transform(Gf.Vec3d(*p)) for p in world], dtype=np.float32)
+        mesh.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(local))
+        mesh.GetExtentAttr().Set(
+            [Gf.Vec3f(*local.min(axis=0).tolist()), Gf.Vec3f(*local.max(axis=0).tolist())]
+        )
+        self.log.info(
+            "已设置包裹厚度", original_m=height, thickness_m=self.config.parcel_thickness_m
+        )
 
     def _hide_embedded_robot(self) -> None:
         """关掉场景包里自带的机器人,并把其世界位姿留给 Job 去摆独立引用.

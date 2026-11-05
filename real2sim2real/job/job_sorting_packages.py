@@ -178,7 +178,7 @@ class SortingJob(BaseJob):
         """``collect_episodes``:每集开盘之前,相对入带摆放位 XY 抖动包裹.
 
         必须先恢复静止网格再量 AABB / 重建 Newton:上一集写回的变形表面
-        不能再做星形四面体.
+        不能用来重新生成体积网格.
 
         Args:
             target: 本轮搬运目标.
@@ -928,7 +928,7 @@ class SortingJob(BaseJob):
         ms_step: float,
         ms_record: float,
     ) -> dict[str, Any]:
-        """``_run_collect_loop`` 结束时并入 ``last_stats``;默认空.
+        """记录实际采集负载下的步耗时和实时率，合并入 episode metadata.
 
         Args:
             physics_i: 已跑物理步.
@@ -942,8 +942,16 @@ class SortingJob(BaseJob):
         Returns:
             任务统计;不要重复写 ``steps``.
         """
-        del physics_i, record_i, t0, timeout_reason, ms_plan, ms_step, ms_record
-        return {}  # 基类只写 steps;子类补 rtf/抬升等,勿重复 steps
+        elapsed = max(time.monotonic() - t0, 1e-9)
+        return {
+            "physics_frames": physics_i,
+            "wall_time_s": elapsed,
+            "realtime_factor": physics_i / self.config.physics_hz / elapsed,
+            "mean_plan_ms": ms_plan / max(physics_i, 1),
+            "mean_step_ms": ms_step / max(physics_i, 1),
+            "mean_record_ms": ms_record / max(record_i, 1),
+            "timeout_reason": timeout_reason or None,
+        }
 
     def episode_done_hook(self, status: str) -> None:
         """执行成功后保留抓点,供下一集采样时避开其邻域.

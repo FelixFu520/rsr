@@ -1,14 +1,14 @@
 # 分拣快递:工厂背景 + 分拣场景包 + Pro-M6 分三个 USD 引用
 #
 # /World/background  → assets/Background/Factory/factory_002/Factory_Interior.usd
-# /World/scene       → assets/Scene/sorting_station/composed/scene.usdc(关掉包内自带机器人)
+# /World/scene       → assets/Scene/sorting_station/composed/scene_parcel_5cm.usdc(包裹厚度已保存)
 # /World/robots      → assets/Robot/pro_m6_696/pro_m6_696.usda(引用场景包里的视觉机器人)
 # 只引用,不改各 USD 内部尺度.机器人源 prim 已带工位世界位姿.
 
 [logging]
 level = "INFO"
 console = true
-log_file = "outputs/sorting_pro_m6/rsr.log"
+log_file = "outputs/sorting_pro_m6_usd_5cm/rsr.log"
 
 [sim_world]
 backend = "isaacsim"
@@ -29,12 +29,15 @@ auto_exposure = false
 
 [scene]
 backend = "sorting"
-usd_path = "assets/Scene/sorting_station/composed/scene.usdc"
+usd_path = "assets/Scene/sorting_station/composed/scene_parcel_5cm.usdc"
 prim_path = "/World/scene"
 hide_prim_paths = ["/World/scene/Pro_m6_696_dynamics_fixed"]
 platform_prim_path = "/World/scene/platform/Empty/Plane/Plane_002"
 conveyor_in_prim_path = "/World/scene/ConveyorBelt_A06_01"
 conveyor_out_prim_path = "/World/scene/ConveyorBelt_A06"
+# 5 cm 初始厚度已写入上面的 USD;0 表示保留资产网格，不在运行时调整。
+parcel_thickness_m = 0.0
+parcel_mesh_prim_path = "/World/scene/ImportedBaggedClothing/Asset/visual/visual"
 
 [[scene.objects]]
 name = "bagged_clothing"
@@ -84,27 +87,42 @@ infeed_prim_path = "/World/scene/ConveyorBelt_A06_01"
 runtime_root_prim_path = "/World/ProM6_SortingRuntime"
 physics_device = "cuda:0"
 physics_hz = 60.0
-replay_cache_dir = "outputs/sorting_pro_m6/replay_cache"
-drive_mode = "callback"
-youngs_modulus = 10000.0
-poisson_ratio = 0.3
+replay_cache_dir = "outputs/sorting_pro_m6_usd_5cm/replay_cache"
+drive_mode = "manual"
+youngs_modulus = 100000.0
+poisson_ratio = 0.45
 density = 70.0
+# 实物目标：5 cm 厚、0.3 kg；密度按体积网格计算。弹性参数仍需实测标定。
+parcel_mass_kg = 0.3
+volume_mesh_resolution = 28
+elasticity_damping = 10.0
+self_collision = true
+contact_stiffness = 30000.0
+contact_damping = 0.2
+grasp_depth_m = 0.008
+gripper_closed_position_rad = 0.65
+min_finger_contacts = 20
+newton_cuda_graph = true
+friction_epsilon = 0.001
+support_mu = 0.5
 particle_radius = 0.0015
 soft_contact_mu = 0.5
 shape_mu = 1.5
 newton_substeps = 10
-vbd_iterations = 10
+vbd_iterations = 40
 min_lift_height_m = 0.08
 # 入带时标签朝上：主体中部抓取 + 较低提起 + 避免过压下放，平台松爪后校验真实标签法线。
 # 双臂在主体中心区域随机抓取，候选需通过下探和提起 IK；[0, 0] 恢复中心优先。
 grasp_jitter_fraction_xy = [0.3, 0.35]
 grasp_random_candidates = 12
+max_grasp_offset_m = 0.04
 grasp_random_seed = 0
 grasp_min_distance_m = 0.01
 keep_label_up = true
 label_uv_bounds = [0.14, 0.50, 0.32, 0.615]
 label_up_min_cos = 0.9
 left_lift_height_m = 0.14
+right_lift_height_m = 0.14
 # 若仍有袋尾接触入带，稳握后按 0.02 m 小步补抬，最多额外 0.12 m；离带检查保持开启。
 left_setdown_offset_m = 0.0
 belt_speed_mps = 0.5
@@ -128,7 +146,7 @@ viewport_camera_prims = [
 
 [job.recorder]
 format = "lerobot_v2"
-output_dir = "outputs/sorting_pro_m6"
+output_dir = "outputs/sorting_pro_m6_usd_5cm"
 task = "relay the bagged package from the infeed belt to the platform, then to the outfeed belt"
 robot_type = "pro_m6"
 fps = 15
