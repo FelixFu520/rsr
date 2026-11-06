@@ -1,0 +1,35 @@
+# Experimental solver comparison: stable dynamics; shirt grasp is not accepted.
+inherit = "franka_demo_common.toml"
+
+[sim_world]
+physics_engine = "newton"
+newton_execution = "direct"
+newton_solver = "xpbd"
+
+[scene]
+object_kind = "cloth"
+target_xy = [0.30, 0.0]
+grasp_vertex = 1922
+
+[robot]
+arm_stiffness = 6000.0
+arm_damping = 300.0
+
+[planner]
+cloth_solver = "xpbd"
+closed_finger_m = 0.006
+grasp_offset_m = [0.0, 0.0, 0.010]
+newton_substeps = 40
+solver_iterations = 20
+# Newton 1.6.1 XPBD cloth has no topology-aware self-collision support.
+# Preserve garment/robot/table contacts; disable raw neighbor particle repulsion.
+xpbd_self_contact = false
+# Uniform vertex mass preserves 0.2 kg total; this differs from VBD's area lumping.
+xpbd_mass_lumping = "uniform"
+xpbd_spring_stiffness = 30.0 # kg/s^2, numerically the same as N/m
+xpbd_spring_damping = 0.0 # kg/s, numerically the same as N*s/m
+cloth_bend_stiffness = 0.001
+cloth_bend_damping = 0.0
+
+[job]
+output_dir = "outputs/franka_cloth_newton_xpbd_unified"

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pydantic import Field
-
 from real2sim2real.core.config import BaseConfig
 
 

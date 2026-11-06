@@ -1,0 +1,25 @@
+inherit = "franka_demo_common.toml"
+
+[sim_world]
+physics_engine = "newton"
+newton_execution = "direct"
+newton_solver = "mujoco"
+
+[scene]
+object_kind = "cloth"
+target_xy = [0.30, 0.0]
+grasp_vertex = 1922
+
+[robot]
+# Force-driven MuJoCo needs enough arm stiffness to limit static gravity sag.
+arm_stiffness = 6000.0
+arm_damping = 300.0
+
+[planner]
+cloth_solver = "vbd"
+closed_finger_m = 0.006
+# Compensate measured arm sag while keeping the fingertips above the table.
+grasp_offset_m = [0.0, 0.0, 0.010]
+
+[job]
+output_dir = "outputs/franka_cloth_newton_mujoco"

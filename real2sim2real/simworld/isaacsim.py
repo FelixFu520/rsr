@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import select
 import sys
-from typing import Any
+from collections.abc import Callable
+from typing import Any, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from real2sim2real.core.config import BaseConfig
 from real2sim2real.core.logger import get_logger
@@ -26,8 +27,40 @@ class IsaacsimSimWorldConfig(BaseConfig):
         default="RayTracedLighting", description="RayTracedLighting速度快, PathTracing渲染效果逼真"
     )
     rt_subframes: int = Field(default=8, description="光线追踪渲染器会在后台迭代多少次子步.")
-    physics_dt: float = Field(default=1.0 / 60.0, description="物理步长.")
-    rendering_dt: float = Field(default=1.0 / 30.0, description="渲染步长.")
+    physics_dt: float = Field(default=1.0 / 60.0, ge=0, description="物理步长.")
+    rendering_dt: float = Field(default=1.0 / 30.0, ge=0, description="渲染步长.")
+    physics_engine: Literal["", "physx", "newton", "hybrid"] = Field(
+        default="",
+        description=(
+            "physx:仅 PhysX;newton:仅 Newton;hybrid:PhysX 刚体 + 应用手动 Newton 柔体."
+            "空值兼容旧 enable_newton,默认选择 physx."
+        ),
+    )
+    physx_solver: Literal["TGS", "PGS"] = Field(
+        default="TGS", description="PhysX 刚体与关节约束求解器,仅 physx/hybrid 使用."
+    )
+    newton_execution: Literal["usd", "direct"] = Field(
+        default="usd",
+        description=(
+            "纯 Newton 的执行方式:usd 使用 Isaac 官方 Newton 后端;"
+            "direct 由注册的 stepper 独占整个 Newton 模型,Kit 只负责显示."
+        ),
+    )
+    newton_solver: Literal["mujoco", "xpbd", "vbd", "featherstone", "semi_implicit"] = Field(
+        default="mujoco",
+        description="Newton 求解器;Isaac USD 后端支持 mujoco/xpbd/vbd,其余仅用于 direct.",
+    )
+    newton_substeps: int = Field(default=1, ge=1, description="每个 Newton 物理步的子步数.")
+    newton_iterations: int = Field(default=10, ge=1, description="Newton 约束求解迭代数.")
+    newton_use_cuda_graph: bool = Field(
+        default=True, description="官方 Newton 后端使用 CUDA Graph."
+    )
+    newton_solver_options: dict[str, Any] = Field(
+        default_factory=dict, description="传给安装版本 Newton solver config 的额外参数."
+    )
+    newton_config_options: dict[str, Any] = Field(
+        default_factory=dict, description="传给安装版本 NewtonConfig 的额外参数."
+    )
     device: str = Field(
         default="",
         description="物理设备,如 cuda / cpu;空则沿用 Isaac 默认.人形策略须 cuda",
@@ -67,8 +100,25 @@ class IsaacsimSimWorldConfig(BaseConfig):
     auto_exposure: bool = Field(default=False, description="是否启用自动曝光.")
     enable_newton: bool = Field(
         default=False,
-        description=("启动后启用 Isaac 自带 isaacsim.pip.newton."),
+        description="兼容旧配置:physics_engine 为空时 True 选择 hybrid,False 选择 physx.",
     )
+
+    @property
+    def resolved_physics_engine(self) -> Literal["physx", "newton", "hybrid"]:
+        """返回显式引擎,或从旧 ``enable_newton`` 推导兼容模式."""
+        return self.physics_engine or ("hybrid" if self.enable_newton else "physx")
+
+    @model_validator(mode="after")
+    def _validate_newton_execution(self) -> IsaacsimSimWorldConfig:
+        if self.resolved_physics_engine != "physx" and self.physics_dt <= 0:
+            raise ValueError("Newton/hybrid 模式需要大于零的 physics_dt")
+        if (
+            self.resolved_physics_engine == "newton"
+            and self.newton_execution == "usd"
+            and self.newton_solver not in {"mujoco", "xpbd", "vbd"}
+        ):
+            raise ValueError("Isaac Newton USD 后端仅支持 mujoco/xpbd/vbd;其他求解器须选择 direct")
+        return self
 
 
 class IsaacsimSimWorld(BaseSimWorld):
@@ -76,10 +126,11 @@ class IsaacsimSimWorld(BaseSimWorld):
 
     职责:
     - 环境检查与 App / World 启停、步进
+    - 加载环境 USD 或背景引用
     - 视口辅助(camera gizmo / 独立预览窗)
-    - step 后跨对象同步(如抓取物 soft-attach;需先 ``attach_robot``)
+    - 为 direct/hybrid 模式调用应用注册的 Newton stepper
 
-    不负责读取 USD / 填充 stage;由 Scene ``init_scene`` 加载资产,``arrange`` 编排位姿。
+    额外场景资产与机器人分别由 Scene/Robot 初始化和编排位姿。
     """
 
     config_cls = IsaacsimSimWorldConfig
@@ -101,6 +152,32 @@ class IsaacsimSimWorld(BaseSimWorld):
         self.app: Any | None = None  # isaacsim.SimulationApp;init_world 后才有
         self.world: Any | None = None  # isaacsim.core.api.World;承载物理/渲染步进
         self.stage: Any | None = None  # 当前 USD stage,Scene/Robot 往这里挂 prim
+        self.physics_steps = 0
+        self._direct_playing = False
+        self._newton_stepper: Callable[[float], None] | None = None
+        self._newton_runtime_config: Any | None = None
+
+    @property
+    def physics_engine(self) -> Literal["physx", "newton", "hybrid"]:
+        """当前配置的实际物理模式;hybrid 不会启动官方 Newton USD 后端."""
+        return self.config.resolved_physics_engine
+
+    @property
+    def uses_direct_newton(self) -> bool:
+        """是否由应用直接拥有全部 Newton 动力学,PhysX 不参与积分."""
+        return self.physics_engine == "newton" and self.config.newton_execution == "direct"
+
+    def register_newton_stepper(self, stepper: Callable[[float], None] | None) -> None:
+        """注册 direct/hybrid 的 Newton 步进函数;hybrid 在 PhysX 步进后调用.
+
+        stepper 接收以秒为单位的 ``physics_dt``.应用负责模型、接触、状态同步与清理;
+        hybrid 是显式联合仿真,不会自动产生跨引擎的反作用力.
+        """
+        if stepper is not None and not callable(stepper):
+            raise TypeError("Newton stepper 必须可调用")
+        if stepper is not None and not (self.uses_direct_newton or self.physics_engine == "hybrid"):
+            raise ValueError("只有 direct Newton 或 hybrid 模式接受应用 Newton stepper")
+        self._newton_stepper = stepper
 
     # ==========> 仿真世界生命周期 <==========
 
@@ -127,6 +204,12 @@ class IsaacsimSimWorld(BaseSimWorld):
         }
         # 启动 Kit 进程内嵌 App,之后才能用 isaacsim.core / carb
         self.app: SimulationApp = SimulationApp(launch_config=launch_config)
+        import carb
+
+        # 显式模式由本组件选择.避免用户 Kit 设置在扩展加载时自动改成另一动力学所有者.
+        carb.settings.get_settings().set_bool(
+            "/exts/isaacsim.physics.newton/auto_switch_on_startup", False
+        )
 
         # (2) 启用可选插件
         # 占用图 / RTX 实验相机都是可选插件,须显式 enable 后再 update
@@ -134,19 +217,13 @@ class IsaacsimSimWorld(BaseSimWorld):
 
         enable_extension("isaacsim.asset.gen.omap")  # 占用图生成,规划/避障可能用到
         enable_extension("isaacsim.sensors.experimental.rtx")  # RTX CameraSensor 依赖此扩展
-        if self.config.enable_newton:
-            # 分拣接触抓取用自带 Newton/Warp;须在 import newton 之前加载
-            try:
-                enable_extension("isaacsim.pip.newton")
-            except Exception as exc:  # noqa: BLE001  # 部分构建只认 immediate
-                self.log.warning("enable_extension newton 失败,改 immediate", error=str(exc))
-                import omni.kit.app  # noqa: PLC0415  # Kit 扩展管理器
-
-                omni.kit.app.get_app().get_extension_manager().set_extension_enabled_immediate(
-                    "isaacsim.pip.newton", True
-                )
-            self.log.info("已启用 isaacsim.pip.newton")
-        self.app.update()  # 泵一帧,让刚 enable 的扩展真正加载进 Kit
+        if self.physics_engine != "physx":
+            # hybrid/direct 只加载库,不能启用会替代 PhysX 的 USD backend.
+            self._enable_newton_extension("isaacsim.pip.newton")
+        if self.physics_engine == "newton" and not self.uses_direct_newton:
+            self._enable_newton_extension("isaacsim.physics.newton")
+            self._enable_newton_extension("isaacsim.physics.newton.tensors")
+        self.update()  # 只泵 UI/扩展,不允许启动期间隐式推进物理
 
         # (3) 配置渲染设置
         # carb: Kit 运行时全局设置(RTX 视口).launch_config 只影响启动参数,
@@ -171,7 +248,6 @@ class IsaacsimSimWorld(BaseSimWorld):
         # 三个独立挂载点,把背景 USD 引用到 /World/background,避免背景尺度传到场景和机器人.
         # stage_usd_path 是例外:成品场景自带 /PhysicsScene 与绝对 prim 路径,
         # 必须整份 open 成 stage,否则 reference 只带进默认 prim 子树,路径与物理设置都会变。
-        from isaacsim.core.api import World  # App 启动后才能 import World
         from isaacsim.core.utils.stage import add_reference_to_stage, get_current_stage
 
         self._open_stage_usd()  # 未配置 stage_usd_path 时是 no-op,继续走背景 reference 通路
@@ -194,23 +270,36 @@ class IsaacsimSimWorld(BaseSimWorld):
                 )  # 如 cuda:PhysX 在 GPU 积分,非默认 CPU
             self.log.debug("设备和后端", device=device or "default", backend=physics_backend)
 
-        # 物理/渲染步长来自配置;单位固定米,与 cuRobo / USD 资产对齐
-        world_kwargs: dict[str, Any] = {
-            "stage_units_in_meters": 1.0,
-            "physics_dt": self.config.physics_dt,
-            "rendering_dt": self.config.rendering_dt,
-        }
-        # 新版 World 认 device/backend 就一并传入;旧版 TypeError 则丢掉,只靠上面 SimulationManager
-        if device:
-            world_kwargs["device"] = device
-        if physics_backend:
-            world_kwargs["backend"] = physics_backend
-        try:
-            self.world: World = World(**world_kwargs)
-        except TypeError:
-            world_kwargs.pop("device", None)
-            world_kwargs.pop("backend", None)
-            self.world = World(**world_kwargs)
+        if self.physics_engine == "newton":
+            import omni.usd
+            from pxr import UsdGeom
+
+            # deprecated World/PhysicsContext 会无条件应用 PhysxSceneAPI;纯 Newton 不能创建它.
+            if get_current_stage() is None:
+                omni.usd.get_context().new_stage()
+            UsdGeom.SetStageMetersPerUnit(get_current_stage(), 1.0)
+            if not self.uses_direct_newton:
+                self._configure_newton_usd()
+        else:
+            from isaacsim.core.api import World  # 仅 PhysX/hybrid 使用 legacy World
+
+            self._select_physics_engine("physx")
+            world_kwargs: dict[str, Any] = {
+                "stage_units_in_meters": 1.0,
+                "physics_dt": self.config.physics_dt,
+                "rendering_dt": self.config.rendering_dt,
+            }
+            if device:
+                world_kwargs["device"] = device
+            if physics_backend:
+                world_kwargs["backend"] = physics_backend
+            try:
+                self.world = World(**world_kwargs)
+            except TypeError:
+                world_kwargs.pop("device", None)
+                world_kwargs.pop("backend", None)
+                self.world = World(**world_kwargs)
+            self.world.get_physics_context().set_solver_type(self.config.physx_solver)
         self.stage = get_current_stage()  # 记下当前 stage,供 Scene/Robot 查 prim
         ensure_world_mount_roots(self.stage)  # /World/background、/scene、/robots 互为兄弟
         # 整份 open 过 stage 就不再挂背景;两者都空时只留 World 自建的空 /World 与三个挂载点
@@ -237,14 +326,106 @@ class IsaacsimSimWorld(BaseSimWorld):
             self.log.info("引用背景成功", prim_path=bg_prim, usd=usd_path)
             if not self.config.background_gravity:  # False:背景当静态碰撞,不随重力掉落
                 self._make_background_static()  # 只锁背景子树,不碰 /World/scene 与机器人
-        self.world.reset()  # 激活刚加入 stage 的物理体,建立 PhysX 场景
+        if self.world is not None:
+            self.world.reset()  # Newton 等待 Scene/Robot 装配完成后再解析模型
 
         # (6) 停止仿真,避免 Play 时 Kit 锁定编辑
         self.stop()
 
         # (7) 多泵几帧只保证 UI/Hydra 就绪;解决不了「无灯/贴图失败」导致的黑屏
         for _ in range(max(1, int(self.config.wait_init_time))):  # 至少泵 1 帧
-            self.app.update()  # 推进 Kit 主循环,让材质/灯光流式加载
+            self.update()  # 推进 Kit 主循环,让材质/灯光流式加载
+        self.log.info(
+            "physics_mode_initialized",
+            physics_engine=self.physics_engine,
+            newton_execution=self.config.newton_execution,
+            newton_solver=self.config.newton_solver if self.physics_engine != "physx" else None,
+        )
+
+    def _enable_newton_extension(self, name: str) -> None:
+        """加载所选模式必需的扩展,不可用时立即报错而不静默退回 PhysX."""
+        from isaacsim.core.utils.extensions import enable_extension
+
+        if not enable_extension(name):
+            raise RuntimeError(f"无法启用 {name};请使用包含 Newton 的 Isaac Sim 6.2 安装")
+
+    def _select_physics_engine(self, name: Literal["physx", "newton"]) -> None:
+        from isaacsim.core.simulation_manager import SimulationManager
+
+        if SimulationManager.get_active_physics_engine() != name:
+            if not SimulationManager.switch_physics_engine(name):
+                raise RuntimeError(f"无法切换 Isaac 物理后端到 {name}")
+
+    def _configure_newton_usd(self) -> None:
+        """使用本机 6.2 公开接口配置 MuJoCo/XPBD/VBD 的 USD 后端."""
+        from isaacsim.core.simulation_manager import PhysicsScene, SimulationManager
+        from isaacsim.physics.newton import (
+            MuJoCoSolverConfig,
+            NewtonConfig,
+            VBDSolverConfig,
+            XPBDSolverConfig,
+            configure_newton,
+            switch_newton_solver,
+        )
+
+        self._select_physics_engine("newton")
+        solver = self.config.newton_solver
+        solver_options = dict(self.config.newton_solver_options)
+        solver_options.pop("solver_type", None)
+        if solver in {"xpbd", "vbd"}:
+            solver_options.setdefault("iterations", self.config.newton_iterations)
+        solver_cls = {
+            "mujoco": MuJoCoSolverConfig,
+            "xpbd": XPBDSolverConfig,
+            "vbd": VBDSolverConfig,
+        }[solver]
+        config_options = dict(self.config.newton_config_options)
+        config_options.update(
+            num_substeps=self.config.newton_substeps,
+            physics_frequency=1.0 / self.config.physics_dt,
+            use_cuda_graph=self.config.newton_use_cuda_graph,
+            time_step_app=False,
+            solver_cfg=solver_cls(**solver_options),
+        )
+        self._newton_runtime_config = NewtonConfig(**config_options)
+        configure_newton(self._newton_runtime_config)
+        paths = PhysicsScene.get_physics_scene_paths() or ["/World/PhysicsScene"]
+        for path in paths:
+            scene = PhysicsScene(path)
+            try:
+                switched = switch_newton_solver(solver, scene.prim)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"安装的 Isaac Newton USD schemas 无法启用 {solver};"
+                    "请检查该版本功能支持,或使用 newton_execution='direct' 和应用 stepper"
+                ) from exc
+            if not switched:
+                raise RuntimeError(f"当前 Isaac Newton 后端不支持求解器: {solver}")
+            scene.set_dt(self.config.physics_dt)
+            scene.set_max_solver_iterations(self.config.newton_iterations)
+            if solver == "mujoco":
+                from isaacsim.core.simulation_manager.impl.mjc_scene import NewtonMjcScene
+
+                # Newton parser 读通用 Hz,SimulationManager.step 则通过 MJC wrapper 读秒.
+                # 只写前者会让实际积分静默保留 MuJoCo 默认的 0.002 s.
+                mjc_scene = NewtonMjcScene(scene.prim)
+                mjc_scene.set_dt(self.config.physics_dt)
+                mjc_scene.set_iterations(self.config.newton_iterations)
+        SimulationManager.set_default_physics_scene(paths[0])
+
+    @staticmethod
+    def _stop_timeline() -> None:
+        try:
+            import omni.timeline
+
+            timeline = omni.timeline.get_timeline_interface()
+            # 无条件覆盖延迟的 Play 命令;is_stopped 只描述已提交状态,不足以检查 pending Play.
+            timeline.stop()
+            commit = getattr(timeline, "commit", None)
+            if callable(commit):
+                commit()
+        except ImportError:
+            pass
 
     def destroy_world(self) -> None:
         """销毁仿真运行时(App/World).
@@ -255,6 +436,16 @@ class IsaacsimSimWorld(BaseSimWorld):
         Returns:
             None.
         """
+        active_error = sys.exc_info()[1]
+        exit_code = 1 if active_error is not None else 0
+        if active_error is not None:
+            # SimulationApp 默认 fast_shutdown 会 os._exit,先记录 traceback 并保留失败退出码.
+            self.log.error(
+                "simulation_failed_before_cleanup", error=str(active_error), exc_info=True
+            )
+        self._direct_playing = False
+        self._newton_stepper = None
+        self._newton_runtime_config = None
         if self.world is not None:  # 有 World 才需要清实例
             try:
                 self.world.clear_instance()  # 释放 World 单例与物理场景
@@ -265,14 +456,29 @@ class IsaacsimSimWorld(BaseSimWorld):
             try:
                 import omni.kit.app  # noqa: PLC0415
 
-                omni.kit.app.get_app().post_quit(0)  # 先发退出,避免 GUI 占着进程
+                omni.kit.app.get_app().post_quit(exit_code)
             except Exception:  # noqa: BLE001
                 pass
             try:
-                self.app.close()  # 退出 SimulationApp,关掉窗口/无头进程
+                try:
+                    self.app.close(exit_code=exit_code)
+                except TypeError:
+                    # 老版 close 无 exit_code;关闭快速退出,让调用方的原异常正常传播.
+                    if active_error is not None:
+                        config = getattr(self.app, "config", None)
+                        if isinstance(config, dict):
+                            config["fast_shutdown"] = False
+                        try:
+                            import carb
+
+                            carb.settings.get_settings().set_bool("/app/fastShutdown", False)
+                        except ImportError:
+                            pass
+                    self.app.close()
             except Exception as exc:  # noqa: BLE001
                 self.log.warning("SimulationApp.close 失败", error=str(exc))
             self.app = None  # 标记已关闭,is_running 将返回 False
+        self.stage = None
 
     def play(self) -> None:
         """开始仿真(Play):物理与时间轴同时跑.
@@ -283,12 +489,22 @@ class IsaacsimSimWorld(BaseSimWorld):
         Returns:
             None.
         """
+        if self.uses_direct_newton:
+            # 直接 Newton 独占积分.时间轴必须保持 Stop,否则 app.update 会额外推进 PhysX.
+            self._stop_timeline()
+            self._direct_playing = True
+            return
         if self.world is not None:  # World 未建时跳过,避免 AttributeError
             self.world.play()  # Isaac World 层开始物理
         try:
             import omni.timeline  # noqa: PLC0415  # Kit 时间轴接口,无 GUI 构建可能没有
 
-            omni.timeline.get_timeline_interface().play()  # 同步 Kit 时间轴到 Playing
+            timeline = omni.timeline.get_timeline_interface()
+            timeline.play()
+            commit = getattr(timeline, "commit", None)
+            if callable(commit):
+                # timeline.play 是延迟命令;立即提交后无渲染的第一步也必须能积分.
+                commit()
         except Exception:  # noqa: BLE001  # 无头/精简包没有 timeline 时忽略
             pass
 
@@ -300,12 +516,20 @@ class IsaacsimSimWorld(BaseSimWorld):
         Returns:
             None.
         """
+        if self.uses_direct_newton:
+            self._direct_playing = False
+            self._stop_timeline()
+            return
         if self.world is not None:  # World 未建则只尝试 timeline
             self.world.pause()  # 暂停物理步进
         try:
             import omni.timeline  # noqa: PLC0415  # 与 play() 对称,两边都 pause
 
-            omni.timeline.get_timeline_interface().pause()  # 暂停 Kit 时间轴
+            timeline = omni.timeline.get_timeline_interface()
+            timeline.pause()
+            commit = getattr(timeline, "commit", None)
+            if callable(commit):
+                commit()
         except Exception:  # noqa: BLE001  # timeline 不可用时静默
             pass
 
@@ -318,6 +542,10 @@ class IsaacsimSimWorld(BaseSimWorld):
         Returns:
             None.
         """
+        self._direct_playing = False
+        if self.uses_direct_newton:
+            self._stop_timeline()
+            return
         if self.world is not None:  # 有 World 才尝试 stop
             try:
                 self.world.stop()  # 理想路径:完全停止物理会话
@@ -326,12 +554,7 @@ class IsaacsimSimWorld(BaseSimWorld):
                     self.world.pause()  # 降级:至少停住物理
                 except Exception:  # noqa: BLE001  # pause 也失败则只靠 timeline
                     pass
-        try:
-            import omni.timeline  # noqa: PLC0415  # GUI 是否可编辑最终看时间轴状态
-
-            omni.timeline.get_timeline_interface().stop()  # 强制时间轴 Stop
-        except Exception:  # noqa: BLE001  # 无 timeline 时忽略
-            pass
+        self._stop_timeline()
 
     def is_running(self) -> bool:
         """Kit App 进程是否仍在跑(关窗口后为 False).
@@ -353,7 +576,13 @@ class IsaacsimSimWorld(BaseSimWorld):
         Returns:
             时间轴处于 Play 为 ``True``;未建或查询失败为 ``False``.
         """
-        if self.world is None:  # 世界还没建,不可能在 Play
+        if self.uses_direct_newton:
+            return self._direct_playing
+        if self.world is None:
+            if self.physics_engine == "newton" and self.app is not None:
+                import omni.timeline
+
+                return bool(omni.timeline.get_timeline_interface().is_playing())
             return False
         try:
             return bool(self.world.is_playing())  # 问 World 当前是否 Playing
@@ -369,6 +598,22 @@ class IsaacsimSimWorld(BaseSimWorld):
         Returns:
             None.
         """
+        self.physics_steps = 0
+        if self.uses_direct_newton:
+            self.stop()
+            return  # Newton 模型的 reset 归拥有模型的 planner/runtime 负责
+        if self.physics_engine == "newton" and self.app is not None:
+            from isaacsim.core.simulation_manager import SimulationManager
+            from isaacsim.physics.newton import acquire_stage, configure_newton
+
+            self.stop()
+            configure_newton(self._newton_runtime_config)
+            SimulationManager.invalidate_physics()
+            SimulationManager.initialize_physics()
+            stage = acquire_stage()
+            if stage is None or not stage.initialized:
+                raise RuntimeError("Newton USD 模型初始化失败,请检查 USD/solver 兼容性和 Kit 日志")
+            return
         if self.world is not None:  # 未 init 时 no-op
             self.world.reset()  # 重建 PhysX 视图,新 articulation 从此可控
 
@@ -385,12 +630,36 @@ class IsaacsimSimWorld(BaseSimWorld):
         Returns:
             None.
         """
+        if self.uses_direct_newton:
+            self._stop_timeline()
+            if self._direct_playing:
+                if self._newton_stepper is None:
+                    raise RuntimeError("direct Newton 模式尚未注册 stepper")
+                self._newton_stepper(self.config.physics_dt)
+                self.physics_steps += 1
+            if render:
+                self.update()
+            return
+        if self.physics_engine == "newton" and self.app is not None:
+            from isaacsim.core.simulation_manager import SimulationManager
+
+            if self.is_playing():
+                SimulationManager.step(steps=1, update_fabric=bool(render))
+                self.physics_steps += 1
+            if render:
+                self.update()
+            return
         if self.world is None:  # 未建 World 则无法步进
             return
+        was_playing = self.is_playing()
         try:
             self.world.step(render=False, update_fabric=bool(render))
         except TypeError:
             self.world.step(render=False)
+        if was_playing:
+            if self._newton_stepper is not None:
+                self._newton_stepper(self.config.physics_dt)
+            self.physics_steps += 1
         if render:
             render_fn = getattr(self.world, "render", None)
             if callable(render_fn):
@@ -408,7 +677,19 @@ class IsaacsimSimWorld(BaseSimWorld):
             None.
         """
         if self.app is not None:  # App 未启动则无法泵循环
-            self.app.update()  # 处理窗口事件、资源流式加载、视口绘制
+            if self.uses_direct_newton:
+                self._stop_timeline()
+            import carb
+
+            settings = carb.settings.get_settings()
+            key = "/app/player/playSimulations"
+            previous = settings.get(key)
+            # 与 Isaac SimulationContext.render 一致:刷新时不再隐式推进物理.
+            settings.set_bool(key, False)
+            try:
+                self.app.update()
+            finally:
+                settings.set(key, previous if previous is not None else True)
 
     # ==========> 仿真世界调试/可视化接口 <==========
 

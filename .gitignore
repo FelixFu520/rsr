@@ -2,7 +2,7 @@ app
 uv.lock
 assets/
 outputs/
-
+bak/
 tests/
 
 # Byte-compiled / optimized / DLL files

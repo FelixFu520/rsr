@@ -6,6 +6,143 @@
 
 > Agent / 贡献者：请先读 [`AGENTS.md`](AGENTS.md)（目录约定、扩展后端、配置与 CLI 约定）。
 
+## Franka 桌面抓取 Demo
+
+Demo 的 world、scene、robot、planner、job 分别以 `franka_demo` 注册；复用固定的
+`BaseJob.run()` 生命周期。机器人固定在桌面上，执行接近、闭合、抬升、保持、释放与撤离。
+从仓库根目录运行，资产位于 `assets/Demo`（复制资产和依赖，不改源文件）。
+组件实现分别位于 [world](real2sim2real/simworld/franka_demo.py)、
+[scene](real2sim2real/scene/scene_franka_demo.py)、
+[robot](real2sim2real/robot/robot_franka_demo.py)、
+[planner](real2sim2real/planner/planner_franka_demo.py) 和
+[job](real2sim2real/job/job_franka_demo.py)；
+共享引擎模式由 [isaacsim.py](real2sim2real/simworld/isaacsim.py) 提供。
+
+```bash
+./app/python.sh -m pip install -e ".[dev]"
+./app/python.sh scripts/prepare_franka_demo_assets.py
+
+# 刚性方块：PhysX + TGS
+./app/python.sh -m real2sim2real.core.cli collect run -c configs/franka_rigid_physx.toml
+
+# 衣服：PhysX 机械臂 + Newton VBD 衣服
+./app/python.sh -m real2sim2real.core.cli collect run -c configs/franka_cloth_hybrid.toml
+
+# 衣服：全部物理由 Newton 执行，Featherstone 机械臂 + VBD 衣服
+./app/python.sh -m real2sim2real.core.cli collect run -c configs/franka_cloth_newton.toml
+```
+
+无头运行可在命令前加 `RSR_SIM_WORLD__HEADLESS=true`；GUI 完成后保持窗口用
+`RSR_JOB__KEEP_OPEN=true`。每个示例写入独立的 `outputs/franka_*` 目录，
+`result.json` 保存实测抓取结果，启用 `capture_frames` 时保存保持和结束画面。
+验收失败默认抛出异常并关闭仿真，避免把仅完成动作序列当作成功抓取。
+`configuration.json` 记录本次生效配置，`trajectory.jsonl` 保存逐步测量值。
+
+录制全部六个配置（含统一 XPBD 抓取失败对照）：
+
+```bash
+./app/python.sh scripts/record_franka_demos.py
+```
+
+脚本依次启动仿真，避免同时运行多个 demo。视频汇总在 `outputs/videos/`，
+各案例目录也保存 `grasp.mp4`、`video.json` 和逐帧仿真时间 `video_frames.jsonl`。
+默认视频为 1280×720；每 `render_stride` 个物理步采一帧，当前配置对应 30 fps，
+播放速度与仿真时间一致。录制过程中的额外渲染刷新不推进物理。
+单独录制一个配置可用 `RSR_JOB__RECORD_VIDEO=true`；
+宽高由 `[job].video_width`、`video_height` 控制，系统需提供 `ffmpeg`。
+
+张开夹爪的对照可用环境变量运行，输出写到单独目录；预期
+`result.json` 中 `target_lifted=false`、`target_stays_near_gripper=false`，
+用于核对闭合动作对持续抓持的作用：
+
+```bash
+RSR_SIM_WORLD__HEADLESS=true RSR_PLANNER__OPEN_GRIPPER_CONTROL=true \
+RSR_JOB__FAIL_ON_UNSUCCESSFUL=false RSR_JOB__CAPTURE_FRAMES=false \
+RSR_JOB__OUTPUT_DIR=outputs/franka_cloth_open_control \
+./app/python.sh -m real2sim2real.core.cli collect run -c configs/franka_cloth_newton.toml
+```
+
+PhysX/hybrid 使用官方 Panda USD，纯 Newton 使用随 Newton 示例提供的官方 Franka
+FR3 URDF。两者都固定基座，双指行程命令以米为单位。示例中的摩擦系数、驱动增益和
+衣服材料参数是仿真起点：方块质量 `0.1 kg`，衣服默认总质量 `0.2 kg`，
+衣服密度根据实际三角面面积反算。Newton 内部使用厘米尺度，渲染和输出统一为米。
+衣服抓点采用实心侧缝顶点 `1922`。纯 Newton 抓取高度偏移为 `6 mm`；
+hybrid 为 `12 mm`，并提高机械臂位置驱动增益，保证实际指尖在桌面上方闭合。
+这些值对应随示例复制的资产与桌面尺寸，更换模型时应重新核对碰撞几何。
+
+`[sim_world].physics_engine` 支持：
+
+| 值 | 动力学归属 | 使用场景 |
+|---|---|---|
+| `physx` | PhysX 负责全部刚体和关节 | 刚性方块 demo |
+| `newton` | Newton 负责全部动力学 | 衣服 demo 使用 `newton_execution="direct"` 的共享模型 |
+| `hybrid` | PhysX 机器人，显式 Newton 步进负责衣服 | 衣服 demo，保留项目现有集成方式 |
+
+纯 Newton 的 `newton_execution="usd"` 使用 Isaac Sim 官方 Newton 后端，
+MuJoCo、XPBD 已通过本机步进验证。VBD 的 USD 路径还依赖匹配的
+`NewtonVbdSceneAPI` schema，本机 6.2 RC 安装未提供，选择时会明确报错。
+VBD 衣服 demo 使用 `direct`，由注册的 stepper 管理 Newton 模型，
+暂停 Kit 时间轴且不调用 PhysX World 步进。
+旧配置 `enable_newton=true` 在没有显式模式时仍选择 `hybrid`。
+
+布料 demo 使用 Newton 原生三角面片模型和夹指接触，不使用把衣服绑定到夹爪的附件。
+VBD 的 `integrate_with_external_rigid_solver` 路线，以及 hybrid 的运动学接触代理，
+均为单向机器人驱动衣服；衣服反力不会反馈到机械臂。需要双向力控时须另行接入并验证
+Newton 耦合求解器。[官方 Isaac Sim 后端说明](https://docs.isaacsim.omniverse.nvidia.com/6.2.0/physics/newton_physics.html)
+和 [Newton 耦合说明](https://newton-physics.github.io/newton/1.6.1/concepts/coupling.html)
+解释了后端切换与显式耦合的区别。
+
+另提供 `franka_cloth_newton_xpbd.toml`（XPBD 机器人 + VBD 衣服）和
+`franka_cloth_newton_mujoco.toml`（MuJoCo 机器人 + VBD 衣服）供求解器对照；
+衣服求解器由 `[planner].cloth_solver` 显式指定。MuJoCo 本身不求解衣服。
+Featherstone 路径采用速度驱动；Featherstone、XPBD 机器人均补偿重力，衣服保留重力。
+MuJoCo 路径保留机器人重力，因此使用独立的驱动增益与抓取高度配置。
+`franka_cloth_newton_xpbd_unified.toml` 另外保留 `cloth_solver="xpbd"` 的统一求解对照：
+本机整件衣服可稳定步进，尚未通过抓持验收，失败会正常返回非零状态。
+统一 XPBD 衣服使用距离弹簧（`xpbd_spring_stiffness` / `xpbd_spring_damping`），
+通过 `xpbd_mass_lumping="uniform"` 保持总质量并均匀分配到粒子，区别于 VBD 的面积质量分配；
+默认关闭原始粒子间排斥；Newton 1.6.1 的 XPBD 不支持布料自碰撞。
+`xpbd_self_contact=true` 仅供诊断，不具备 VBD 的网格邻接过滤，密集网格可能发散。
+这些求解器对照配置属于实验路径。Newton 1.6.1 的 Featherstone、XPBD
+不执行 `joint_effort_limit`；本示例的 `finger_max_force` 限力只在 PhysX/MuJoCo
+路径生效。布料的单向耦合路径均不能据此评价真实夹爪承载能力。
+[Newton 求解器能力表](https://newton-physics.github.io/newton/1.6.1/solvers/index.html#joint-feature-support)
+
+衣服 demo 的子步数与迭代数由 `[planner].newton_substeps`、`solver_iterations`
+控制；`[sim_world]` 下同名 Newton 配置用于官方 USD 后端。
+如需单独检查引擎步进、重力下落和渲染刷新是否误推进物理，可逐条运行：
+
+```bash
+./app/python.sh scripts/validate_physics_modes.py --engine physx
+./app/python.sh scripts/validate_physics_modes.py --engine newton --solver mujoco
+./app/python.sh scripts/validate_physics_modes.py --engine newton --solver xpbd
+./app/python.sh scripts/validate_physics_modes.py --engine newton --execution direct --solver vbd
+./app/python.sh scripts/validate_physics_modes.py --engine newton --execution direct
+./app/python.sh scripts/validate_physics_modes.py --engine hybrid --solver vbd
+```
+
+本机参考验收（Isaac Sim `6.2.0-rc.14`、Newton `1.6.1`、Warp `1.17.0`）：
+
+| 配置 | 保持阶段最低抬升 | 松爪后下降 | 结果 |
+|---|---:|---:|---|
+| `franka_rigid_physx.toml` | 24.1 cm | 24.4 cm | 通过 |
+| `franka_cloth_newton.toml` | 24.2 cm | 23.9 cm | 通过 |
+| `franka_cloth_hybrid.toml` | 25.5 cm | 25.2 cm | 通过 |
+| `franka_cloth_newton_mujoco.toml` | 25.2 cm | 24.0 cm | 通过（含视频） |
+| `franka_cloth_newton_xpbd.toml` | 26.2 cm | 25.3 cm | 通过（含视频） |
+
+衣服包含 6436 个自由粒子，无固定顶点或抓取附件。上述数值来自各示例目录中的
+`result.json`；保持阶段持续检查实际几何位置，释放后检查回落和桌面支撑。
+MuJoCo+VBD、XPBD+VBD 此前也用相同生产 runtime 和完整资产完成无 Kit 的 GPU 物理验收，
+各自的张开夹爪对照均未达到持续抓持条件。当前六配置视频采集流程会在 Kit 中
+重新执行完整动作序列；每次采集的实际结果见对应案例的 `result.json`，
+视频和解码检查汇总见 `outputs/videos/recording_summary.json`。
+Demo 的配置、资产、步进与验收回归可单独运行：
+
+```bash
+./app/python.sh -m pytest -q tests/test_isaacsim_modes.py tests/test_franka_demo_scene.py tests/test_franka_demo_job.py tests/test_franka_demo_acceptance.py tests/test_franka_demo_coupling.py
+```
+
 ## 环境模型
 
 | 角色 | 用什么 |
