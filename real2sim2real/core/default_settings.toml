@@ -6,6 +6,40 @@ console = true  # 文本控制台输出
 
 [sim_world]
 backend = "stub"  # 不启动 Kit
+# 切换 backend="isaacsim" 后可配置以下字段；完整示例见 configs/isaacsim_world.toml。
+# physics_engine = "physx"  # physx / newton / hybrid；所有案例共用 IsaacsimWorld
+# physics_dt = 0.008333333333333333  # s，1/120；USD 路径要求对应整数 Hz
+# rendering_dt = 0.03333333333333333  # s，1/30；step 的物理步数不受渲染影响
+# gravity = [0.0, 0.0, -9.81]  # m/s²
+# device = "cuda:0"  # cpu / cuda:N；空字符串沿用 Isaac 默认
+# physx_solver = "TGS"  # TGS / PGS，physx/hybrid 使用
+# physx_enable_ccd = false
+# physx_enable_stabilization = true
+# newton_execution = "usd"  # usd / direct，仅纯 Newton 使用
+# newton_solver = "mujoco"  # USD: mujoco/xpbd/vbd；direct 还支持模型自选求解器
+# newton_substeps = 1
+# newton_iterations = 10
+# newton_use_cuda_graph = true
+# newton_solver_options = {}
+# newton_config_options = {}
+# headless = true
+# renderer = "RayTracedLighting"  # 或 PathTracing
+# width = 1280
+# height = 720
+# rt_subframes = 1
+# warmup_frames = 2  # 只刷新渲染，不推进物理
+# dlss = false
+# auto_exposure = false
+# fast_shutdown = true  # 6.2 默认快速退出进程；异常退出码为 1
+# extensions = []  # 按需加载的额外扩展
+# stage_usd_path = ""  # 整份环境；必须米、Z-up，与 background_usd_path 二选一
+# background_usd_path = ""
+# background_prim_path = "/World/background"
+# background_offset = [0.0, 0.0, 0.0]
+# background_gravity = false  # false:背景已有动态刚体改为 kinematic
+# background_skip_metrics_assembler = true  # 原样引用；false 使用 Isaac 单位转换工具
+# camera_eye = [1.8, 1.65, 1.85]  # 可选，与 camera_target 同时配置
+# camera_target = [0.0, 0.0, 0.95]
 
 [scene]
 backend = "stub"

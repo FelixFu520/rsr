@@ -49,6 +49,7 @@ stub = "real2sim2real.scene.scene_stub:StubScene"
 
 [project.entry-points."real2sim2real.simworld.backends"]
 stub = "real2sim2real.simworld.stub:StubSimWorld"
+isaacsim = "real2sim2real.simworld.isaacsim:IsaacsimWorld"
 
 [project.entry-points."real2sim2real.cli.commands"]
 collect = "real2sim2real.job.cli:register"

@@ -6,15 +6,75 @@
 
 > Agent / 贡献者：请先读 [`AGENTS.md`](AGENTS.md)（目录约定、扩展后端、配置与 CLI 约定）。
 
-当前整理状态：非 stub 实现已按原目录结构迁入 `bak/real2sim2real/`，主包仅保留基础接口、配置、Registry、CLI 与 stub 通路。
-下文的 Franka / sorting 示例作为历史参考保留；对应后端已取消注册，需整理恢复后才能运行。`configs/`、`scripts/`、`tests/` 暂未迁移。
+当前整理状态：任务实现已按原目录结构迁入 `bak/real2sim2real/`。主包保留基础框架、stub 通路与统一的 `IsaacsimWorld`。
+下文的 Franka / sorting 任务作为历史参考保留；scene、robot、planner、job 尚待整理恢复。所有案例配置已统一使用 `sim_world.backend="isaacsim"`。
+
+## 统一仿真世界（Isaac Sim 6.2）
+
+[IsaacsimWorld](real2sim2real/simworld/isaacsim.py) 与 `IsaacsimWorldConfig` 放在同一文件，
+由 `AutoSimWorld.from_config()` 创建。构造阶段不启动 Kit，`init_world()` 才创建应用、
+加载环境并配置引擎。世界使用米、Z-up；桌子、刚性/柔性物体和机器人由 Scene/Robot 添加，
+无需为每个抓取案例派生世界类。`world` 句柄是 6.2 的 `SimulationManager`，
+后续组件通过 experimental/tensor API 访问物理状态。
+
+| `physics_engine` | 动力学执行方式 |
+|---|---|
+| `physx` | USD 场景全部由 PhysX 积分，支持该引擎可用的刚体/柔体资产 |
+| `newton` + `newton_execution="usd"` | 官方 Newton USD 后端；求解器选择 `mujoco`、`xpbd` 或 `vbd`，具体资产支持取决于求解器和安装的 schema |
+| `newton` + `newton_execution="direct"` | 应用 Newton 模型负责全部动力学，Kit 时间轴保持停止，只用于显示 |
+| `hybrid` | PhysX 推进一步后调用应用的 Newton 模型，供 PhysX 机器人 + Newton 柔体等组合使用 |
+
+Isaac 的引擎切换接口互斥启用一个 USD 动力学后端；hybrid 使用显式联合仿真，
+不会自动创建跨引擎碰撞或双向力反馈。接触代理、状态同步及模型构建由案例组件负责。
+Newton USD 的 VBD 路径还要求安装对应 schema；本机 `6.2.0-rc.14` 缺少该 schema 时会明确报错，
+柔体可接入 direct/hybrid 模型。[6.2 官方 Newton 说明](https://docs.isaacsim.omniverse.nvidia.com/6.2.0/physics/newton_physics.html)。
+
+完整配置见 [configs/isaacsim_world.toml](configs/isaacsim_world.toml)，可以设置引擎、求解器、
+物理/渲染步长、重力、设备、窗口、渲染器、额外扩展、环境 USD、背景位置与观察视角。
+默认配置仍走 stub；仅检查真实世界初始化可运行：
+
+```bash
+./app/python.sh -m pip install -e ".[dev]"
+./app/python.sh -m real2sim2real.core.cli collect run -c configs/isaacsim_world.toml
+```
+
+装配后的执行顺序为 `reset()` → `play()` → `step(render=...)`，结束调用 `destroy_world()`。
+`step()` 每次推进一个 `physics_dt`，`update()` 只刷新 UI/渲染；`rendering_dt` 设置 Kit 帧周期，
+不会自动增加物理步数。USD 模型初始化包含 SDK 的 warmup 步，`physics_steps` 只统计应用显式调用。
+`fast_shutdown=true` 沿用 Isaac 的快速退出方式，关闭 Kit 时退出进程；异常退出码为 1。
+
+direct/hybrid 的组件在启动仿真前挂载 Newton 模型：
+
+```python
+sim_world.register_newton_stepper(
+    runtime.step,   # 接收 dt 秒，完成一整步；hybrid 在此同步 PhysX 接触代理
+    reset=runtime.reset,
+    close=runtime.close,
+)
+```
+
+该 runtime 从 `sim_world.config` 读取求解器、子步数、迭代数、重力等参数；世界只调度回调，
+不重复积分模型。缺少 stepper 时 direct/hybrid 会在运行前报错。USD 路径由世界直接应用 Newton 配置。
+已有案例配置使用同一个世界，但归档中的任务后端仍需逐一整理接入。
+
+引擎自由落体和“只渲染不积分”检查（每条命令独立启动 Kit）：
+
+```bash
+./app/python.sh -m pytest -q tests/test_isaacsim_modes.py
+./app/python.sh scripts/validate_physics_modes.py --engine physx
+./app/python.sh scripts/validate_physics_modes.py --engine newton --solver mujoco
+./app/python.sh scripts/validate_physics_modes.py --engine newton --solver xpbd
+./app/python.sh scripts/validate_physics_modes.py --engine newton --execution direct --solver vbd
+./app/python.sh scripts/validate_physics_modes.py --engine hybrid --solver vbd
+./app/python.sh scripts/validate_physics_modes.py --engine hybrid --solver vbd --cloth
+```
 
 ## Franka 桌面抓取 Demo
 
-Demo 的 world、scene、robot、planner、job 分别以 `franka_demo` 注册；复用固定的
+Demo 的世界统一选 `isaacsim`；scene、robot、planner、job 的后端名为 `franka_demo`；复用固定的
 `BaseJob.run()` 生命周期。机器人固定在桌面上，执行接近、闭合、抬升、保持、释放与撤离。
 从仓库根目录运行，资产位于 `assets/Demo`（复制资产和依赖，不改源文件）。
-组件实现分别位于 [world](real2sim2real/simworld/franka_demo.py)、
+世界实现位于 [isaacsim.py](real2sim2real/simworld/isaacsim.py)，任务组件归档为
 [scene](real2sim2real/scene/scene_franka_demo.py)、
 [robot](real2sim2real/robot/robot_franka_demo.py)、
 [planner](real2sim2real/planner/planner_franka_demo.py) 和
@@ -263,7 +323,7 @@ uv build
 | Planner | `planner/planner_sorting_packages.py` | `from real2sim2real.planner.planner_sorting_packages import SortingPlanner` |
 | Robot | `robot/robot_pro_m6.py` | `from real2sim2real.robot.robot_pro_m6 import ProM6Robot` |
 | Scene | `scene/scene_sorting_packages.py` | `from real2sim2real.scene.scene_sorting_packages import SortingScene` |
-| SimWorld | `simworld/isaacsim.py` | `from real2sim2real.simworld.isaacsim import IsaacsimSimWorld` |
+| SimWorld | `simworld/isaacsim.py` | `from real2sim2real.simworld.isaacsim import IsaacsimWorld` |
 
 表中文件路径均相对于 `real2sim2real/`。entry points 直接指向各实现模块中的类。配置中的 `sorting`、`pro_m6`、`isaacsim` 后端名保持不变。
 Kit、USD 和控制器运行时依赖在世界初始化后加载，构造组件不会启动仿真资源。

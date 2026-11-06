@@ -26,7 +26,7 @@ from typing import Any
 import numpy as np
 
 from real2sim2real.core.logger import get_logger
-from real2sim2real.simworld.isaacsim import IsaacsimSimWorld, IsaacsimSimWorldConfig
+from real2sim2real.simworld.isaacsim import IsaacsimWorld, IsaacsimWorldConfig
 
 
 def _make_usd_cube(stage: Any) -> None:
@@ -57,7 +57,7 @@ def _engine_timestamps() -> dict[str, int]:
     }
 
 
-def _runtime_diagnostics(world: IsaacsimSimWorld) -> dict[str, Any]:
+def _runtime_diagnostics(world: IsaacsimWorld) -> dict[str, Any]:
     from isaacsim.core.simulation_manager import SimulationManager
 
     result = {
@@ -87,7 +87,7 @@ def _runtime_diagnostics(world: IsaacsimSimWorld) -> dict[str, Any]:
     return result
 
 
-def _managed_state_reader(world: IsaacsimSimWorld) -> Callable[[], tuple[np.ndarray, np.ndarray]]:
+def _managed_state_reader(world: IsaacsimWorld) -> Callable[[], tuple[np.ndarray, np.ndarray]]:
     if world.physics_engine == "newton":
         from isaacsim.physics.newton import acquire_stage
 
@@ -129,10 +129,12 @@ def _managed_state_reader(world: IsaacsimSimWorld) -> Callable[[], tuple[np.ndar
     return read_physx
 
 
-def _register_direct_cube(
-    world: IsaacsimSimWorld,
+def _register_direct_model(
+    world: IsaacsimWorld,
+    *,
+    cloth: bool = False,
 ) -> Callable[[], tuple[np.ndarray, np.ndarray]]:
-    """Use a real Newton rigid body to test the application's sole manual stepper."""
+    """Use a real Newton rigid body or cloth to test the application's manual stepper."""
     import newton
     import warp as wp
 
@@ -143,12 +145,32 @@ def _register_direct_cube(
         "featherstone": newton.solvers.SolverFeatherstone,
         "semi_implicit": newton.solvers.SolverSemiImplicit,
     }[world.config.newton_solver]
-    builder = newton.ModelBuilder()
+    builder = newton.ModelBuilder(gravity=world.config.gravity)
     solver_cls.register_custom_attributes(builder)
-    body = builder.add_body(
-        xform=wp.transform(wp.vec3(0.0, 0.0, 5.0), wp.quat_identity()), label="validation_cube"
-    )
-    builder.add_shape_box(body, hx=0.025, hy=0.025, hz=0.025)
+    if cloth:
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 0, 5),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.01,
+            tri_ke=1000.0,
+            tri_ka=1000.0,
+            tri_kd=0.1,
+            edge_ke=1.0,
+            edge_kd=0.1,
+            add_springs=world.config.newton_solver == "xpbd",
+            spring_ke=1000.0,
+            spring_kd=0.1,
+        )
+    else:
+        body = builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, 5.0), wp.quat_identity()), label="validation_cube"
+        )
+        builder.add_shape_box(body, hx=0.025, hy=0.025, hz=0.025)
     if world.config.newton_solver == "vbd":
         builder.color()
     model = builder.finalize(device=world.config.device or "cuda:0")
@@ -156,7 +178,7 @@ def _register_direct_cube(
     state = [model.state(), model.state()]
     newton.eval_fk(model, model.joint_q, model.joint_qd, state[0])
     newton.eval_fk(model, model.joint_q, model.joint_qd, state[1])
-    options: dict[str, Any] = {}
+    options = dict(world.config.newton_solver_options)
     if world.config.newton_solver in {"xpbd", "vbd"}:
         options["iterations"] = world.config.newton_iterations
     if world.config.newton_solver == "mujoco":
@@ -176,6 +198,12 @@ def _register_direct_cube(
     world.register_newton_stepper(step)
 
     def read() -> tuple[np.ndarray, np.ndarray]:
+        if cloth:
+            positions = state[0].particle_q.numpy()
+            velocities = state[0].particle_qd.numpy()
+            if not np.isfinite(positions).all() or not np.isfinite(velocities).all():
+                raise AssertionError("Cloth state contains NaN/Inf")
+            return positions.mean(axis=0), velocities.mean(axis=0)
         return state[0].body_q.numpy()[body, :3].copy(), state[0].body_qd.numpy()[body, :3].copy()
 
     return read
@@ -210,7 +238,7 @@ def _validate_fall(
 
 def validate(args: argparse.Namespace) -> None:
     """Start Kit only after CLI parsing; raise failures so cleanup preserves exit code 1."""
-    config = IsaacsimSimWorldConfig(
+    config = IsaacsimWorldConfig(
         backend="isaacsim",
         headless=not args.gui,
         physics_engine=args.engine,
@@ -220,16 +248,17 @@ def validate(args: argparse.Namespace) -> None:
         physics_dt=1.0 / 120.0,
         rendering_dt=1.0 / 30.0,
         rt_subframes=1,
-        wait_init_time=1,
+        warmup_frames=1,
         newton_use_cuda_graph=not args.no_cuda_graph,
+        stage_usd_path=str(args.stage) if args.stage else "",
     )
-    world = IsaacsimSimWorld(config=config)
+    world = IsaacsimWorld(config=config)
     try:
         world.init_world()
         _make_usd_cube(world.stage)
         readers = {}
         if world.uses_direct_newton or world.physics_engine == "hybrid":
-            readers["direct_newton"] = _register_direct_cube(world)
+            readers["direct_newton"] = _register_direct_model(world, cloth=args.cloth)
         world.reset()
         world.play()
         if not world.uses_direct_newton:
@@ -285,6 +314,7 @@ def validate(args: argparse.Namespace) -> None:
             "engine": args.engine,
             "execution": args.execution,
             "solver": config.physx_solver if args.engine == "physx" else args.solver,
+            "direct_object": "cloth" if args.cloth else "cube",
             "physics_steps": world.physics_steps,
             "dt_s": config.physics_dt,
             "dynamics": dynamics,
@@ -335,10 +365,22 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--gui", action="store_true")
     parser.add_argument("--no-cuda-graph", action="store_true")
+    parser.add_argument(
+        "--cloth", action="store_true", help="Direct/hybrid Newton cloth centroid test"
+    )
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--stage", type=Path, help="Optional environment stage for engine-switch checks"
+    )
     args = parser.parse_args()
     if not 4 <= args.steps <= 60:
         parser.error("--steps must be between 4 and 60 to remain above the ground")
+    if args.cloth and (
+        args.engine == "physx"
+        or (args.engine == "newton" and args.execution != "direct")
+        or args.solver not in {"xpbd", "vbd"}
+    ):
+        parser.error("--cloth requires Newton direct/hybrid with solver xpbd/vbd")
     validate(args)
 
 

@@ -164,7 +164,7 @@ uv lock
 
 ## 编码约定
 
-- Python 3.12（与 Isaac Sim 6.0.1 一致）；类型标注；公共 API 写简短 docstring
+- Python 3.12（与 Isaac Sim 6.2 一致）；类型标注；公共 API 写简短 docstring
 - Lint：`ruff`（`E,F,I,UP,B`），行宽 100
 - 日志：`get_logger` / `LoggerMixin`（structlog），勿散落 `print`
 - 插件加载失败：告警并继续，勿拖垮 CLI / Registry
