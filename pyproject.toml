@@ -37,15 +37,21 @@ select = ["E", "F", "I", "UP", "B"]
 
 [project.entry-points."real2sim2real.job.backends"]
 stub = "real2sim2real.job.job_stub:StubJob"
+pickplace_cloth = "real2sim2real.job.job_physic_solver:PhysicSolverJob"
 
 [project.entry-points."real2sim2real.planner.backends"]
 stub = "real2sim2real.planner.planner_stub:StubPlanner"
+pickplace_cloth = "real2sim2real.planner.planner_physic_solver:PickPlaceClothPlanner"
 
 [project.entry-points."real2sim2real.robot.backends"]
 stub = "real2sim2real.robot.robot_stub:StubRobot"
+franka_newton = "real2sim2real.robot.robot_physic_solver:FrankaNewtonRobot"
+franka_physx = "real2sim2real.robot.robot_physic_solver:FrankaPhysxRobot"
 
 [project.entry-points."real2sim2real.scene.backends"]
 stub = "real2sim2real.scene.scene_stub:StubScene"
+pickplace_cloth = "real2sim2real.scene.scene_physic_solver:PickPlaceClothScene"
+pickplace_rigid = "real2sim2real.scene.scene_physic_solver:PickPlaceRigidScene"
 
 [project.entry-points."real2sim2real.simworld.backends"]
 stub = "real2sim2real.simworld.stub:StubSimWorld"

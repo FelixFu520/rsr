@@ -6,8 +6,78 @@
 
 > Agent / 贡献者：请先读 [`AGENTS.md`](AGENTS.md)（目录约定、扩展后端、配置与 CLI 约定）。
 
-当前整理状态：任务实现已按原目录结构迁入 `bak/real2sim2real/`。主包保留基础框架、stub 通路与统一的 `IsaacsimWorld`。
-下文的 Franka / sorting 任务作为历史参考保留；scene、robot、planner、job 尚待整理恢复。所有案例配置已统一使用 `sim_world.backend="isaacsim"`。
+当前整理状态：历史任务实现保留在 `bak/rsr-bak/`。主包包含基础框架、stub 通路、统一的 `IsaacsimWorld` 和衣服抓放采集案例。
+下文旧 Franka / sorting 任务作为历史参考保留；新衣服案例使用下述独立配置。
+
+## 求解器组合与 LeRobot v3 采集
+
+求解器案例统一命名为 `PhysicSolver_<机器人求解器>_<接触求解器>_<任务>.toml`。
+任务参数写入各自配置，`core/default_settings.toml` 保持原来的 stub 默认值。
+PhysX 的实际求解器在文件名中写为 `tgs`，引擎归属仍由 `sim_world.physics_engine` 指定。
+
+这些案例的实现集中在 [planner_physic_solver.py](real2sim2real/planner/planner_physic_solver.py)、
+[robot_physic_solver.py](real2sim2real/robot/robot_physic_solver.py)、
+[scene_physic_solver.py](real2sim2real/scene/scene_physic_solver.py) 和
+[job_physic_solver.py](real2sim2real/job/job_physic_solver.py)。模块文件统一命名，
+各后端仍通过原有 `backend` 名称选择。
+
+| 配置后缀（均有 `PhysicSolver_` 前缀和 `.toml` 后缀） | 世界模式 | 机器人 / 接触 | 任务 |
+|---|---|---|---|
+| `featherstone_vbd_pickplace_cloth` | Newton direct | Featherstone / VBD | 衣服抓放 |
+| `mujoco_vbd_pickplace_cloth` | Newton direct | MuJoCo / VBD | 衣服抓放 |
+| `xpbd_vbd_pickplace_cloth` | Newton direct | XPBD / VBD | 衣服抓放 |
+| `tgs_vbd_pickplace_cloth` | hybrid | PhysX TGS / Newton VBD | 衣服抓放 |
+| `tgs_tgs_pickplace_rigid` | PhysX | TGS / TGS | 刚体方块抓放 |
+| `xpbd_xpbd_pickplace_cloth` | Newton direct | XPBD / XPBD | 衣服抓放实验组 |
+
+统一串行采集和校验：
+
+```bash
+./app/python.sh scripts/collect_physic_solver_cases.py
+# 也可只选择一个组合：
+./app/python.sh scripts/collect_physic_solver_cases.py xpbd_vbd_pickplace_cloth
+```
+
+采集脚本复核并复用已有数据，其余组合逐个启动 Kit。汇总位于
+`outputs/PhysicSolver/collection_summary.json`，逐组记录采集状态和抓取验收结果。
+各组合仍使用独立的 `output_dir`、日志和 LeRobot v3 数据目录。
+实验组可通过 `job.recorder.save_failed_episodes=true` 保留失败轨迹：
+episode 元数据的 `success=false`、`dataset_use="diagnostic"` 会明确区分实测失败与成功示教。
+数据内 `meta/task_outcome.json` 同时保存物理验收和生效配置。
+
+XPBD 使用 maximal body coordinates，关节观测由实时 link 位姿反算到独立观测缓冲区；
+采集不会修改求解器状态。PhysX 和 Newton 的数据均记录实际关节位置及同一帧的控制目标。
+
+[PhysicSolver_featherstone_vbd_pickplace_cloth.toml](configs/PhysicSolver_featherstone_vbd_pickplace_cloth.toml)
+使用统一的 `IsaacsimWorld`，选择 Newton direct：Featherstone 负责固定基座的 Franka FR3，
+VBD 负责衣服。动作包括接近、闭合、抬升、保持、横向转运、降低、松开与撤离。
+默认无头运行，所有资产使用 `assets/PhysicSolver/` 中的独立副本。
+
+```bash
+./app/python.sh -m pip install -e ".[dev]"
+# 资产已复制；需要重新准备时执行（保留 USD/URDF/MDL 依赖和许可证）
+./app/python.sh scripts/prepare_physic_solver_assets.py
+./app/python.sh -m real2sim2real.core.cli collect run -c configs/PhysicSolver_featherstone_vbd_pickplace_cloth.toml
+```
+
+默认结果位于 `outputs/PhysicSolver/featherstone_vbd_pickplace_cloth/`：
+
+- `lerobot_v3/`：一次成功采集的一个 episode，包含 `meta/info.json`、`meta/stats.json`、
+  `meta/tasks.parquet`、`meta/episodes/chunk-000/file-000.parquet`、
+  `data/chunk-000/file-000.parquet` 与对应 RGB MP4。
+- `result.json`：提起、持续抓持、衣服变形、松开回落、放置误差等实测验收结果。
+- `diagnostics/<run>/`：生效配置与逐步测量。未通过验收的采集保存在此处，
+  不发布为训练数据集。
+
+数据为 [LeRobot v3.0 布局](https://huggingface.co/docs/lerobot/lerobot-dataset-v3)，
+以 15 fps 同步记录 `observation.images.overview`、`observation.state` 与 `action`。
+状态是实际关节位置，动作是同一帧下发的关节目标：前七维为机械臂 rad，后两维为手指开度 m。
+采集仅刷新渲染，不额外推进物理。已有成功数据不会被覆盖；再次采集时更换
+`job.output_dir`，例如使用环境变量 `RSR_JOB__OUTPUT_DIR=outputs/PhysicSolver/run2`。
+
+该案例采用机器人驱动衣服的单向耦合；衣服无固定顶点、无抓取附件。
+Featherstone 的轨迹控制包含重力补偿和限速跟踪，当前不执行 URDF effort limit；
+因此这些数据用于该仿真控制方式，不能据此评价真实夹爪限力性能。
 
 ## 统一仿真世界（Isaac Sim 6.2）
 
@@ -69,7 +139,10 @@ sim_world.register_newton_stepper(
 ./app/python.sh scripts/validate_physics_modes.py --engine hybrid --solver vbd --cloth
 ```
 
-## Franka 桌面抓取 Demo
+## Franka 桌面抓取 Demo（历史归档）
+
+以下保留历史设计与验收记录；旧配置和任务后端位于 `bak/rsr-bak/`，
+旧资产准备与视频录制脚本已清理。当前采集使用上方 PhysicSolver 配置和脚本。
 
 Demo 的世界统一选 `isaacsim`；scene、robot、planner、job 的后端名为 `franka_demo`；复用固定的
 `BaseJob.run()` 生命周期。机器人固定在桌面上，执行接近、闭合、抬升、保持、释放与撤离。
@@ -83,7 +156,6 @@ Demo 的世界统一选 `isaacsim`；scene、robot、planner、job 的后端名�
 
 ```bash
 ./app/python.sh -m pip install -e ".[dev]"
-./app/python.sh scripts/prepare_franka_demo_assets.py
 
 # 刚性方块：PhysX + TGS
 ./app/python.sh -m real2sim2real.core.cli collect run -c configs/franka_rigid_physx.toml
@@ -101,13 +173,7 @@ Demo 的世界统一选 `isaacsim`；scene、robot、planner、job 的后端名�
 验收失败默认抛出异常并关闭仿真，避免把仅完成动作序列当作成功抓取。
 `configuration.json` 记录本次生效配置，`trajectory.jsonl` 保存逐步测量值。
 
-录制全部六个配置（含统一 XPBD 抓取失败对照）：
-
-```bash
-./app/python.sh scripts/record_franka_demos.py
-```
-
-脚本依次启动仿真，避免同时运行多个 demo。视频汇总在 `outputs/videos/`，
+旧版录制流程依次启动六个案例（含统一 XPBD 抓取失败对照）。历史视频汇总在 `outputs/videos/`，
 各案例目录也保存 `grasp.mp4`、`video.json` 和逐帧仿真时间 `video_frames.jsonl`。
 默认视频为 1280×720；每 `render_stride` 个物理步采一帧，当前配置对应 30 fps，
 播放速度与仿真时间一致。录制过程中的额外渲染刷新不推进物理。
