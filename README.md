@@ -6,6 +6,9 @@
 
 > Agent / 贡献者：请先读 [`AGENTS.md`](AGENTS.md)（目录约定、扩展后端、配置与 CLI 约定）。
 
+当前整理状态：非 stub 实现已按原目录结构迁入 `bak/real2sim2real/`，主包仅保留基础接口、配置、Registry、CLI 与 stub 通路。
+下文的 Franka / sorting 示例作为历史参考保留；对应后端已取消注册，需整理恢复后才能运行。`configs/`、`scripts/`、`tests/` 暂未迁移。
+
 ## Franka 桌面抓取 Demo
 
 Demo 的 world、scene、robot、planner、job 分别以 `franka_demo` 注册；复用固定的

@@ -6,84 +6,15 @@ console = true  # 文本控制台输出
 
 [sim_world]
 backend = "stub"  # 不启动 Kit
-# isaacsim / franka_demo 专用（stub 不接收这些字段）
-# physics_engine = ""  # 空值兼容旧配置；默认 physx，enable_newton=true 时 hybrid
-# physx_solver = "TGS"  # 或 PGS
-# newton_execution = "usd"  # usd:官方后端；direct:应用 stepper 独占全部 Newton 动力学
-# newton_solver = "mujoco"  # usd: mujoco/xpbd/vbd；direct 另支持 featherstone/semi_implicit
-# newton_substeps = 1
-# newton_iterations = 10
-# newton_use_cuda_graph = true
-# newton_solver_options = {}
-# newton_config_options = {}
-# enable_newton = false  # 旧配置兼容开关；显式 physics_engine 优先
-# franka_demo: background_usd_path/camera_eye/camera_target 见 configs/franka_demo_common.toml
 
 [scene]
 backend = "stub"
-# franka_demo: object_kind="rigid"/"cloth"，资产/布局默认值见 FrankaDemoSceneConfig
-# table_usd_path = "assets/Demo/Table/Aligned.usd"
-# cube_usd_path = "assets/Demo/Cube/Aligned.usd"
-# cloth_usd_path = "assets/Demo/Cloth/unisex_shirt.usd"
-# table_scale = [2.0, 1.2, 1.0]
-# target_xy = [0.14, 0.0]
-# grasp_vertex = 1922  # Demo 衣服实体侧缝；换资产需重新选择
 
 [robot]
 backend = "stub"
-# franka_demo: 官方 Franka USD / URDF 及驱动默认值见 FrankaDemoRobotConfig
-# usd_path = "assets/Demo/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"
-# urdf_path = "assets/Demo/Robot/franka_emika_panda/urdf/fr3_franka_hand.urdf"
 
 [planner]
 backend = "stub"
-# franka_demo 专用；完整运动/材料参数见 FrankaDemoPlannerConfig
-# newton_substeps = 10  # 应用 direct/hybrid cloth 步进的子步数
-# newton_use_cuda_graph = true
-# solver_iterations = 10
-# cloth_solver = "vbd"  # Newton 内部衣服求解器；统一 XPBD 仅用于显式对照
-# retract_s = 1.5
-# retract_height_m = 0.12  # 张开后上撤，避免布料挂在指尖
-# cloth_mass_kg = 0.2
-# cloth_density_cm = 0.00005  # 可选 kg/cm²；设置后覆盖总质量模式
-# xpbd_spring_stiffness = 1000.0  # XPBD 距离弹簧 kg/s²（数值等同 N/m）
-# xpbd_spring_damping = 1.0  # kg/s（数值等同 N·s/m）
-# xpbd_self_contact = false  # XPBD 无布料邻接过滤；原始粒子自接触仅供诊断
-# xpbd_mass_lumping = "area"  # 或 uniform；仅统一 XPBD 模型使用
-# open_gripper_control = false  # 负对照：保持张开，预期验收失败
-# sorting 后端专用默认值（切换 backend 后可取消注释；stub 不接收任务字段）
-# parcel_mass_kg = 0.3  # 可选目标质量 kg；不设置时按 density 计算
-# volume_mesh_resolution = 28
-# elasticity_damping = 10.0  # Pa·s
-# self_collision = true
-# contact_stiffness = 30000.0  # N/m
-# contact_damping = 0.2  # N·s/m
-# grasp_depth_m = 0.008
-# gripper_closed_position_rad = 0.58
-# min_finger_contacts = 20  # 与体积网格采样相关；仍须通过提起/离台验收
-# newton_cuda_graph = true
-# friction_epsilon = 0.001  # 摩擦平滑速度 m/s
-# support_mu = 0.5
-# right_lift_height_m = 0.28  # sorting 默认；本工位厚包裹示例用 0.14 m 保持出带路径可达
-# max_grasp_offset_m = 0.0  # 0 不限制；厚包裹示例用 0.04 m 限制偏心夹持力矩
-# grasp_jitter_fraction_xy = [0.25, 0.3]  # 相对包裹半宽/半长；[0, 0] 关闭随机抓点
-# grasp_random_candidates = 12
-# grasp_random_seed = 0  # 0 为每轮随机，正整数为可复现的每集/每次尝试种子
-# grasp_min_distance_m = 0.01
 
 [job]
 backend = "stub"  # StubJob 只串工厂,不采集
-# franka_demo 专用默认值
-# max_steps = 12000
-# timeout_s = 1200.0
-# render_stride = 4
-# keep_open = false
-# output_dir = "outputs/franka_demo"
-# capture_frames = true
-# record_video = false  # franka_demo: grasp.mp4, fps=1/(physics_dt*render_stride)
-# video_width = 1280
-# video_height = 720
-# fail_on_unsuccessful = true
-# sorting 后端专用默认值
-# object_jitter_min_distance_m = 0.04
-# max_attempts = 4  # IK/物理验收失败时重新采样；失败尝试不写入训练索引

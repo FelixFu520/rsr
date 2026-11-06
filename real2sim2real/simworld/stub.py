@@ -8,8 +8,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from real2sim2real.core.config import BaseConfig
 from real2sim2real.simworld.base import BaseSimWorld
-from real2sim2real.simworld.config import StubSimWorldConfig
+
+
+class StubSimWorldConfig(BaseConfig):
+    """``[sim_world]``:stub 仿真世界配置."""
 
 
 class StubSimWorld(BaseSimWorld):

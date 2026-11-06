@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
 from real2sim2real.core.config import BaseConfig
 from real2sim2real.job.base import BaseJob
-
-# 落盘格式；与 recorder 支持的版本保持一致。
-RecorderFormat = Literal["lerobot_v2", "lerobot_v3"]
 
 
 class StubJobConfig(BaseConfig):
