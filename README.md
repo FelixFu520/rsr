@@ -100,7 +100,7 @@ Newton USD 的 VBD 路径还要求安装对应 schema；本机 `6.2.0-rc.14` 缺
 柔体可接入 direct/hybrid 模型。[6.2 官方 Newton 说明](https://docs.isaacsim.omniverse.nvidia.com/6.2.0/physics/newton_physics.html)。
 
 完整配置见 [configs/isaacsim_world.toml](configs/isaacsim_world.toml)，可以设置引擎、求解器、
-物理/渲染步长、重力、设备、窗口、渲染器、额外扩展、环境 USD、背景位置与观察视角。
+物理/渲染步长、重力、设备、窗口、渲染器、额外扩展、环境 USD 与背景位置。
 默认配置仍走 stub；仅检查真实世界初始化可运行：
 
 ```bash
@@ -126,6 +126,64 @@ sim_world.register_newton_stepper(
 该 runtime 从 `sim_world.config` 读取求解器、子步数、迭代数、重力等参数；世界只调度回调，
 不重复积分模型。缺少 stepper 时 direct/hybrid 会在运行前报错。USD 路径由世界直接应用 Newton 配置。
 已有案例配置使用同一个世界，但归档中的任务后端仍需逐一整理接入。
+
+PhysicSolver 使用 `[[scene.cameras]]` 配置固定相机，使用 `[[robot.cameras]]` 配置机载相机，
+可分别添加多项。相机由所属 Scene/Robot 创建，世界配置不含相机字段。
+每项包含唯一的 `name`、`prim_path`、`pose_relative_to`、`pose` 和 `resolution`，
+可选 `clipping_range`、`focal_length` 和 `horizontal_aperture`（镜头参数单位 mm）。
+`pose.position` 单位为米，`pose.orientation_wxyz` 是相对参考 prim 的四元数；
+使用 USD 相机坐标（-Z 朝前、+Y 朝上），相机路径须位于参考 prim 下以跟随运动。
+
+六份 PhysicSolver 案例默认包含固定 `overview` 和腕部 `wrist` 两路 RGB 相机。
+Newton 腕部相机挂在 `fr3_link7`，PhysX 挂在 `panda_link7`；偏离手掌侧面并看向夹爪中心。
+Newton 在创建可视连杆后挂载相机，逐步继承实际求解后的腕部位姿。
+录制按相机名生成 `observation.images.overview`、`observation.images.wrist` 等独立视频，
+每路使用自身分辨率，共享关节数据帧号和时间戳；切换采集视角不会推进物理。
+GUI 默认显示列表中的第一路，可在视口中切换到对应 Camera prim。
+Featherstone 示例默认使用 `RayTracedLighting`、640×480 和 `rt_subframes=4`；
+采集会等待视口实际完成渲染，并核对截图的相机矩阵与分辨率，不推进物理。
+关闭 DLSS 时采用空间 FXAA，避免不同相机共享不合适的时域历史；无头 RGB 不含视口网格和坐标轴。
+`samples_per_pixel_per_frame=64` 仅在切换为 `PathTracing` 时生效。
+相机 `resolution` 决定视频分辨率，
+`sim_world.width/height` 决定初始渲染尺寸；无相机列表时才使用 `job.recorder.width/height`。
+完整示例见 [Featherstone 布料配置](configs/PhysicSolver_featherstone_vbd_pickplace_cloth.toml)。
+`job.timeout_s` 是采集循环中包含渲染与采集的墙钟时限，不是仿真时长。双相机逐路采集时，
+每路都会执行 `rt_subframes`；128 spp × 8 帧的旧设置曾在录到 16.68/18 秒时耗尽 1800 秒。
+当前保留双路 15 fps，并移除采集之间不写入数据的重复渲染。日志每约 30 秒报告仿真进度、
+已录帧数、预计剩余耗时及控制/物理/采集/I/O 分项耗时；这些耗时也写入 `result.json`。
+需要手动提高采样时，应同时根据实测耗时设置墙钟预算。
+
+该 Featherstone 配置现使用 `newton_cloth_franka` 场景及 Planner，参考
+[NVIDIA cloth_franka 说明](https://developer.nvidia.com/blog/train-a-quadruped-locomotion-policy-and-simulate-cloth-manipulation-with-nvidia-isaac-lab-and-newton/)
+及本机 Newton 1.6.1 的官方示例。运行前执行
+`./app/python.sh scripts/prepare_official_newton_cloth.py`，从 Isaac Sim 官方发行包复制
+`unisex_shirt.usd`、许可证和带 SHA-256/版本的 `provenance.json` 到独立的
+`assets/PhysicSolver/Cloth/newton_official/`。原始衣服几何保持不变，不压扁或重建。
+添加 `--verify-upstream` 可在线核对 GitHub 官方资产哈希；本次已核验完全一致。
+衣服与关键帧整体平移到项目桌面，保留官方机器人/桌面的相对高度和 80 cm 工作区。
+
+控制采用官方关键帧、雅可比伪逆与零空间速度控制；当前为前 7 个关键帧的一轮抓放，
+`planner.keyframe_limit=33` 可执行完整参考序列。它是预设控制器，不是训练好的 RL 策略。
+动作视频与观测位置对齐，`action` 明确记录实际关节速度（rad/s、m/s）。
+Featherstone → VBD 保持官方单向耦合，不增加布料固定点或抓取附件。
+衣服原始 USD 只有几何和显示颜色，没有完整织物材质。场景为它绑定显式哑光材质，
+`cloth_roughness=0.92`、`cloth_specular=0.02`，并把仓库灯和桌面补光强度降为原来的
+四分之一（`sim_world.background_light_scale`、`scene.fill_light_intensity/key_light_intensity`）。
+这会减少塑料般的高光和过亮区域；它仍是均匀表面材质，没有织纹贴图或专用织物 BRDF。
+碰撞粒子半径决定物理包络；默认官方参数为 8 mm，不能把检测到接触当作可视表面已经贴合。
+`full_surface_contacts` 可增加网格边、面与刚体的接触；刚体网格需要 SDF，分辨率由
+`contact_sdf_resolution` 控制。`keyframe_offset_m` 以米平移参考路径，
+`open_finger_m/closed_finger_m` 控制单侧实际开度，便于匹配物理厚度。
+`finger_velocity_gain` 控制夹指响应速度，实际命令受 URDF 速度上限约束；
+减小碰撞半径后必须确认夹指在提起前已经闭合，不能只缩小厚度。
+本次 1–4 mm 半径、边/面接触、闭合时序、弯曲刚度和摩擦对比中，薄接触方案仍发生中途滑脱。
+示例继续保留通过完整抓放验收的 8 mm 参数；约 3 mm 的可见表面间隙尚未解决。
+物理包络内的接触验收与可见表面零间隙是两个独立条件。
+项目保留 `cloth_mass_kg=0.2`，按三角形面积分配质量；官方演示的 `density=0.02`
+在当前厘米模型中对应约 141 kg，因此未直接沿用。验收报告只统计进入物理接触包络的接触，
+排除检测余量内但未进入接触包络的候选；同时要求首轮转移阶段至少 95% 的帧保持双侧接触，
+释放下落跟踪松开前被夹住的同一片衣服顶点，并检查提起及释放，
+不将执行一轮抓放宣称为完成整件衣服的折叠。
 
 引擎自由落体和“只渲染不积分”检查（每条命令独立启动 Kit）：
 

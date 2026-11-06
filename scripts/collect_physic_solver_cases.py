@@ -34,7 +34,12 @@ CASES = (
 )
 
 
-def validate_dataset(output: Path, *, allow_failure: bool = False) -> dict[str, Any]:
+def validate_dataset(
+    output: Path,
+    *,
+    allow_failure: bool = False,
+    expected_cameras: dict[str, tuple[int, int]] | None = None,
+) -> dict[str, Any]:
     """Check physical outcome, data/video time ranges, finite joints and video decodability."""
     result = json.loads((output / "result.json").read_text())
     root = output / "lerobot_v3"
@@ -66,37 +71,57 @@ def validate_dataset(output: Path, *, allow_failure: bool = False) -> dict[str, 
             arm_range = float(np.ptp(values[:, :7], axis=0).max())
             if result["success"] and arm_range < 0.1:
                 raise ValueError("Successful grasp has stale or non-moving joint observations")
-    video_key = "observation.images.overview"
-    video = root / info["video_path"].format(video_key=video_key, chunk_index=0, file_index=0)
-    stream = json.loads(
-        subprocess.check_output(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-count_frames",
-                "-show_entries",
-                "stream=codec_name,nb_read_frames,r_frame_rate,width,height",
-                "-of",
-                "json",
-                str(video),
-            ]
-        )
-    )["streams"][0]
-    if int(stream["nb_read_frames"]) != frames:
-        raise ValueError("Video/data frame count mismatch")
-    numerator, denominator = map(int, stream["r_frame_rate"].split("/"))
-    if numerator / denominator != info["fps"]:
-        raise ValueError("Video/data FPS mismatch")
-    if abs(episode[f"videos/{video_key}/to_timestamp"] - frames / info["fps"]) > 1e-6:
-        raise ValueError("Video episode time range mismatch")
+    video_features = {
+        key: value for key, value in info["features"].items() if value["dtype"] == "video"
+    }
+    if not video_features:
+        raise ValueError("No camera videos in dataset")
+    if expected_cameras:
+        for name, (width, height) in expected_cameras.items():
+            if video_features.get(f"observation.images.{name}", {}).get("shape") != [
+                height,
+                width,
+                3,
+            ]:
+                raise ValueError(f"Missing or incompatible camera: {name}; choose a new output_dir")
+    videos = {}
+    for video_key, feature in video_features.items():
+        video = root / info["video_path"].format(video_key=video_key, chunk_index=0, file_index=0)
+        stream = json.loads(
+            subprocess.check_output(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-count_frames",
+                    "-show_entries",
+                    "stream=codec_name,nb_read_frames,r_frame_rate,width,height",
+                    "-of",
+                    "json",
+                    str(video),
+                ]
+            )
+        )["streams"][0]
+        if int(stream["nb_read_frames"]) != frames:
+            raise ValueError("Video/data frame count mismatch")
+        numerator, denominator = map(int, stream["r_frame_rate"].split("/"))
+        if numerator / denominator != info["fps"]:
+            raise ValueError("Video/data FPS mismatch")
+        if (stream["width"], stream["height"]) != tuple(feature["shape"][1::-1]):
+            raise ValueError(f"Video/metadata dimensions mismatch: {video_key}")
+        if episode[f"videos/{video_key}/from_timestamp"] != 0.0:
+            raise ValueError("Video must start at timestamp zero")
+        if abs(episode[f"videos/{video_key}/to_timestamp"] - frames / info["fps"]) > 1e-6:
+            raise ValueError("Video episode time range mismatch")
+        videos[video_key] = str(video)
     report = {
         "validated": True,
         "grasp_success": result["success"],
         "frames": frames,
         "fps": info["fps"],
         "dataset": str(root),
-        "video": str(video),
+        "video": videos.get("observation.images.overview", next(iter(videos.values()))),
+        "videos": videos,
         "dataset_use": "demonstration" if result["success"] else "diagnostic",
         "place_error_m": result.get("place_error_m"),
         "minimum_hold_lift_m": result.get("minimum_hold_lift_m"),
@@ -137,6 +162,11 @@ def main() -> int:
         config = tomllib.loads(path.read_text())
         output = ROOT / config["job"]["output_dir"]
         allow = config.get("job", {}).get("recorder", {}).get("save_failed_episodes", False)
+        cameras = {
+            camera["name"]: tuple(camera.get("resolution", [640, 480]))
+            for section in ("scene", "robot")
+            for camera in config.get(section, {}).get("cameras", [])
+        }
         row = {"config": str(path), "output_dir": str(output), "validated": False}
         engine = config["sim_world"]["physics_engine"]
         kind = config["scene"]["object_kind"]
@@ -154,7 +184,7 @@ def main() -> int:
         started = time.monotonic()
         try:
             try:
-                row.update(validate_dataset(output, allow_failure=allow))
+                row.update(validate_dataset(output, allow_failure=allow, expected_cameras=cameras))
                 row["reused_existing"] = True
             except (OSError, ValueError, KeyError, AssertionError):
                 if (output / "lerobot_v3").exists():
@@ -188,7 +218,7 @@ def main() -> int:
                     raise RuntimeError(
                         f"Simulation exited with {process.returncode}; see {log_path}"
                     ) from None
-                row.update(validate_dataset(output, allow_failure=allow))
+                row.update(validate_dataset(output, allow_failure=allow, expected_cameras=cameras))
         except (
             OSError,
             ValueError,

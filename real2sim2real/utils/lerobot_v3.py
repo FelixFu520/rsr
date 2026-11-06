@@ -33,11 +33,21 @@ class LeRobotV3Recorder:
         task: str,
         robot_type: str = "franka_fr3_newton",
         joint_names: list[str] | None = None,
+        action_names: list[str] | None = None,
+        cameras: dict[str, tuple[int, int]] | None = None,
     ) -> None:
         if root.exists():
             raise FileExistsError(f"Dataset already exists: {root}")
         if fps <= 0 or width <= 0 or height <= 0 or width % 2 or height % 2:
             raise ValueError("FPS must be positive and H.264 dimensions must be positive and even")
+        self.cameras = dict(cameras) if cameras is not None else {"overview": (width, height)}
+        if not self.cameras or any(
+            not name.isidentifier()
+            or any(size <= 0 or size % 2 for size in resolution)
+            or len(resolution) != 2
+            for name, resolution in self.cameras.items()
+        ):
+            raise ValueError("Cameras require valid names and two positive even dimensions")
         self.ffmpeg = shutil.which("ffmpeg")
         if self.ffmpeg is None:
             raise RuntimeError("LeRobot video recording requires ffmpeg")
@@ -46,34 +56,42 @@ class LeRobotV3Recorder:
         self.staging = Path(tempfile.mkdtemp(prefix=".lerobot-v3-", dir=root.parent))
         self.frame_dir = self.staging / "frames"
         self.frame_dir.mkdir()
+        for name in self.cameras:
+            (self.frame_dir / name).mkdir()
         self.fps, self.width, self.height, self.task = fps, width, height, task
         self.robot_type = robot_type
         self.joint_names = joint_names if joint_names is not None else JOINT_NAMES
+        self.action_names = action_names if action_names is not None else self.joint_names
         self.rows: list[dict[str, Any]] = []
-        self.image_sum = np.zeros(3)
-        self.image_squared_sum = np.zeros(3)
-        self.image_min = np.ones(3)
-        self.image_max = np.zeros(3)
-        self.pixels = 0
+        self.image_stats = {
+            name: dict(sum=np.zeros(3), squared_sum=np.zeros(3), min=np.ones(3), max=np.zeros(3))
+            for name in self.cameras
+        }
 
-    def frame_path(self) -> Path:
+    def frame_path(self, camera: str = "overview") -> Path:
         """Return the next capture filename; add_frame must follow a successful capture."""
-        return self.frame_dir / f"frame_{len(self.rows):06d}.png"
+        if camera not in self.cameras:
+            raise KeyError(f"Unknown recording camera: {camera}")
+        return self.frame_dir / camera / f"frame_{len(self.rows):06d}.png"
 
     def add_frame(self, state: np.ndarray, action: np.ndarray) -> None:
         """Store current joint positions and commanded targets at the same video frame time."""
         state, action = np.asarray(state, np.float32), np.asarray(action, np.float32)
         if state.shape != (9,) or action.shape != (9,) or not np.isfinite([state, action]).all():
             raise ValueError("State/action must each contain nine finite coordinates")
-        with Image.open(self.frame_path()) as image:
-            if image.size != (self.width, self.height):
-                raise ValueError(f"Unexpected capture size: {image.size}")
-            rgb = np.asarray(image.convert("RGB"), dtype=np.float64) / 255
-        self.image_sum += rgb.sum(axis=(0, 1))
-        self.image_squared_sum += np.square(rgb).sum(axis=(0, 1))
-        self.image_min = np.minimum(self.image_min, rgb.min(axis=(0, 1)))
-        self.image_max = np.maximum(self.image_max, rgb.max(axis=(0, 1)))
-        self.pixels += self.width * self.height
+        # Validate every view before committing any per-frame statistics or joint data.
+        images = {}
+        for name, resolution in self.cameras.items():
+            with Image.open(self.frame_path(name)) as image:
+                if image.size != resolution:
+                    raise ValueError(f"Unexpected capture size for {name}: {image.size}")
+                images[name] = np.asarray(image.convert("RGB"), dtype=np.float64) / 255
+        for name, rgb in images.items():
+            stats = self.image_stats[name]
+            stats["sum"] += rgb.sum(axis=(0, 1))
+            stats["squared_sum"] += np.square(rgb).sum(axis=(0, 1))
+            stats["min"] = np.minimum(stats["min"], rgb.min(axis=(0, 1)))
+            stats["max"] = np.maximum(stats["max"], rgb.max(axis=(0, 1)))
         index = len(self.rows)
         self.rows.append(
             {
@@ -94,39 +112,8 @@ class LeRobotV3Recorder:
 
         if len(self.rows) < 2:
             raise ValueError("A dataset episode must contain at least two frames")
-        video = self.staging / "videos" / VIDEO_KEY / "chunk-000/file-000.mp4"
-        video.parent.mkdir(parents=True)
-        subprocess.run(
-            [
-                self.ffmpeg,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-framerate",
-                str(self.fps),
-                "-i",
-                str(self.frame_dir / "frame_%06d.png"),
-                "-frames:v",
-                str(len(self.rows)),
-                "-c:v",
-                "libx264",
-                "-preset",
-                "fast",
-                "-crf",
-                "18",
-                "-pix_fmt",
-                "yuv420p",
-                "-movflags",
-                "+faststart",
-                str(video),
-            ],
-            check=True,
-            capture_output=True,
-            timeout=300,
-        )
-        if not video.is_file() or video.stat().st_size == 0:
-            raise RuntimeError("Video encoding produced no output")
+        for name in self.cameras:
+            self._encode_video(name)
         schema = pa.schema(
             [
                 ("observation.state", pa.list_(pa.float32(), 9)),
@@ -152,35 +139,38 @@ class LeRobotV3Recorder:
             features[name] = {
                 "dtype": "float32" if is_vector or name == "timestamp" else "int64",
                 "shape": [9 if is_vector else 1],
-                "names": self.joint_names if is_vector else None,
+                "names": (self.action_names if name == "action" else self.joint_names)
+                if is_vector
+                else None,
             }
-        image_mean = self.image_sum / self.pixels
-        image_std = np.sqrt(np.maximum(0, self.image_squared_sum / self.pixels - image_mean**2))
-        stats[VIDEO_KEY] = {
-            name: value.reshape(3, 1, 1).tolist()
-            for name, value in {
-                "min": self.image_min,
-                "max": self.image_max,
-                "mean": image_mean,
-                "std": image_std,
-            }.items()
-        }
-        stats[VIDEO_KEY]["count"] = [len(self.rows)]
-        features[VIDEO_KEY] = {
-            "dtype": "video",
-            "shape": [self.height, self.width, 3],
-            "names": ["height", "width", "channels"],
-            "info": {
-                "video.fps": self.fps,
-                "video.height": self.height,
-                "video.width": self.width,
-                "video.channels": 3,
-                "video.codec": "h264",
-                "video.pix_fmt": "yuv420p",
-                "video.is_depth_map": False,
-                "has_audio": False,
-            },
-        }
+        for name, (width, height) in self.cameras.items():
+            video_key = f"observation.images.{name}"
+            image = self.image_stats[name]
+            pixels = len(self.rows) * width * height
+            mean = image["sum"] / pixels
+            std = np.sqrt(np.maximum(0, image["squared_sum"] / pixels - mean**2))
+            stats[video_key] = {
+                key: value.reshape(3, 1, 1).tolist()
+                for key, value in dict(
+                    min=image["min"], max=image["max"], mean=mean, std=std
+                ).items()
+            }
+            stats[video_key]["count"] = [len(self.rows)]
+            features[video_key] = {
+                "dtype": "video",
+                "shape": [height, width, 3],
+                "names": ["height", "width", "channels"],
+                "info": {
+                    "video.fps": self.fps,
+                    "video.height": height,
+                    "video.width": width,
+                    "video.channels": 3,
+                    "video.codec": "h264",
+                    "video.pix_fmt": "yuv420p",
+                    "video.is_depth_map": False,
+                    "has_audio": False,
+                },
+            }
         episode = {
             "episode_index": 0,
             "tasks": [self.task],
@@ -191,11 +181,17 @@ class LeRobotV3Recorder:
             "data/file_index": 0,
             "meta/episodes/chunk_index": 0,
             "meta/episodes/file_index": 0,
-            f"videos/{VIDEO_KEY}/chunk_index": 0,
-            f"videos/{VIDEO_KEY}/file_index": 0,
-            f"videos/{VIDEO_KEY}/from_timestamp": 0.0,
-            f"videos/{VIDEO_KEY}/to_timestamp": len(self.rows) / self.fps,
         }
+        for name in self.cameras:
+            video_key = f"observation.images.{name}"
+            episode.update(
+                {
+                    f"videos/{video_key}/chunk_index": 0,
+                    f"videos/{video_key}/file_index": 0,
+                    f"videos/{video_key}/from_timestamp": 0.0,
+                    f"videos/{video_key}/to_timestamp": len(self.rows) / self.fps,
+                }
+            )
         if episode_success is not None:
             episode["success"] = episode_success
             episode["dataset_use"] = "demonstration" if episode_success else "diagnostic"
@@ -252,6 +248,41 @@ class LeRobotV3Recorder:
         self.staging.rename(self.root)
         return self.root
 
+    def _encode_video(self, name: str) -> None:
+        video = self.staging / "videos" / f"observation.images.{name}" / "chunk-000/file-000.mp4"
+        video.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                self.ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-framerate",
+                str(self.fps),
+                "-i",
+                str(self.frame_dir / name / "frame_%06d.png"),
+                "-frames:v",
+                str(len(self.rows)),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                str(video),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=300,
+        )
+        if not video.is_file() or video.stat().st_size == 0:
+            raise RuntimeError("Video encoding produced no output")
+
     def discard(self, diagnostics: Path) -> None:
         """Keep failed captures outside the accepted training dataset for inspection."""
         if self.staging.exists():
@@ -268,7 +299,9 @@ class LeRobotV3Recorder:
         }
 
 
-def capture_viewport_frame(world: Any, path: Path, *, width: int, height: int) -> None:
+def capture_viewport_frame(
+    world: Any, path: Path, *, width: int, height: int, camera_prim: str | None = None
+) -> None:
     """Capture the current USD pose without advancing physics; synchronous file completion."""
     import asyncio
 
@@ -278,18 +311,50 @@ def capture_viewport_frame(world: Any, path: Path, *, width: int, height: int) -
     viewport = get_active_viewport()
     if viewport is None:
         raise RuntimeError("No active viewport for RGB capture")
+    if camera_prim is not None:
+        from pxr import UsdGeom
+
+        prim = world.stage.GetPrimAtPath(camera_prim)
+        if not prim or not prim.IsA(UsdGeom.Camera):
+            raise ValueError(f"Recording camera does not exist: {camera_prim}")
+        viewport.camera_path = camera_prim
+        expected_view = np.asarray(
+            UsdGeom.XformCache().GetLocalToWorldTransform(prim).GetInverse(), dtype=float
+        )
+    else:
+        expected_view = None
     viewport.resolution = (width, height)
     before = world.physics_steps
-    future = capture_viewport_to_file(viewport, str(path))
-    task = asyncio.ensure_future(future.wait_for_result(completion_frames=0))
-    for _ in range(120):
-        world.update()
-        if task.done():
-            task.result()
-            acquire_renderer_capture_interface().wait_async_capture()
-            break
-    else:
-        task.cancel()
-        raise TimeoutError(f"RGB capture timed out: {path}")
-    if not path.is_file() or world.physics_steps != before:
-        raise RuntimeError("Capture failed or advanced physics")
+    for _attempt in range(3):
+        # Kit update ticks can outpace Hydra/GPU completion. Count actual render
+        # events, then validate the capture's camera matrix before committing it.
+        rendered = asyncio.ensure_future(
+            viewport.wait_for_rendered_frames(max(2, world.config.rt_subframes))
+        )
+        for _ in range(240):
+            world.update()
+            if rendered.done():
+                rendered.result()
+                break
+        else:
+            rendered.cancel()
+            raise TimeoutError(f"Viewport render did not complete: {viewport.camera_path}")
+        future = capture_viewport_to_file(viewport, str(path))
+        task = asyncio.ensure_future(future.wait_for_result(completion_frames=0))
+        for _ in range(120):
+            world.update()
+            if task.done():
+                task.result()
+                acquire_renderer_capture_interface().wait_async_capture()
+                break
+        else:
+            task.cancel()
+            raise TimeoutError(f"RGB capture timed out: {path}")
+        if not path.is_file() or world.physics_steps != before:
+            raise RuntimeError("Capture failed or advanced physics")
+        actual_view = np.asarray(future.view, dtype=float).reshape(4, 4)
+        if tuple(future.resolution) == (width, height) and (
+            expected_view is None or np.allclose(actual_view, expected_view, rtol=0, atol=1e-5)
+        ):
+            return
+    raise RuntimeError(f"RGB capture did not match camera/resolution: {camera_prim}")

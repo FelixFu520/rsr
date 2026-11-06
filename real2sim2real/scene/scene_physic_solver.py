@@ -18,6 +18,7 @@ from real2sim2real.core.logger import get_logger
 from real2sim2real.scene.base import BaseScene
 from real2sim2real.simworld.base import BaseSimWorld
 from real2sim2real.utils.asset_utils import prim_aabb, read_prim_world_pose, resolve_usd_path
+from real2sim2real.utils.cameras import CameraConfig, create_cameras, validate_camera_list
 
 
 class PickPlaceClothSceneConfig(BaseConfig):
@@ -37,6 +38,14 @@ class PickPlaceClothSceneConfig(BaseConfig):
         default=1922, ge=0, description="Validated side-seam vertex of the bundled shirt."
     )
     friction: float = Field(default=1.2, ge=0.0)
+    fill_light_intensity: float = Field(default=650.0, ge=0)
+    key_light_intensity: float = Field(default=2200.0, ge=0)
+    cameras: list[CameraConfig] = Field(default_factory=list)
+
+    @field_validator("cameras")
+    @classmethod
+    def _validate_cameras(cls, value: list[CameraConfig]) -> list[CameraConfig]:
+        return validate_camera_list(value)
 
     @field_validator("table_scale")
     @classmethod
@@ -94,13 +103,14 @@ class PickPlaceClothScene(BaseScene):
             raise RuntimeError("Cloth scene requires an initialized USD stage")
         stage = sim_world.stage
         dome = UsdLux.DomeLight.Define(stage, "/World/scene/lighting/fill")
-        dome.CreateIntensityAttr(650.0)
+        dome.CreateIntensityAttr(self.config.fill_light_intensity)
         key = UsdLux.DistantLight.Define(stage, "/World/scene/lighting/key")
-        key.CreateIntensityAttr(2200.0)
+        key.CreateIntensityAttr(self.config.key_light_intensity)
         UsdGeom.Xformable(key).AddRotateXYZOp().Set(Gf.Vec3f(-35, -25, -30))
         UsdGeom.Xform.Define(stage, self.config.prim_path)
         table = UsdGeom.Xform.Define(stage, self.table_prim_path)
         table.GetPrim().GetReferences().AddReference(self._asset(self.config.table_usd_path))
+        self.sensors.update(create_cameras(stage, self.config.cameras))
 
     def arrange(self) -> None:
         """Place the table on the floor and the target on its measured top."""
@@ -158,14 +168,7 @@ class PickPlaceClothScene(BaseScene):
         if not mesh_prim.IsA(UsdGeom.Mesh):
             raise RuntimeError("The Newton shirt asset must contain /root/shirt")
         source_mesh = UsdGeom.Mesh(mesh_prim)
-        points = np.asarray(source_mesh.GetPointsAttr().Get(), dtype=np.float64)
-        transform = UsdGeom.XformCache().GetLocalToWorldTransform(mesh_prim)
-        points = np.asarray([transform.Transform(Gf.Vec3d(*p)) for p in points])
-        points *= UsdGeom.GetStageMetersPerUnit(source)
-        points -= 0.5 * (points.min(axis=0) + points.max(axis=0))
-        points[:, 2] *= self.config.cloth_thickness_scale
-        points[:, :2] += self.config.target_xy
-        points[:, 2] += self.table_top_z + self.config.cloth_initial_clearance
+        points = self._initial_cloth_points(source, mesh_prim)
         counts = np.asarray(source_mesh.GetFaceVertexCountsAttr().Get(), dtype=np.int32)
         indices = np.asarray(source_mesh.GetFaceVertexIndicesAttr().Get(), dtype=np.int32)
         if not np.all(counts == 3):
@@ -182,6 +185,19 @@ class PickPlaceClothScene(BaseScene):
             raise ValueError("grasp_vertex exceeds the copied shirt vertex count")
         self.cloth_grasp_vertex = self.config.grasp_vertex
         self.publish_cloth_vertices(points)
+
+    def _initial_cloth_points(self, source: Any, mesh_prim: Any) -> np.ndarray:
+        from pxr import Gf, UsdGeom
+
+        points = np.asarray(UsdGeom.Mesh(mesh_prim).GetPointsAttr().Get(), dtype=np.float64)
+        transform = UsdGeom.XformCache().GetLocalToWorldTransform(mesh_prim)
+        points = np.asarray([transform.Transform(Gf.Vec3d(*p)) for p in points])
+        points *= UsdGeom.GetStageMetersPerUnit(source)
+        points -= 0.5 * (points.min(axis=0) + points.max(axis=0))
+        points[:, 2] *= self.config.cloth_thickness_scale
+        points[:, :2] += self.config.target_xy
+        points[:, 2] += self.table_top_z + self.config.cloth_initial_clearance
+        return points
 
     def _bind_friction(self, prim: Any) -> None:
         from pxr import UsdPhysics, UsdShade

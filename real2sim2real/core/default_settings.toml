@@ -5,15 +5,34 @@ console = true  # 文本控制台输出
 
 [sim_world]
 backend = "stub"  # 不启动 Kit
+# Featherstone 双相机采集示例：renderer="RayTracedLighting"、rt_subframes=4。
+# samples_per_pixel_per_frame=64 仅 PathTracing 生效；采集核对真实渲染帧及相机矩阵。
+# background_light_scale=1.0；引用背景子树的灯光强度倍率，官方衣服示例设为 0.25。
 
 [scene]
 backend = "stub"
+# pickplace_cloth / pickplace_rigid 支持 [[scene.cameras]] 固定相机列表。
+# 每项含 name、prim_path、pose_relative_to、pose、resolution 和可选镜头参数。
+# 示例见 configs/PhysicSolver_featherstone_vbd_pickplace_cloth.toml。
+# newton_cloth_franka 使用 newton_official/unisex_shirt.usd 和未经压扁的官方布局。
+# cloth_base_color=[0.16,0.20,0.65]、cloth_roughness=0.92、cloth_specular=0.02。
+# pickplace 系列场景：fill_light_intensity=650、key_light_intensity=2200。
 
 [robot]
 backend = "stub"
+# franka_newton / franka_physx 支持 [[robot.cameras]] 机载相机列表，字段与场景相机一致。
+# 官方 cloth_franka 场景使用 franka_newton 的 control_mode="velocity"。
 
 [planner]
 backend = "stub"
+# newton_cloth_franka：keyframe_limit=7（首轮抓放）；完整官方序列见 OFFICIAL_KEYFRAMES。
+# final_settle_s=2；shape_contact_stiffness=50000、shape_contact_damping=50、shape_contact_friction=1.5。
+# newton_cloth_franka 的 table_friction=1.5（官方默认），可独立于夹指摩擦设置。
+# 官方手指默认 open_finger_m=0.032、closed_finger_m=0.004，单位为单侧米。
+# full_surface_contacts=false；启用时对刚体网格生成 SDF，contact_sdf_resolution=64。
+# keyframe_offset_m=[0,0,0]：以米平移官方末端路径，厚度变化时需重新验证抓放。
+# finger_velocity_gain=1.0：夹指开合响应增益（1/s），速度受 URDF 限制。
 
 [job]
 backend = "stub"  # StubJob 只串工厂,不采集
+# pickplace_cloth 的 timeout_s=1800：包含采集与渲染的墙钟时限；运行中约每 30 秒记录进度。

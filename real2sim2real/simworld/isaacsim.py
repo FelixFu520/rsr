@@ -64,6 +64,7 @@ class IsaacsimWorldConfig(BaseConfig):
     width: int = Field(default=1280, gt=0)
     height: int = Field(default=720, gt=0)
     rt_subframes: int = Field(default=1, ge=1)
+    samples_per_pixel_per_frame: int = Field(default=64, ge=1)
     warmup_frames: int = Field(default=2, ge=0, description="初始化时只刷新 UI/渲染的帧数")
     dlss: bool = False
     auto_exposure: bool = False
@@ -78,8 +79,7 @@ class IsaacsimWorldConfig(BaseConfig):
     background_offset: Vector3 = (0.0, 0.0, 0.0)
     background_gravity: bool = False
     background_skip_metrics_assembler: bool = True
-    camera_eye: Vector3 | None = None
-    camera_target: Vector3 | None = None
+    background_light_scale: FiniteFloat = Field(default=1.0, ge=0)
 
     @field_validator("background_prim_path")
     @classmethod
@@ -103,10 +103,6 @@ class IsaacsimWorldConfig(BaseConfig):
             and self.newton_solver not in {"mujoco", "xpbd", "vbd"}
         ):
             raise ValueError("Newton USD 后端仅提供 mujoco/xpbd/vbd；其他求解器需 direct")
-        if (self.camera_eye is None) != (self.camera_target is None):
-            raise ValueError("camera_eye 和 camera_target 必须同时配置")
-        if self.camera_eye is not None and self.camera_eye == self.camera_target:
-            raise ValueError("camera_eye 不能与 camera_target 相同")
         if self.stage_usd_path and self.background_usd_path:
             raise ValueError("stage_usd_path 与 background_usd_path 只能选择一个")
         # USD 场景将 Hz 存为整数，拒绝会被 SDK 静默截断的步长。
@@ -262,7 +258,7 @@ class IsaacsimWorld(BaseSimWorld):
                     "renderer": self.config.renderer,
                     "width": self.config.width,
                     "height": self.config.height,
-                    "rt_subframes": self.config.rt_subframes,
+                    "samples_per_pixel_per_frame": self.config.samples_per_pixel_per_frame,
                     "fast_shutdown": self.config.fast_shutdown,
                     "extra_args": [
                         "--/exts/isaacsim.physics.newton/auto_switch_on_startup=false",
@@ -300,14 +296,16 @@ class IsaacsimWorld(BaseSimWorld):
         self._renderer.set_dt(self.config.rendering_dt)
         self._settings.set("/rtx/rendermode", self.config.renderer)
         self._settings.set_bool("/rtx/post/dlss/enabled", self.config.dlss)
+        # SimulationApp defaults to AA mode 3 (DLSS). Select spatial FXAA when
+        # DLSS is disabled, avoiding incompatible temporal history across cameras.
+        self._settings.set_int("/rtx/post/aa/op", 3 if self.config.dlss else 2)
         self._settings.set_bool("/rtx/post/tonemap/autoExposure/enabled", self.config.auto_exposure)
+        if self.config.headless:
+            # Dataset RGB must not include viewport grids, axes, or selection guides.
+            self._settings.set_int("/persistent/app/viewport/displayOptions", 0)
         if not self.uses_direct_newton:
             self._configure_physics()
             self.world = self._manager
-        if self.config.camera_eye is not None:
-            from isaacsim.core.utils.viewports import set_camera_view
-
-            set_camera_view(eye=self.config.camera_eye, target=self.config.camera_target)
         for _ in range(self.config.warmup_frames):
             self.update()
         self.log.info(
@@ -325,7 +323,7 @@ class IsaacsimWorld(BaseSimWorld):
 
     def _load_environment(self) -> None:
         import omni.usd
-        from pxr import Gf, UsdGeom, UsdPhysics
+        from pxr import Gf, Usd, UsdGeom, UsdLux, UsdPhysics
 
         context = omni.usd.get_context()
         if self.config.stage_usd_path:
@@ -365,10 +363,15 @@ class IsaacsimWorld(BaseSimWorld):
             UsdGeom.Xformable(background).AddTranslateOp(opSuffix="rsr_offset").Set(
                 Gf.Vec3d(*self.config.background_offset)
             )
+            if self.config.background_light_scale != 1.0:
+                for prim in Usd.PrimRange(background):
+                    if prim.HasAPI(UsdLux.LightAPI):
+                        light = UsdLux.LightAPI(prim)
+                        light.GetIntensityAttr().Set(
+                            light.GetIntensityAttr().Get() * self.config.background_light_scale
+                        )
             if not self.config.background_gravity:
                 # 仅修改背景子树的动态刚体，保留静态碰撞和后续 Scene/Robot 的物理属性。
-                from pxr import Usd
-
                 for prim in Usd.PrimRange(background):
                     if prim.HasAPI(UsdPhysics.RigidBodyAPI):
                         UsdPhysics.RigidBodyAPI(prim).CreateKinematicEnabledAttr(True)

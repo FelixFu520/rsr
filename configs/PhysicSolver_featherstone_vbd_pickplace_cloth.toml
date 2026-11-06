@@ -1,7 +1,8 @@
-# Isaac Sim 6.2：Franka FR3 抓起衣服、横向移动、降低并松开放回桌面。
+# Isaac Sim 6.2：官方 Newton cloth_franka 衣服、第一轮关键帧抓放与独立双相机。
 # 准备资产：./app/python.sh scripts/prepare_physic_solver_assets.py
+# 官方衣服：./app/python.sh scripts/prepare_official_newton_cloth.py
 # 运行：./app/python.sh -m real2sim2real.core.cli collect run -c configs/PhysicSolver_featherstone_vbd_pickplace_cloth.toml
-# 成功数据：outputs/PhysicSolver/featherstone_vbd_pickplace_cloth/lerobot_v3
+# 成功数据：outputs/featherstone_vbd/lerobot_v3
 # 验收及配置：同目录 result.json 与 diagnostics/<run>/，失败轨迹不会进入训练数据集。
 
 [sim_world]
@@ -10,17 +11,18 @@ physics_engine = "newton"
 newton_execution = "direct"  # 自建机器人/衣服模型，Kit 只负责显示
 newton_solver = "featherstone"  # 刚体机械臂；衣服求解器在 planner.cloth_solver 中指定
 newton_substeps = 10
-newton_iterations = 10
+newton_iterations = 5
 newton_use_cuda_graph = true
-physics_dt = 0.008333333333333333  # 120 Hz；15 fps 录制，每 8 个物理步一帧
+physics_dt = 0.016666666666666666  # 官方 60 Hz；15 fps 录制，每 4 个物理步一帧
 rendering_dt = 0.06666666666666667
 gravity = [0.0, 0.0, -9.81]
 device = "cuda:0"
 headless = true
-renderer = "RayTracedLighting"
+renderer = "PathTracing"  # 实时采集；离线路径追踪可覆盖为 PathTracing。
 width = 640
 height = 480
-rt_subframes = 1
+rt_subframes = 4  # 等待每路相机实际完成渲染的帧数，不推进物理。
+samples_per_pixel_per_frame = 64
 warmup_frames = 2
 fast_shutdown = true
 background_usd_path = "assets/PhysicSolver/Isaac/Environments/Simple_Warehouse/warehouse_multiple_shelves.usd"
@@ -28,23 +30,34 @@ background_prim_path = "/World/background"
 background_offset = [-4.0, 0.0, 0.0]
 background_gravity = false
 background_skip_metrics_assembler = true
-camera_eye = [1.8, 1.65, 1.85]
-camera_target = [0.0, 0.0, 0.95]
+background_light_scale = 0.25  # 仓库自带灯与桌面补光叠加；统一降低曝光强度。
 
 [scene]
-backend = "pickplace_cloth"
+backend = "newton_cloth_franka"
 object_kind = "cloth"
 table_usd_path = "assets/PhysicSolver/Table/Aligned.usd"
-cloth_usd_path = "assets/PhysicSolver/Cloth/unisex_shirt.usd"
+cloth_usd_path = "assets/PhysicSolver/Cloth/newton_official/unisex_shirt.usd"
 prim_path = "/World/scene"
-table_scale = [2.0, 1.2, 1.0]
+table_scale = [1.3333333333333333, 0.8, 1.0]
 table_xy = [0.0, 0.0]
-target_xy = [0.30, 0.0]
-robot_base_xy = [-0.38, 0.0]
-cloth_initial_clearance = 0.015
-cloth_thickness_scale = 0.03
 grasp_vertex = 1922  # 衣服实体侧缝，按该资产拓扑选取
 friction = 1.2
+fill_light_intensity = 162.5
+key_light_intensity = 550.0
+cloth_base_color = [0.16, 0.20, 0.65]
+cloth_roughness = 0.92
+cloth_specular = 0.02
+
+# 固定全景相机；USD 光学坐标为 -Z 向前、+Y 向上，四元数顺序 wxyz。
+[[scene.cameras]]
+name = "overview"
+prim_path = "/World/scene/overview_cam"
+pose_relative_to = "/World/scene"
+pose = { position = [1.8, 1.65, 1.85], orientation_wxyz = [0.3303108012, 0.2302877772, 0.5234982467, 0.7508740906] }
+resolution = [640, 480]
+clipping_range = [0.1, 80.0]
+focal_length = 18.0
+horizontal_aperture = 20.955
 
 [robot]
 backend = "franka_newton"
@@ -53,63 +66,47 @@ prim_path = "/World/robots/Franka"
 # Z 在 before_place_robot_hook 中由实际桌面高度替换。
 base_position = [-0.38, 0.0, 0.732389]
 base_orientation = [1.0, 0.0, 0.0, 0.0]
-initial_joint_positions = [0.0, -0.569, 0.0, -2.81, 0.0, 3.037, 0.741, 0.04, 0.04]
-arm_stiffness = 1200.0
-arm_damping = 80.0
-finger_stiffness = 1600.0
-finger_damping = 40.0
-finger_max_force = 60.0  # 资产参数；当前 Featherstone 不执行 effort limit
-finger_friction = 3.0
+initial_joint_positions = [0.0, 0.0, 0.0, -1.59695, 0.0, 2.5307, 0.0, 0.0, 0.0]
+control_mode = "velocity"
+
+# 腕部相机随 link7 运动；位于手掌前侧上沿，朝向夹爪中心（link7 的局部 Z≈0.2104 m）。
+[[robot.cameras]]
+name = "wrist"
+prim_path = "/World/robots/Franka/fr3_link7/wrist_cam"
+pose_relative_to = "/World/robots/Franka/fr3_link7"
+pose = { position = [0.0282842712, -0.0282842712, 0.175], orientation_wxyz = [0.1571484180, -0.3489283367, 0.8423875227, -0.3793898419] }
+resolution = [640, 480]
+clipping_range = [0.002, 20.0]
+focal_length = 8.0
+horizontal_aperture = 20.955
 
 [planner]
-backend = "pickplace_cloth"
+backend = "newton_cloth_franka"
+keyframe_limit = 7  # 官方第一轮抓放；完整序列可设为 33。
+final_settle_s = 2.0
+shape_contact_stiffness = 50000.0
+shape_contact_damping = 50.0
+shape_contact_friction = 1.5
 cloth_solver = "vbd"
 # Featherstone → VBD 是机器人驱动衣服的单向耦合，无布料固定顶点或抓取附件。
-settle_s = 1.0
-approach_s = 3.0
-descend_s = 2.0
-close_s = 2.0
-lift_s = 3.0
-hold_s = 2.0
-transfer_s = 2.5
-lower_s = 1.5
-release_s = 1.0
-retract_s = 1.5
-rest_s = 2.0
-approach_height_m = 0.18
-lift_height_m = 0.25
-place_offset_m = [-0.05, -0.12, 0.0]  # 相对实际抓取点的放置偏移，m
-place_height_m = 0.08
-maximum_place_error_m = 0.08
-retract_height_m = 0.12
-grasp_offset_m = [0.0, 0.0, 0.006]
-tcp_orientation_wxyz = [0.0, 1.0, 0.0, 0.0]
-open_finger_m = 0.04
-closed_finger_m = 0.006
-open_gripper_control = false
-minimum_lift_m = 0.08
-minimum_release_drop_m = 0.04
-maximum_patch_distance_m = 0.08
-maximum_table_penetration_m = 0.02
-grasp_patch_vertices = 20
-ik_iterations = 24
+minimum_lift_m = 0.03
+minimum_release_drop_m = 0.01
 particle_radius_m = 0.008
-cloth_mass_kg = 0.2
+cloth_mass_kg = 0.2  # 保留项目衣服质量，按网格面积分配；未直接套用官方演示面密度。
 cloth_stretch_stiffness = 10000.0
 cloth_stretch_damping = 0.015
 cloth_bend_stiffness = 5.0
 cloth_bend_damping = 0.5
-contact_stiffness = 50000.0
-contact_damping = 50.0
+contact_stiffness = 10000.0
+contact_damping = 10.0
 cloth_friction = 0.25
-table_friction = 0.4
-friction_epsilon_cm_s = 0.1  # Newton 模型内部使用 cm，输出数据使用 m/rad
+friction_epsilon_cm_s = 0.01  # Newton 模型内部使用 cm，输出数据使用 m/rad
 
 [job]
 backend = "pickplace_cloth"
-output_dir = "outputs/PhysicSolver/featherstone_vbd_pickplace_cloth"
+output_dir = "outputs/featherstone_vbd02"
 max_steps = 6000
-timeout_s = 1800.0
+timeout_s = 1800.0  # 包含双相机渲染和录制的墙钟时限，不是 18 秒仿真时长。
 inspect_gui = false
 
 [job.recorder]
@@ -117,7 +114,7 @@ format = "lerobot_v3"
 fps = 15
 width = 640
 height = 480
-task = "Pick up the shirt, move it to the designated place on the table, and release it."
+task = "Execute the first official Newton cloth_franka fold: approach, grasp, lift, translate, and release the shirt."
 # observation.state：7 个实测臂关节角 rad + 2 个实测手指开度 m。
-# action：同一帧下发的 7 个关节目标 rad + 2 个手指目标 m。
-# observation.images.overview：与状态/动作对齐的 H.264 RGB 视频。
+# action：官方控制器实际下发的 7 个关节速度 rad/s + 2 个手指速度 m/s。
+# observation.images.overview / observation.images.wrist：与状态/动作对齐的两路 H.264 RGB 视频。

@@ -60,7 +60,11 @@ class PickPlaceClothPlannerConfig(BaseConfig):
     grasp_patch_vertices: int = Field(default=20, ge=1)
     cloth_solver: Literal["vbd", "xpbd"] = "vbd"
     ik_iterations: int = Field(default=24, ge=1)
-    particle_radius_m: float = Field(default=0.008, gt=0)
+    particle_radius_m: float = Field(
+        default=0.008,
+        gt=0,
+        description="Particle contact envelope radius in metres; does not thicken the visual mesh",
+    )
     cloth_mass_kg: float = Field(default=0.2, gt=0)
     cloth_density_cm: float | None = Field(default=None, gt=0)
     cloth_stretch_stiffness: float = Field(default=1e4, gt=0)
@@ -229,6 +233,7 @@ class NewtonClothRuntime:
         builder = newton.ModelBuilder(
             gravity=tuple(value * self.scale for value in robot.sim_world.config.gravity)
         )
+        self._configure_builder(builder)
         if self.pure_newton and self.solver_name == "mujoco":
             SolverMuJoCo.register_custom_attributes(builder)
         self.proxy_body_ids: list[int] = []
@@ -347,9 +352,7 @@ class NewtonClothRuntime:
         self.control = self.model.control()
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
-        self.pipeline = newton.CollisionPipeline(
-            self.model, soft_contact_margin=config.particle_radius_m * self.scale
-        )
+        self.pipeline = self._create_collision_pipeline()
         self.contacts = self.pipeline.contacts()
         self.unified_xpbd = xpbd
         if self.unified_xpbd:
@@ -433,6 +436,14 @@ class NewtonClothRuntime:
                 robot.sim_world.config.physics_dt / config.newton_substeps,
                 use_graph=config.newton_use_cuda_graph,
             )
+
+    def _configure_builder(self, builder: Any) -> None:
+        """Allow specialized contact geometry before importing rigid assets."""
+
+    def _create_collision_pipeline(self) -> Any:
+        return self.newton.CollisionPipeline(
+            self.model, soft_contact_gap=self.config.particle_radius_m * self.scale
+        )
 
     def _create_ik(self) -> None:
         hand_bodies = [
@@ -520,13 +531,7 @@ class NewtonClothRuntime:
                         # trajectory; the freely simulated cloth keeps gravity.
                         self.model.gravity.assign(self.gravity_zero)
                     if self.solver_name not in {"mujoco", "xpbd"}:
-                        self.wp.launch(
-                            self.track_joint_velocity,
-                            dim=self.model.joint_dof_count,
-                            inputs=[self.control.joint_target_q, self.state_0.joint_q],
-                            outputs=[self.state_0.joint_qd],
-                            device=self.model.device,
-                        )
+                        self._apply_rigid_control()
                     if self.rigid_previous_body_q is not None:
                         self.wp.copy(self.rigid_previous_body_q, self.state_0.body_q)
                         self.wp.copy(self.rigid_previous_body_qd, self.state_0.body_qd)
@@ -541,6 +546,15 @@ class NewtonClothRuntime:
             self.pipeline.collide(self.state_0, self.contacts)
             self.cloth_solver.step(self.state_0, self.state_1, self.control, self.contacts, dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
+
+    def _apply_rigid_control(self) -> None:
+        self.wp.launch(
+            self.track_joint_velocity,
+            dim=self.model.joint_dof_count,
+            inputs=[self.control.joint_target_q, self.state_0.joint_q],
+            outputs=[self.state_0.joint_qd],
+            device=self.model.device,
+        )
 
     def _publish(self) -> None:
         """Publish and validate the latest actual state after one complete frame."""
@@ -605,12 +619,19 @@ class NewtonClothRuntime:
         return np.asarray(point, dtype=float) / self.scale
 
     def _create_robot_visuals(self) -> None:
-        from pxr import Gf, UsdGeom, Vt
+        from pxr import Gf, Tf, UsdGeom, Vt
 
         model = self.model
         stage = self.robot.sim_world.stage
-        for body in range(self.robot_body_count):
-            xform = UsdGeom.Xform.Define(stage, f"{self.robot.config.prim_path}/body_{body}")
+        body_paths = [
+            f"{self.robot.config.prim_path}/{Tf.MakeValidIdentifier(label.rsplit('/', 1)[-1])}"
+            for label in model.body_label[: self.robot_body_count]
+        ]
+        if len(set(body_paths)) != len(body_paths):
+            raise ValueError("Robot body labels must have unique USD link names")
+        for path in body_paths:
+            xform = UsdGeom.Xform.Define(stage, path)
+            xform.ClearXformOpOrder()
             self._visual_bodies.append(xform.AddTransformOp())
         shape_body = model.shape_body.numpy()
         shape_type = model.shape_type.numpy()
@@ -632,7 +653,7 @@ class NewtonClothRuntime:
                 UsdGeom.Xform.Define(stage, f"{self.robot.config.prim_path}/fixed_base")
                 path = f"{self.robot.config.prim_path}/fixed_base/shape_{index}"
             else:
-                path = f"{self.robot.config.prim_path}/body_{body}/shape_{index}"
+                path = f"{body_paths[body]}/shape_{index}"
             mesh = UsdGeom.Mesh.Define(stage, path)
             mesh.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(np.asarray(source.vertices, np.float32)))
             indices = np.asarray(source.indices, np.int32).reshape(-1)
@@ -645,6 +666,7 @@ class NewtonClothRuntime:
             xf.AddOrientOp().Set(Gf.Quatf(float(tf[6]), *tf[3:6].tolist()))
             xf.AddScaleOp().Set(Gf.Vec3f(*(scales[index] / self.scale).tolist()))
         self._publish_robot_visuals()
+        self.robot.initialize_cameras()
 
     def _publish_robot_visuals(self) -> None:
         from pxr import Gf
@@ -660,6 +682,7 @@ class PickPlaceClothPlanner(BasePlanner):
     """Drive joints and evaluate lifted geometry without attaching the grasp target."""
 
     config_cls = PickPlaceClothPlannerConfig
+    runtime_cls = NewtonClothRuntime
 
     def __init__(self, config: PickPlaceClothPlannerConfig | None = None, **_: Any) -> None:
         super().__init__()
@@ -702,7 +725,7 @@ class PickPlaceClothPlanner(BasePlanner):
                     "solver_iterations": world_config.newton_iterations,
                 }
             )
-            self.runtime = NewtonClothRuntime(self.robot, self.scene, runtime_config)
+            self.runtime = self.runtime_cls(self.robot, self.scene, runtime_config)
             if register_stepper:
                 self.robot.sim_world.register_newton_stepper(self.runtime.step)
             triangles = np.asarray(self.scene.triangle_indices).reshape(-1, 3)
@@ -943,6 +966,7 @@ class PickPlaceClothPlanner(BasePlanner):
                     else None
                 ),
                 cloth_solver=type(self.runtime.cloth_solver).__name__,
+                particle_radius_m=self.config.particle_radius_m,
                 cloth_self_contact_enabled=not self.runtime.unified_xpbd,
                 xpbd_particle_repulsion_enabled=(
                     self.config.xpbd_self_contact if self.runtime.unified_xpbd else None

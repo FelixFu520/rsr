@@ -28,8 +28,6 @@ background_prim_path = "/World/background"
 background_offset = [-4.0, 0.0, 0.0]
 background_gravity = false
 background_skip_metrics_assembler = true
-camera_eye = [1.8, 1.65, 1.85]
-camera_target = [0.0, 0.0, 0.95]
 
 [scene]
 backend = "pickplace_cloth"
@@ -46,6 +44,17 @@ cloth_thickness_scale = 0.03
 grasp_vertex = 1922  # 衣服实体侧缝，按该资产拓扑选取
 friction = 1.2
 
+# 固定全景相机；USD 光学坐标为 -Z 向前、+Y 向上，四元数顺序 wxyz。
+[[scene.cameras]]
+name = "overview"
+prim_path = "/World/scene/overview_cam"
+pose_relative_to = "/World/scene"
+pose = { position = [1.8, 1.65, 1.85], orientation_wxyz = [0.3303108012, 0.2302877772, 0.5234982467, 0.7508740906] }
+resolution = [640, 480]
+clipping_range = [0.1, 80.0]
+focal_length = 18.0
+horizontal_aperture = 20.955
+
 [robot]
 backend = "franka_newton"
 urdf_path = "assets/PhysicSolver/Robot/franka_emika_panda/urdf/fr3_franka_hand.urdf"
@@ -60,6 +69,17 @@ finger_stiffness = 1600.0
 finger_damping = 40.0
 finger_max_force = 60.0  # 力矩限值是否生效取决于所选机器人求解器
 finger_friction = 3.0
+
+# 腕部相机随 link7 运动；位于手掌前侧上沿，朝向夹爪中心（link7 的局部 Z≈0.2104 m）。
+[[robot.cameras]]
+name = "wrist"
+prim_path = "/World/robots/Franka/fr3_link7/wrist_cam"
+pose_relative_to = "/World/robots/Franka/fr3_link7"
+pose = { position = [0.0282842712, -0.0282842712, 0.175], orientation_wxyz = [0.1571484180, -0.3489283367, 0.8423875227, -0.3793898419] }
+resolution = [640, 480]
+clipping_range = [0.002, 20.0]
+focal_length = 8.0
+horizontal_aperture = 20.955
 
 [planner]
 backend = "pickplace_cloth"
@@ -120,4 +140,4 @@ height = 480
 task = "Pick up the shirt, move it to the designated place on the table, and release it."
 # observation.state：7 个实测臂关节角 rad + 2 个实测手指开度 m。
 # action：同一帧下发的 7 个关节目标 rad + 2 个手指目标 m。
-# observation.images.overview：与状态/动作对齐的 H.264 RGB 视频。
+# observation.images.overview / observation.images.wrist：与状态/动作对齐的两路 H.264 RGB 视频。

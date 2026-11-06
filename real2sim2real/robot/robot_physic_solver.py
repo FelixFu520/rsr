@@ -7,18 +7,31 @@ Lula IK，也为 hybrid 世界提供实测的手指/手掌碰撞位姿。两种�
 
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from real2sim2real.core.config import BaseConfig
 from real2sim2real.robot.base import BaseRobot
 from real2sim2real.utils.asset_utils import resolve_usd_path
+from real2sim2real.utils.cameras import CameraConfig, create_cameras, validate_camera_list
 
 
-class FrankaNewtonRobotConfig(BaseConfig):
+class _RobotCameraConfig(BaseConfig):
+    """Named cameras mounted in the robot's local link frames."""
+
+    cameras: list[CameraConfig] = Field(default_factory=list)
+
+    @field_validator("cameras")
+    @classmethod
+    def _validate_cameras(cls, value: list[CameraConfig]) -> list[CameraConfig]:
+        return validate_camera_list(value)
+
+
+class FrankaNewtonRobotConfig(_RobotCameraConfig):
     """Joint coordinates are arm radians followed by two finger openings in metres."""
 
     urdf_path: str = "assets/PhysicSolver/Robot/franka_emika_panda/urdf/fr3_franka_hand.urdf"
@@ -44,6 +57,7 @@ class FrankaNewtonRobotConfig(BaseConfig):
         default=60.0, gt=0, description="Authored N; Featherstone does not enforce effort limits"
     )
     finger_friction: float = Field(default=3.0, ge=0)
+    control_mode: Literal["position", "velocity"] = "position"
 
 
 class FrankaNewtonRobot(BaseRobot):
@@ -81,6 +95,10 @@ class FrankaNewtonRobot(BaseRobot):
     def adjust(self) -> None:
         """Keep the explicitly configured base pose."""
 
+    def initialize_cameras(self) -> None:
+        """Mount cameras after Newton has created and positioned the visual link frames."""
+        self.sensors.update(create_cameras(self.sim_world.stage, self.config.cameras))
+
     def add_newton_robot(self, builder: Any, *, scale: float = 100.0) -> None:
         """Import the bundled official Newton FR3 URDF with a fixed base."""
         import newton
@@ -102,10 +120,27 @@ class FrankaNewtonRobot(BaseRobot):
             collapse_fixed_joints=True,
             force_show_colliders=False,
         )
+        # Newton 1.6.1's URDF importer ignores <limit velocity>. Restore the
+        # authored limits, converting only prismatic axes to model centimetres.
+        joints = {joint.get("name"): joint for joint in ET.parse(path).getroot().findall("joint")}
+        for index, label in enumerate(builder.joint_label):
+            joint = joints.get(label.rsplit("/", 1)[-1])
+            if joint is None or joint.get("type") not in {"revolute", "prismatic"}:
+                continue
+            limit = joint.find("limit")
+            if limit is not None and limit.get("velocity") is not None:
+                velocity = float(limit.get("velocity"))
+                if joint.get("type") == "prismatic":
+                    velocity *= scale
+                builder.joint_velocity_limit[builder.joint_qd_start[index]] = velocity
         q = list(self.config.initial_joint_positions)
         q[-2:] = [value * scale for value in q[-2:]]
         builder.joint_q[:9] = q
         builder.joint_target_q[:9] = q
+        if self.config.control_mode == "velocity":
+            # Match the official cloth_franka controller: velocities drive Featherstone,
+            # with the URDF's native joint settings and no added position servos.
+            return
         builder.joint_target_ke[:7] = [self.config.arm_stiffness * scale**2] * 7
         builder.joint_target_kd[:7] = [self.config.arm_damping * scale**2] * 7
         builder.joint_target_ke[7:9] = [self.config.finger_stiffness] * 2
@@ -117,7 +152,7 @@ class FrankaNewtonRobot(BaseRobot):
         builder.joint_effort_limit[7:9] = [self.config.finger_max_force * scale] * 2
 
 
-class FrankaPhysxRobotConfig(BaseConfig):
+class FrankaPhysxRobotConfig(_RobotCameraConfig):
     """Configuration shared by the PhysX Panda and Newton FR3."""
 
     usd_path: str = "assets/PhysicSolver/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"
@@ -186,6 +221,7 @@ class FrankaPhysxRobot(BaseRobot):
             position=np.asarray(self.config.base_position),
             orientation=np.asarray(self.config.base_orientation),
         )
+        self.sensors.update(create_cameras(sim_world.stage, self.config.cameras))
 
     def arrange(self) -> None:
         """Record the table-mounted base pose and configure actual finger materials."""
