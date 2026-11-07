@@ -219,6 +219,7 @@ class PhysicSolverJob(BaseJob):
                         if remaining_s is not None
                         else None,
                         timings_s={name: round(value, 2) for name, value in timings.items()},
+                        physical_progress=self.planner.state.get("progress"),
                     )
                     next_progress = now + 30.0
             result = self.planner.result()
@@ -272,6 +273,9 @@ class PhysicSolverJob(BaseJob):
                 object_kind=self.scene.config.object_kind,
             )
             self.state["result"] = result
+            write_diagnostics = getattr(self.planner, "write_diagnostics", None)
+            if write_diagnostics is not None:
+                write_diagnostics(run)
             (run / "result.json").write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
             (output / "result.json").write_text(
                 json.dumps(result, indent=2, allow_nan=False) + "\n"

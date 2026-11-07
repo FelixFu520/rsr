@@ -18,10 +18,15 @@ backend = "stub"
 # cloth_base_color=[0.16,0.20,0.65]、cloth_roughness=0.92、cloth_specular=0.02。
 # pickplace 系列场景：fill_light_intensity=650、key_light_intensity=2200。
 
+# pickplace_package：cloth_usd_path="assets/PhysicSolver/Package/v7/parcel_two_mesh.usd"。
+# target_xy=[0.10,0]、robot_base_xy=[-0.42,0]；保持两个网格及原始 UV/材质。
+
 [robot]
 backend = "stub"
 # franka_newton / franka_physx 支持 [[robot.cameras]] 机载相机列表，字段与场景相机一致。
 # 官方 cloth_franka 场景使用 franka_newton 的 control_mode="velocity"。
+# franka_package_pads：V7 长夹块，pad_half_extents_m=[0.03,0.007,0.042]，
+# pad_center_m=[0,0.007,0.055]；pad_density_kg_m3=1000 为未硬件标定的仿真密度。
 
 [planner]
 backend = "stub"
@@ -32,6 +37,18 @@ backend = "stub"
 # full_surface_contacts=false；启用时对刚体网格生成 SDF，contact_sdf_resolution=64。
 # keyframe_offset_m=[0,0,0]：以米平移官方末端路径，厚度变化时需重新验证抓放。
 # finger_velocity_gain=1.0：夹指开合响应增益（1/s），速度受 URDF 限制。
+
+# pickplace_package 参数与默认值见 PackagePlannerConfig 和包裹示例 TOML。
+# V7 材料、质量和内部弹簧从 USD 的 parcel:runtimeParameters / physics:masses 读取。
+# self_contact_buffer=512、friction_epsilon_m_s=0.001、grasp_height_m=0.0704（V7 长夹块）。
+# closed_finger_m=0.00625、lift_height_m=0.18、place_offset_m=[0,-0.12,0]。
+# place_height_m=0.17：长夹块的 TCP 释放高度，确保包裹松开后回落。
+# arm_velocity_gain=3.0：受 URDF 速度上限约束的机械臂速度跟踪增益。
+# 包裹也支持 MuJoCo + robot.control_mode="position"，记录关节位置目标。
+# grasp_offset_m=[0,0,0]：相对包裹中心的抓取偏移；放置目标仍按包裹中心验收。
+# approach_s/descend_s/close_s/lift_s/transfer_s/lower_s/release_s/retract_s/rest_s
+# 默认依次为 2/1.5/1.5/2/1.5/1/1/1/1.5 秒；原装短指示例使用较慢抬升/转运。
+# align_place_to_com=false：开启后在转运开始时，按实测衣物质心平移剩余路径对齐落点。
 
 [job]
 backend = "stub"  # StubJob 只串工厂,不采集

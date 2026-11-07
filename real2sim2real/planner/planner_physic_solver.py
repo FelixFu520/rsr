@@ -213,10 +213,13 @@ class NewtonClothRuntime:
     VBD 外部刚体模式是刚体驱动衣服的单向耦合；衣服没有固定顶点或抓取附件。
     """
 
+    scale = 100.0
+    color_bending = False
+
     def __init__(self, robot: Any, scene: Any, config: Any) -> None:
         import newton
         import warp as wp
-        from newton.solvers import SolverFeatherstone, SolverMuJoCo, SolverVBD, SolverXPBD
+        from newton.solvers import SolverFeatherstone, SolverMuJoCo, SolverXPBD
 
         self.newton, self.wp = newton, wp
         self.robot, self.scene, self.config = robot, scene, config
@@ -229,7 +232,7 @@ class NewtonClothRuntime:
         xpbd = self.pure_newton and self.solver_name == "xpbd" and config.cloth_solver == "xpbd"
         if config.cloth_solver == "xpbd" and not xpbd:
             raise ValueError("cloth_solver='xpbd' requires pure Newton with newton_solver='xpbd'")
-        self.scale = 100.0
+        self.scale = type(self).scale
         builder = newton.ModelBuilder(
             gravity=tuple(value * self.scale for value in robot.sim_world.config.gravity)
         )
@@ -277,50 +280,13 @@ class NewtonClothRuntime:
             hy=half[1] * self.scale,
             hz=half[2] * self.scale,
         )
-        vertices_cm = np.asarray(scene.cloth_vertices) * self.scale
-        triangles = np.asarray(scene.triangle_indices, dtype=np.int32).reshape(-1, 3)
-        triangle_points = vertices_cm[triangles]
-        area_cm2 = float(
-            np.linalg.norm(
-                np.cross(
-                    triangle_points[:, 1] - triangle_points[:, 0],
-                    triangle_points[:, 2] - triangle_points[:, 0],
-                ),
-                axis=1,
-            ).sum()
-            * 0.5
-        )
-        if area_cm2 <= 0:
-            raise ValueError("The cloth surface has no positive triangle area")
-        density = config.cloth_density_cm or config.cloth_mass_kg / area_cm2
-        builder.add_cloth_mesh(
-            vertices=[wp.vec3(*v) for v in vertices_cm],
-            indices=triangles.reshape(-1),
-            pos=wp.vec3(0.0, 0.0, 0.0),
-            rot=wp.quat_identity(),
-            vel=wp.vec3(0.0, 0.0, 0.0),
-            scale=1.0,
-            density=density,
-            tri_ke=config.cloth_stretch_stiffness,
-            tri_ka=config.cloth_stretch_stiffness,
-            tri_kd=config.cloth_stretch_damping,
-            edge_ke=config.cloth_bend_stiffness,
-            edge_kd=config.cloth_bend_damping,
-            # SolverXPBD projects edge springs; it does not solve the FEM
-            # triangle stretch energies consumed by SolverVBD.
-            add_springs=xpbd,
-            spring_ke=config.xpbd_spring_stiffness,
-            spring_kd=config.xpbd_spring_damping,
-            particle_radius=config.particle_radius_m * self.scale,
-        )
+        self._add_deformables(builder, xpbd=xpbd)
         if xpbd and config.xpbd_mass_lumping == "uniform":
-            # The shirt's very small triangles create masses spanning >400x.
-            # Uniform lumping is an explicit XPBD approximation that preserves
-            # total mass while improving its unweighted spring Jacobi solve.
+            # Preserve total mass while improving XPBD's unweighted spring solve.
             total_mass = float(sum(builder.particle_mass))
             mass_per_vertex = total_mass / builder.particle_count
             builder.particle_mass[:] = [mass_per_vertex] * builder.particle_count
-        builder.color()
+        builder.color(include_bending=self.color_bending)
         self.model = builder.finalize(device=robot.sim_world.config.device or "cuda:0")
         if xpbd and not config.xpbd_self_contact:
             # This kernel has no cloth-adjacency exclusion. Preserve the
@@ -359,20 +325,7 @@ class NewtonClothRuntime:
             self.cloth_solver = SolverXPBD(self.model, iterations=config.solver_iterations)
             self.rigid_solver = None
         else:
-            self.cloth_solver = SolverVBD(
-                self.model,
-                iterations=config.solver_iterations,
-                integrate_with_external_rigid_solver=True,
-                particle_enable_self_contact=True,
-                particle_self_contact_margin=0.2,
-                particle_self_contact_gap=0.0,
-                particle_topological_contact_filter_threshold=1,
-                particle_rest_shape_contact_exclusion_radius=0.5,
-                particle_vertex_contact_buffer_size=32,
-                particle_edge_contact_buffer_size=32,
-                particle_collision_detection_interval=-1,
-                friction_epsilon=config.friction_epsilon_cm_s,
-            )
+            self.cloth_solver = self._create_cloth_solver()
             if self.pure_newton and self.solver_name == "mujoco":
                 self.rigid_solver = SolverMuJoCo(
                     self.model, solver="newton", integrator="implicitfast", iterations=30
@@ -436,6 +389,66 @@ class NewtonClothRuntime:
                 robot.sim_world.config.physics_dt / config.newton_substeps,
                 use_graph=config.newton_use_cuda_graph,
             )
+
+    def _add_deformables(self, builder: Any, *, xpbd: bool) -> None:
+        """Add the physical cloth; specialized assets may contain multiple meshes."""
+        config, scene, wp = self.config, self.scene, self.wp
+        vertices_cm = np.asarray(scene.cloth_vertices) * self.scale
+        triangles = np.asarray(scene.triangle_indices, dtype=np.int32).reshape(-1, 3)
+        triangle_points = vertices_cm[triangles]
+        area_cm2 = float(
+            np.linalg.norm(
+                np.cross(
+                    triangle_points[:, 1] - triangle_points[:, 0],
+                    triangle_points[:, 2] - triangle_points[:, 0],
+                ),
+                axis=1,
+            ).sum()
+            * 0.5
+        )
+        if area_cm2 <= 0:
+            raise ValueError("The cloth surface has no positive triangle area")
+        density = config.cloth_density_cm or config.cloth_mass_kg / area_cm2
+        builder.add_cloth_mesh(
+            vertices=[wp.vec3(*v) for v in vertices_cm],
+            indices=triangles.reshape(-1),
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            scale=1.0,
+            density=density,
+            tri_ke=config.cloth_stretch_stiffness,
+            tri_ka=config.cloth_stretch_stiffness,
+            tri_kd=config.cloth_stretch_damping,
+            edge_ke=config.cloth_bend_stiffness,
+            edge_kd=config.cloth_bend_damping,
+            # SolverXPBD projects edge springs; it does not solve the FEM
+            # triangle stretch energies consumed by SolverVBD.
+            add_springs=xpbd,
+            spring_ke=config.xpbd_spring_stiffness,
+            spring_kd=config.xpbd_spring_damping,
+            particle_radius=config.particle_radius_m * self.scale,
+        )
+
+    def _create_cloth_solver(self) -> Any:
+        """Create VBD independently of the rigid articulation solver."""
+        from newton.solvers import SolverVBD
+
+        config = self.config
+        return SolverVBD(
+            self.model,
+            iterations=config.solver_iterations,
+            integrate_with_external_rigid_solver=True,
+            particle_enable_self_contact=True,
+            particle_self_contact_margin=0.2,
+            particle_self_contact_gap=0.0,
+            particle_topological_contact_filter_threshold=1,
+            particle_rest_shape_contact_exclusion_radius=0.5,
+            particle_vertex_contact_buffer_size=32,
+            particle_edge_contact_buffer_size=32,
+            particle_collision_detection_interval=-1,
+            friction_epsilon=config.friction_epsilon_cm_s,
+        )
 
     def _configure_builder(self, builder: Any) -> None:
         """Allow specialized contact geometry before importing rigid assets."""

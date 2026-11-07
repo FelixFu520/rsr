@@ -24,6 +24,7 @@ PhysX 的实际求解器在文件名中写为 `tgs`，引擎归属仍由 `sim_wo
 | 配置后缀（均有 `PhysicSolver_` 前缀和 `.toml` 后缀） | 世界模式 | 机器人 / 接触 | 任务 |
 |---|---|---|---|
 | `featherstone_vbd_pickplace_cloth` | Newton direct | Featherstone / VBD | 衣服抓放 |
+| `featherstone_vbd_pickplace_package` | Newton direct | Featherstone / VBD | V7 袋膜与内部衣物抓放 |
 | `mujoco_vbd_pickplace_cloth` | Newton direct | MuJoCo / VBD | 衣服抓放 |
 | `xpbd_vbd_pickplace_cloth` | Newton direct | XPBD / VBD | 衣服抓放 |
 | `tgs_vbd_pickplace_cloth` | hybrid | PhysX TGS / Newton VBD | 衣服抓放 |
@@ -78,6 +79,64 @@ VBD 负责衣服。动作包括接近、闭合、抬升、保持、横向转运�
 该案例采用机器人驱动衣服的单向耦合；衣服无固定顶点、无抓取附件。
 Featherstone 的轨迹控制包含重力补偿和限速跟踪，当前不执行 URDF effort limit；
 因此这些数据用于该仿真控制方式，不能据此评价真实夹爪限力性能。
+
+### V7 包裹抓放
+
+[原装 Franka 夹爪配置](configs/PhysicSolver_mujoco_vbd_pickplace_package.toml) 使用
+MuJoCo 位置驱动机械臂和 URDF 原装短指，接触与袋膜/衣物仍使用 VBD。
+初始姿态在中央抓取点上方，抓取偏移、各阶段时长可配置；动作数据记录关节位置目标。
+可按转运开始时的实测衣物质心修正剩余路径，使悬垂包裹对齐放置目标。
+结果单独保存在 `outputs/PhysicSolver/mujoco_vbd_pickplace_package/`，保留失败诊断视频。
+
+```bash
+./app/python.sh -m real2sim2real.core.cli collect run -c configs/PhysicSolver_mujoco_vbd_pickplace_package.toml
+./app/python.sh scripts/validate_package_pickplace.py outputs/PhysicSolver/mujoco_vbd_pickplace_package
+```
+
+原装短指配置已完成一次通过全部 14 项验收的采集：衣物/袋膜最大质心提升约
+236/232 mm，转运双侧接触保持率 100%，释放回落约 106 mm，落点误差约 18.8 mm。
+局部最大边长伸长比 1.223，无桌面穿透；转运期间抽样的最低质心提升仍分别为
+231/226 mm。12.3 秒、双相机各 185 帧（15 fps）数据标记为 `demonstration`。
+视频解码、帧对齐、动作单位和十个关键时刻的袋内包含关系均已复核。
+
+[长夹块对照配置](configs/PhysicSolver_featherstone_vbd_pickplace_package.toml) 使用
+`pickplace_package` 场景和 Planner，沿用采集 Job 的完整生命周期和双相机 LeRobot v3 输出。
+独立资产在 `assets/PhysicSolver/Package/v7/`，保留 Bag、Garment 两个物理网格、
+原始 UV/材质、逐点质量（衣物 200 g、袋膜约 20.54 g）和衣物内部的被动弹簧。
+Newton 模型使用米/千克/秒，V7 的材料参数从资产读取，不将衣物压扁或固定在夹爪上。
+机器人使用 `franka_package_pads`：在 Featherstone 手指刚体上安装 V7 的
+14 × 60 × 84 mm 长夹块，显示尺寸与碰撞几何一致。原 Franka 短指在本任务的中央/边缘
+试抓中滑脱，因此不将长夹块数据标成原装夹爪数据。夹块密度取 1000 kg/m³，
+每块约 70.56 g，是仿真假设，未做硬件标定。
+
+```bash
+# 重新复制时拒绝覆盖不同文件；源 V7 改变后应选新的 --target 保存快照。
+./app/python.sh scripts/prepare_package_assets.py
+# 可先不录 RGB，验证抓取几何和物理行为。
+./app/python.sh scripts/check_package_pickplace.py
+./app/python.sh -m real2sim2real.core.cli collect run -c configs/PhysicSolver_featherstone_vbd_pickplace_package.toml
+# 已导出数据的帧对齐、双相机解码和粒子几何复核（含失败诊断数据）。
+./app/python.sh scripts/validate_package_pickplace.py
+```
+
+结果在 `outputs/PhysicSolver/featherstone_vbd_pickplace_package/`。
+验收分别检查袋膜与衣物的质心提升、转运双侧接触、释放回落、落点、逐帧表面伸长与桌面穿透，
+并累计每个物理子步的接触容量。`diagnostics/<run>/particles.npz` 保存 15 Hz 的实际粒子状态，
+用于在十个关键时刻独立检查全部衣物顶点及面中心是否仍在封闭袋膜内（容差 1 mm）。
+几何抽样不能证明连续时间无穿透。源 V7 的 USD 复算尚未全部通过，因此本任务独立验收，
+不继承源轨迹的成功标记；失败轨迹留在 diagnostics，不进入成功数据集。
+需要将完整失败视频也导出为 LeRobot 时，设置 `job.recorder.save_failed_episodes=true`；
+episode 会标记 `success=false`、`dataset_use="diagnostic"`。
+复核脚本输出 `validation.json`、`qa/physical_audit.json` 和双相机关键帧 `qa/keyframes.jpg`。
+
+长夹块对照配置的实测验收未通过：32 子步 / 28 次迭代下，衣物与袋膜质心分别提升约
+115.7 / 115.4 mm 后滑脱，转运双侧接触占比约 2.25%，局部最大边长伸长比为 1.422。
+13 秒、双相机各 195 帧的采集保留为 `diagnostic`。十个几何抽样时刻的衣物包含检查通过，
+未检测到桌面穿透或接触容量溢出；这些通过项不代表抓放任务成功。
+
+Featherstone 与 VBD 在这里采用单向刚体驱动柔体耦合，夹爪不接收包裹的反作用力；
+参见 [Newton VBD 耦合说明](https://newton-physics.github.io/newton/1.6.0/api/_generated/newton.solvers.SolverVBD.html)。
+这套控制方式不能用于验证实物夹爪的额定负载或限力性能。
 
 ## 统一仿真世界（Isaac Sim 6.2）
 
