@@ -1,0 +1,175 @@
+# Pro-M6 双臂：入料带 → 平台放手交接 → 出料带放手 → 摩擦输送。
+# V7 袋膜/衣物各自动态；不固定粒子、不瞬移包裹、不切换物理模型。
+[sim_world]
+backend = "isaacsim"
+physics_engine = "newton"
+newton_execution = "direct"
+newton_solver = "mujoco"
+newton_substeps = 32
+newton_iterations = 28
+newton_use_cuda_graph = true
+physics_dt = 0.016666666666666666
+rendering_dt = 0.06666666666666667
+gravity = [0.0, 0.0, -9.81]
+device = "cuda:0"
+headless = true
+renderer = "RayTracedLighting"
+width = 640
+height = 480
+rt_subframes = 8
+warmup_frames = 2
+fast_shutdown = true
+background_usd_path = "assets/Background/Factory/factory_002/Factory_Interior.usd"
+background_prim_path = "/World/background"
+background_gravity = false
+background_skip_metrics_assembler = true
+background_light_scale = 0.25
+
+[scene]
+backend = "sorting_package"
+object_kind = "cloth"
+station_usd_path = "assets/Scene/sorting_station/composed/scene_parcel_5cm_loose_edges.usdc"
+cloth_usd_path = "assets/PhysicSolver/Package/v7_sorting/parcel_two_mesh.usd"
+prim_path = "/World/scene"
+infeed_path = "ConveyorBelt_A06_01/Belt"
+platform_path = "platform/Empty/Plane/Plane_002"
+outfeed_path = "ConveyorBelt_A06/Belt"
+target_xy = [0.55, -0.90]
+outfeed_target_xy = [-0.55, -0.876]
+garment_mass_kg = 0.2  # 原衣物质量；轻载对照可显式覆盖，袋膜质量不变。
+initial_clearance_m = 0.002
+support_depth_m = 0.04
+label_uv_bounds = [0.20, 0.44, 0.66, 0.65]
+fill_light_intensity = 650.0
+key_light_intensity = 2200.0
+
+[[scene.cameras]]
+name = "overview"
+prim_path = "/World/Cameras/overview"
+pose_relative_to = "/World"
+pose = { position = [2.4, -3.6, 3.6], orientation_wxyz = [0.7895774599, 0.5032690768, 0.1887259038, 0.2960915475] }
+resolution = [640, 480]
+clipping_range = [0.1, 80.0]
+focal_length = 18.0
+horizontal_aperture = 20.955
+
+[robot]
+backend = "pro_m6_newton"
+usd_path = "assets/Robot/pro_m6_696/pro_m6_696.usda"
+prim_path = "/World/robots/ProM6"
+control_mode = "position"
+arm_stiffness = 6000.0
+arm_damping = 300.0
+finger_stiffness = 40.0
+finger_damping = 1.0
+finger_friction = 1.4
+initial_gripper_rad = 0.0  # 仿真初始关节姿态，不修改结构。
+pad_width_m = 0.03  # 原生指垫；机器人结构固定，不允许加宽。
+
+[[robot.cameras]]
+name = "head"
+prim_path = "/World/robots/ProM6/Geometry/base_link/sorting_head_camera"
+pose_relative_to = "/World/robots/ProM6/Geometry/base_link"
+pose = { position = [0.0, -0.70, 1.7], orientation_wxyz = [0.989361, 0.145478, 0.0, 0.0] }
+resolution = [640, 480]
+clipping_range = [0.01, 80.0]
+focal_length = 10.0
+horizontal_aperture = 20.955
+
+[[robot.cameras]]
+name = "left_wrist"
+prim_path = "/World/robots/ProM6/robotiq_left/sorting_wrist_camera"
+pose_relative_to = "/World/robots/ProM6/robotiq_left"
+pose = { position = [0.10, 0.0, 0.10], orientation_wxyz = [0.4331887305, 0.0, 0.9013032363, 0.0] }
+resolution = [640, 480]
+clipping_range = [0.005, 20.0]
+focal_length = 8.0
+horizontal_aperture = 20.955
+
+[[robot.cameras]]
+name = "right_wrist"
+prim_path = "/World/robots/ProM6/robotiq_right/sorting_wrist_camera"
+pose_relative_to = "/World/robots/ProM6/robotiq_right"
+pose = { position = [0.10, 0.0, 0.10], orientation_wxyz = [0.4331887305, 0.0, 0.9013032363, 0.0] }
+resolution = [640, 480]
+clipping_range = [0.005, 20.0]
+focal_length = 8.0
+horizontal_aperture = 20.955
+
+[planner]
+backend = "sorting_package"
+mujoco_cpu = true  # 单台双臂使用原生 MuJoCo；VBD 仍在 CUDA 上运行。
+physics_origin_m = [0.0, 0.0, 0.0]  # 数值对照可将原点移到包裹附近；世界观测不变。
+tcp_orientation_wxyz = [0.0, 0.7071067811865476, 0.7071067811865476, 0.0]  # 世界 X 闭合。
+mujoco_control_per_frame = true  # 只合并恒定控制输入的同步；保留每个 MuJoCo/VBD 子步。
+mujoco_iterations = 100
+mimic_time_constant_s = 0.0015
+mimic_impedance = 0.999
+cloth_solver = "vbd"
+full_surface_contacts = true
+contact_sdf_resolution = 64
+contact_stiffness = 20000.0
+contact_damping = 30.0
+shape_contact_stiffness = 20000.0
+shape_contact_damping = 30.0
+shape_contact_friction = 1.4
+# gripper_package_friction = 2.0  # 可单独提高内指—包裹有效摩擦；需实际验收。
+cloth_friction = 1.4
+table_friction = 0.5
+self_contact_buffer = 512
+friction_epsilon_m_s = 0.001
+open_gripper_rad = 0.0
+closed_gripper_rad = 0.64  # 源工位白色指垫初始闭合间隙约 12 mm。
+hold_gripper_rad = 0.675  # 提升中平滑补夹至约 4.8 mm 正间隙，接近参考 FR3 的约 5 mm。
+grasp_height_m = 0.048  # 指垫比 ToolCenter 前伸约 36 mm；闭合时下缘离台约 12 mm。
+# grasp_pad_bottom_m = 0.030  # 可选：按原生 FK 补偿闭合时指垫底边的下移。
+grasp_offset_xy_m = [0.0, 0.0]
+lift_height_m = 0.25
+place_height_m = 0.20
+approach_s = 3.0
+descend_s = 1.5
+close_s = 1.5
+lift_s = 3.0
+hold_s = 1.0  # 提升后原位静置；形状验收仍检查整个后续转运的三个时刻。
+transfer_s = 3.5
+transfer_profile = "cubic"  # 可选 quintic：转运段起止加速度为零，需单独物理验收。
+strain_limited_grip = false
+grip_strain_target = 1.18
+grip_maximum_relief_rad = 0.01
+grip_relief_rate_rad_s = 0.05
+grip_recovery_rate_rad_s = 0.005
+grip_strain_hysteresis = 0.03
+lower_s = 1.5
+release_s = 1.0
+retract_s = 1.0
+return_s = 2.5
+rest_s = 1.5
+belt_speed_mps = 0.5
+belt_transport_s = 6.0
+minimum_belt_displacement_m = 0.30
+minimum_lift_m = 0.08
+minimum_release_drop_m = 0.01
+maximum_table_penetration_m = 0.0015
+maximum_place_error_m = 0.08
+maximum_edge_stretch = 1.3
+minimum_triangle_area_ratio = 0.03
+maximum_shape_rms_m = 0.037413
+maximum_bag_gap_m = 0.01
+early_stop_on_shape_failure = true  # 诊断可设 false，最终验收仍检查原形状/间隙门限。
+maximum_tcp_error_m = 0.03
+label_up_min_cos = 0.9
+
+[job]
+backend = "sorting_package"
+output_dir = "outputs/PhysicSolver/mujoco_vbd_sorting_package"
+max_steps = 6000
+timeout_s = 14400.0
+inspect_gui = false
+
+[job.recorder]
+format = "lerobot_v3"
+fps = 15
+width = 640
+height = 480
+save_failed_episodes = true
+task = "Use the Pro-M6 left arm to relay the V7 parcel from infeed to platform, release, then use the right arm to place it on the outfeed conveyor and release for friction-driven transport."

@@ -62,6 +62,12 @@ class LeRobotV3Recorder:
         self.robot_type = robot_type
         self.joint_names = joint_names if joint_names is not None else JOINT_NAMES
         self.action_names = action_names if action_names is not None else self.joint_names
+        if not self.joint_names or not self.action_names:
+            raise ValueError("State and action coordinate names must be nonempty")
+        if len(set(self.joint_names)) != len(self.joint_names) or len(
+            set(self.action_names)
+        ) != len(self.action_names):
+            raise ValueError("Coordinate names must be unique within each feature")
         self.rows: list[dict[str, Any]] = []
         self.image_stats = {
             name: dict(sum=np.zeros(3), squared_sum=np.zeros(3), min=np.ones(3), max=np.zeros(3))
@@ -77,8 +83,13 @@ class LeRobotV3Recorder:
     def add_frame(self, state: np.ndarray, action: np.ndarray) -> None:
         """Store current joint positions and commanded targets at the same video frame time."""
         state, action = np.asarray(state, np.float32), np.asarray(action, np.float32)
-        if state.shape != (9,) or action.shape != (9,) or not np.isfinite([state, action]).all():
-            raise ValueError("State/action must each contain nine finite coordinates")
+        if (
+            state.shape != (len(self.joint_names),)
+            or action.shape != (len(self.action_names),)
+            or not np.isfinite(state).all()
+            or not np.isfinite(action).all()
+        ):
+            raise ValueError("State/action must match their named finite coordinates")
         # Validate every view before committing any per-frame statistics or joint data.
         images = {}
         for name, resolution in self.cameras.items():
@@ -116,8 +127,8 @@ class LeRobotV3Recorder:
             self._encode_video(name)
         schema = pa.schema(
             [
-                ("observation.state", pa.list_(pa.float32(), 9)),
-                ("action", pa.list_(pa.float32(), 9)),
+                ("observation.state", pa.list_(pa.float32(), len(self.joint_names))),
+                ("action", pa.list_(pa.float32(), len(self.action_names))),
                 ("timestamp", pa.float32()),
                 *[
                     (name, pa.int64())
@@ -138,7 +149,7 @@ class LeRobotV3Recorder:
             stats[name] = self._stats(array)
             features[name] = {
                 "dtype": "float32" if is_vector or name == "timestamp" else "int64",
-                "shape": [9 if is_vector else 1],
+                "shape": [array.shape[1] if is_vector else 1],
                 "names": (self.action_names if name == "action" else self.joint_names)
                 if is_vector
                 else None,

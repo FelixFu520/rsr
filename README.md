@@ -6,7 +6,7 @@
 
 > Agent / 贡献者：请先读 [`AGENTS.md`](AGENTS.md)（目录约定、扩展后端、配置与 CLI 约定）。
 
-当前整理状态：历史任务实现保留在 `bak/rsr-bak/`。主包包含基础框架、stub 通路、统一的 `IsaacsimWorld` 和衣服抓放采集案例。
+当前整理状态：历史任务实现保留在 `bak/rsr-bak/`。主包包含基础框架、stub 通路、统一的 `IsaacsimWorld`、衣服/包裹抓放及 Pro-M6 双臂分拣案例。
 下文旧 Franka / sorting 任务作为历史参考保留；新衣服案例使用下述独立配置。
 
 ## 求解器组合与 LeRobot v3 采集
@@ -137,6 +137,127 @@ episode 会标记 `success=false`、`dataset_use="diagnostic"`。
 Featherstone 与 VBD 在这里采用单向刚体驱动柔体耦合，夹爪不接收包裹的反作用力；
 参见 [Newton VBD 耦合说明](https://newton-physics.github.io/newton/1.6.0/api/_generated/newton.solvers.SolverVBD.html)。
 这套控制方式不能用于验证实物夹爪的额定负载或限力性能。
+
+### Pro-M6 双臂包裹分拣
+
+[分拣配置](configs/PhysicSolver_mujoco_vbd_sorting_package.toml) 恢复旧任务的
+**入料带 → 左臂抓取 → 平台放手交接 → 右臂抓取 → 出料带放手 → 摩擦输送出带**。
+场景、机器人、Planner 和 Job 分别通过 `sorting_package` / `pro_m6_newton` 注册，
+复用固定 Job 生命周期，不依赖运行时导入 `bak/`。左右臂放手撤离后返回安全停靠位；
+第二次抓取读取同一物理模型的实时包裹状态，不恢复或压平网格。
+阶段之间延续上一段的指令目标；闭合和松开默认只更新夹爪目标，避免把实测跟踪误差反复加进
+下一段的笛卡尔轨迹。诊断同时记录实测 TCP 和指令 TCP；任务时钟由整数物理帧计算。
+下放前根据实际质心修正横向落点；转运首帧、中点和末帧即时检查形状与袋衣间隙，
+不可通过的候选提前保存诊断并停止。物理检查与缓存渲染脚本使用独立 Kit 进程，
+依据本次运行标识核对结果和退出码，避免快速关闭跳过失败判断或误用旧结果。
+`planner.transfer_profile="quintic"` 可将转运段改为起止速度、加速度均为零的五次曲线；
+默认 `"cubic"` 保留原三次曲线。它只改变机器人运动目标，仍逐步求解实际关节和接触，
+需要重新检查形状、袋衣间隙、拉伸和落点；在线日志输出各形状检查点的原始数值。
+`planner.strain_limited_grip=true` 可启用仿真网格反馈：瞬时边长伸长超过
+`grip_strain_target` 时，以 `grip_relief_rate_rad_s` 小幅松爪，最大松开量为
+`grip_maximum_relief_rad`；低于目标减去 `grip_strain_hysteresis` 后，按
+`grip_recovery_rate_rad_s` 恢复。默认死区 0.03、恢复速度为松开速度的十分之一。
+左右臂独立反馈，抬升、保持、转运和下放阶段只调整真实关节目标，释放从最后的夹爪目标
+连续打开。该控制使用仿真真实网格，不是仅靠机器人本体传感器的策略；不改写粒子状态或
+放宽物理验收。诊断记录每帧的 `grip_relief_rad`，LeRobot 状态和动作仍为实际 16 维关节量。
+
+机器人从原 Pro-M6 USD 导入，使用原生 MuJoCo CPU 求解关节位置驱动及 Robotiq mimic
+等式约束，袋膜、衣物和刚软接触使用 CUDA VBD。机器人自碰撞沿用源资产的
+`newton:selfCollisionEnabled=false`。源 USD 的碰撞近似先转换为凸包，再生成
+接触 SDF；不增加隐藏夹块。源工位的每根夹指同时有金属网格和 30 × 7.5 × 70 mm 白色指垫碰撞盒。
+高度与穿透验收包含两种碰撞体；不能只根据金属网格估算指尖。夹块闭合时比 ToolCenter
+向前伸出约 36 mm，本任务设置 TCP 离台 48 mm，使夹块下缘离台约 12 mm。
+主轴从 0.64 rad 闭合到提升后的 0.675 rad，对应约 12 → 4.8 mm 的实际夹块间隙，
+没有增加隐藏夹块或把旧虚拟间隙当作实测几何。
+MuJoCo mimic 的时间常数和阻抗写在配置及采集快照中。
+`planner.hold_s` 可在提升后保持原关节目标静置，再开始水平转运；示例为 1 s。
+这与 V7 在提升结束后静置评估形状的阶段相对应，转运期的原有形状门限保持不变。
+`planner.grasp_pad_bottom_m` 可改用指垫底边目标：从原生连杆 FK 计算指垫相对 TCP 的
+高度曲线，下降时按打开角度定位，闭合时同步补偿机械臂高度。校准使用独立 FK 缓冲，
+不推进动力学或改写实际状态。可与 `open_gripper_rad=0.28`（名义开口约 81 mm）配合，
+减少 Robotiq 闭合时向下扫过袋膜的运动。该选项默认不设置，实际关节跟踪误差仍需测量；
+`trajectory.json` 另记录每帧实际指垫最低点相对抓取支撑面的高度 `pad_bottom_m`。
+`planner.grasp_offset_xy_m` 可在世界 XY 中相对实时衣物质心选择抓取点；抓取、转运、下放
+的名义 TCP 路径一起做关节限位预检，放置修正仍以实际质心和原目标平台中心为准。
+机器人与夹爪结构固定为原 USD：30 × 7.5 × 70 mm 原生指垫，不添加扩展件，保留原质量及惯量。
+`scene.garment_mass_kg` 默认 0.2，可显式减轻衣物；逐点质量按相同比例缩放，袋膜质量、
+几何、UV 和弹簧保持原样。
+`robot.initial_gripper_rad` 仅指定仿真开始前的夹爪姿态，同时按原 mimic 比例初始化从动关节；
+后续姿态完全由 MuJoCo 积分求解。轻载诊断从 0.28 rad 打开状态开始，以减少启动阶跃。实际质量、原始质量与缩放比例写入结果；独立验收还读取 USD，核对袋膜质量及衣物质量分布，
+不将轻载实验称为原 200 g 案例。
+`planner.gripper_package_friction` 可单独设定原生内指与包裹的有效摩擦系数。
+本机 Newton 1.6.1 按两侧材料系数的几何平均合成；运行时反算内指材料值，保留其它
+机器人部位、袋衣自接触及支撑面的参数。默认不覆盖，此时有效系数为 1.4；设为 2.0
+时，衣物侧仍为 1.4，内指侧约为 2.857。实际材料值与合成结果写入结果和诊断缓存。
+摩擦实验仍须通过原拉伸、穿透、形状、贴合及完整分拣验收，参数需独立于实物标定记录。
+[摩擦对照配置](configs/PhysicSolver_mujoco_vbd_sorting_package_friction.toml) 使用原装夹爪、
+100 g 衣物和有效摩擦 2.0，并先夹紧再提升；目前仍为待验收实验。
+刚软耦合接触检测使用 MuJoCo 推进后的刚体位姿和推进前的柔体状态；VBD 同时保留
+刚体前后位姿，以计算接触与摩擦运动。
+`planner.physics_origin_m` 可指定固定的局部求解原点；Newton 整体平移机器人、自由刚体、
+静态支撑和粒子，控制目标、USD 及缓存仍使用世界坐标。这改变浮点条件而不改变相对几何
+或添加外力；不同坐标设置的轨迹不保证逐位相同。默认 `[0,0,0]` 保留世界坐标求解。
+每帧的控制目标在 32 个子步内保持恒定；CPU 桥接可批量上传逐子步的实际求解结果，
+避免重复同步。所有 MuJoCo 积分、刚体碰撞和 VBD 接触仍逐子步求解，
+`mujoco_control_per_frame=false` 可切回 Newton 原始桥接作对照。
+
+本任务独立保存当前 `/home/fufa/Projects/package/output/simulation_v7` 到
+`assets/PhysicSolver/Package/v7_sorting/`。已有 `v7/` 抓放资产保持原样；两份快照的网格和
+逐点质量一致，源控制参数与验证记录有差异。衣物 200 g、袋膜约 20.54 g，保留原 UV、材质
+及衣物内部被动弹簧，不固定粒子，不使用抓取附件。传送带用支撑面的切向接触位移产生摩擦，
+不会直接给包裹写入平移或速度。
+
+窄指垫的接触离散对照可使用 `scripts/refine_package_assets.py` 另存
+`assets/PhysicSolver/Package/v7_sorting_refined/`，再设置 `scene.cloth_usd_path` 选择该资产。
+默认局部细分将衣物／袋膜节点从 3300／1650 增至 5076／2538；保持原三角面的初始表面、
+面密度、总质量和原蓬松弹簧锚点，节点质量按新三角面积重新集中。UV 与材质分区随父面映射。
+派生资产的 `provenance.json` 记录源哈希、拓扑变化、USD 回读及封闭性检查；历史报告以
+`SOURCE_` 文件名保留。它需要重新求解和验收，不继承原资产的结果。
+验收同时检查全部新网格探针和原 V7 的材料采样点：原衣物节点使用原质量权重，原袋膜面中心
+按材料坐标映射到细分后的表面，采样数量保持不变，两套结果都必须满足原门限。
+
+```bash
+# 独立快照已准备；在新机器上准备时选择对应的 V7 源目录。
+./app/python.sh scripts/prepare_package_assets.py --target assets/PhysicSolver/Package/v7_sorting
+# 可选的独立接触网格细分对照；不改写上面的原始快照。
+./app/python.sh scripts/refine_package_assets.py
+# 完整物理试验，不采集 RGB。
+./app/python.sh scripts/check_sorting_package.py
+# 从真实物理缓存渲染视频，避免重复求解。失败/截断缓存需显式加 --allow-failure。
+./app/python.sh scripts/render_sorting_package.py outputs/PhysicSolver/sorting_physics_check --output outputs/PhysicSolver/mujoco_vbd_sorting_package
+# 四路同步 LeRobot v3：全景、头部、左腕、右腕。
+./app/python.sh -m real2sim2real.core.cli collect run -c configs/PhysicSolver_mujoco_vbd_sorting_package.toml
+./app/python.sh scripts/validate_sorting_package.py outputs/PhysicSolver/mujoco_vbd_sorting_package
+```
+
+缓存渲染读取物理运行的配置快照及真实粒子、刚体位姿、关节观测和动作；渲染期间保持物理
+暂停，不插值或重新求解轨迹。数据集记录 `observation_generation=rendered_from_recorded_physics`
+及源轨迹 SHA256，验收仍以原始物理结果为准。
+
+LeRobot 的状态和动作均为 16 维：左臂七关节、右臂七关节、左右夹爪主轴，全部使用 rad。
+状态读取 MuJoCo 实际求解结果，动作记录同一物理时刻下发的位置目标。四路视频共享 15 fps
+帧号和时间戳；诊断另外保存每个 60 Hz 物理帧的两个网格、完整关节状态及碰撞体位姿。
+独立校验会完整解码各路 H.264，逐帧核对视频/Parquet/物理状态，并生成 `qa/keyframes.jpg`
+、`qa/synchronized_four_view.mp4` 和 `qa/physical_audit.json`。
+
+验收分别检查两次提起、整个转运期的双侧接触及两个网格离台、平台/出带放手、完整包裹支撑
+范围、标签朝上及真实出带位移。物理检查还包括质量、有限状态、三角面塌陷、边长伸长、
+台面/指垫穿透、子步接触容量、袋内包含关系，以及转运期衣物形状 RMS 和袋衣间隙。
+标签方向使用原 FrontPhotograph 中标签 UV 区域的真实网格法线。
+失败轨迹保留为 `diagnostic`，只有所有检查通过才标记为 `demonstration`；
+验收脚本遇到物理失败返回非零退出码。当前尚未产出通过全部验收的完整双臂示范，
+现有回放均为诊断数据，不继承旧抓放数据或源 V7 的成功标记。平指垫对照仍发生过
+滑脱、局部拉伸或袋衣间隙越限；平台释放、右臂交接及出带不能据此声明已经验证。
+[反馈诊断配置](configs/PhysicSolver_mujoco_vbd_sorting_package_diagnostic.toml)
+使用原生 30 mm 指垫、100 g 衣物和局部细分，继承主配置且保持原形状与接触验收门限。
+它是待验证的轻载实验入口；历史加宽指垫数据不符合当前机器人结构要求，不能作为合格示范。
+诊断时可设 `planner.early_stop_on_shape_failure=false`，继续观察形状或袋衣间隙失败后的
+交接与出带过程。该选项只关闭这两项的提前终止；原始测量、最终验收和数据标签保持不变，
+穿透、过度拉伸、丢抓及不安全落点仍提前停止。`result.json` 的 `failed_checks` 列出未通过项。
+
+MuJoCo → VBD 沿用参考案例的单向刚体驱动柔体耦合，包裹反力不回馈机器人关节。
+这能验证所声明模型下的抓持、变形和释放，不能据此验证真实夹爪额定负载。
+几何检查只覆盖保存的物理帧，不构成连续时间无穿透的证明。
 
 ## 统一仿真世界（Isaac Sim 6.2）
 

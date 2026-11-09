@@ -1,0 +1,860 @@
+"""Pro-M6 task routing, arbitrary robot coordinate export and independent shape checks."""
+
+import json
+import shutil
+import subprocess
+
+import numpy as np
+import pyarrow.parquet as pq
+import pytest
+from PIL import Image
+
+from real2sim2real.core.config import apply_settings_file, reset_settings
+from real2sim2real.job.base import AutoJob
+from real2sim2real.job.job_sorting import SortingJob
+from real2sim2real.utils.lerobot_v3 import LeRobotV3Recorder
+from real2sim2real.utils.sorting_quality import aligned_shape_rms, audit_held_shape
+
+
+@pytest.mark.parametrize("target", [None, 0.0, 2.0])
+def test_pair_friction_changes_only_native_fingers_and_preserves_supports(target):
+    from types import SimpleNamespace
+
+    from real2sim2real.planner.planner_sorting import SortingPlannerConfig
+    from real2sim2real.planner.sorting_runtime import SortingRuntime
+
+    class Array:
+        def __init__(self, values):
+            self.values = np.array(values)
+
+        def numpy(self):
+            return self.values.copy()
+
+        def assign(self, values):
+            self.values = values.copy()
+
+    runtime = object.__new__(SortingRuntime)
+    runtime.config = SortingPlannerConfig(gripper_package_friction=target)
+    runtime.contact_body_ids = dict(left_0=1, left_1=2, right_0=3, right_1=4)
+    runtime.belt_body, runtime.belt_shape = 5, 6
+    original = np.array([0.5, 1.4, 1.4, 1.4, 1.4, 1.4, 0.5, 1.4])
+    runtime.model = SimpleNamespace(
+        shape_body=Array([-1, 0, 1, 2, 3, 4, 5, 6]),
+        shape_material_mu=Array(original),
+        soft_contact_mu=1.4,
+    )
+    runtime._configure_contact_friction()
+    actual = runtime.model.shape_material_mu.numpy()
+    np.testing.assert_array_equal(actual[[0, 1, 6, 7]], original[[0, 1, 6, 7]])
+    expected = 1.4 if target is None else target
+    np.testing.assert_allclose(np.sqrt(1.4 * actual[2:6]), expected)
+    assert runtime.model.soft_contact_mu == 1.4
+    np.testing.assert_allclose(runtime.contact_friction["effective_gripper_package_mu"], [expected])
+    np.testing.assert_allclose(
+        runtime.contact_friction["effective_support_package_mu"], [np.sqrt(0.7)]
+    )
+    with pytest.raises(ValueError):
+        SortingPlannerConfig(gripper_package_friction=2, cloth_friction=0)
+    for invalid in (-1, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            SortingPlannerConfig(gripper_package_friction=invalid)
+
+
+def test_strain_grip_opens_with_bounded_relief_and_recovers_slowly():
+    from real2sim2real.planner.planner_sorting import StrainGripController
+
+    controller = StrainGripController(target=1.18, maximum_relief_rad=0.01, rate_rad_s=0.05)
+    other_arm = StrainGripController(target=1.18, maximum_relief_rad=0.01, rate_rad_s=0.05)
+    assert controller.command(0.66, 1.1, 0.02) == 0.66
+    commands = [controller.command(0.66, 1.25, 0.02) for _ in range(15)]
+    assert np.all(np.diff(commands) <= 0)
+    assert commands[-1] == pytest.approx(0.65)
+    assert controller.peak_relief_rad == pytest.approx(0.01)
+    assert controller.command(0.66, 1.17, 0.02) == pytest.approx(0.65)
+    for _ in range(10):
+        recovered = controller.command(0.66, 1.1, 0.02)
+    assert recovered == pytest.approx(0.651)
+    assert other_arm.relief_rad == 0
+    for _ in range(200):
+        recovered = controller.command(0.66, 1.1, 0.02)
+    assert recovered == 0.66
+    restorative = StrainGripController(1.24, 0.01, 0.05, 0.025, 0.01)
+    assert restorative.command(0.66, 1.28, 0.2) == pytest.approx(0.65)
+    assert restorative.command(0.66, 1.235, 0.2) == pytest.approx(0.65)
+    assert restorative.command(0.66, 1.21, 0.2) == pytest.approx(0.655)
+    assert restorative.command(0.66, 1.28, 0.1) == pytest.approx(0.65)
+
+
+def test_sorting_mass_override_preserves_bag_geometry_and_original_asset(monkeypatch):
+    from types import SimpleNamespace
+
+    from real2sim2real.scene.scene_package import PackageScene
+    from real2sim2real.scene.scene_sorting import SortingScene, SortingSceneConfig
+
+    garment = np.array([0.02, 0.06, 0.12])
+    bag = np.array([0.004, 0.006, 0.010542])
+    published = []
+    attribute = SimpleNamespace(Set=lambda value: published.extend(value))
+    mesh = SimpleNamespace(GetPrim=lambda: SimpleNamespace(GetAttribute=lambda name: attribute))
+    parts = [dict(name="Garment", masses=garment, mesh=mesh), dict(name="Bag", masses=bag)]
+    geometry = np.arange(18).reshape(6, 3).copy()
+    scene = object.__new__(SortingScene)
+    scene.config = SortingSceneConfig(garment_mass_kg=0.1)
+    scene.package_parts, scene.cloth_vertices = parts, geometry.copy()
+    monkeypatch.setattr(PackageScene, "_arrange_cloth", lambda self: None)
+    scene._arrange_cloth()
+    np.testing.assert_allclose(parts[0]["masses"], garment * 0.5)
+    assert parts[0]["masses"].sum() == pytest.approx(0.1)
+    assert np.all(parts[0]["masses"] > 0)
+    np.testing.assert_array_equal(parts[1]["masses"], bag)
+    np.testing.assert_array_equal(scene.cloth_vertices, geometry)
+    np.testing.assert_array_equal(garment, [0.02, 0.06, 0.12])
+    np.testing.assert_allclose(published, parts[0]["masses"])
+    assert scene.authored_garment_mass_kg == pytest.approx(0.2)
+    assert scene.garment_mass_scale == pytest.approx(0.5)
+    assert SortingSceneConfig().garment_mass_kg == 0.2
+    for invalid in (0, -0.1, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            SortingSceneConfig(garment_mass_kg=invalid)
+
+
+@pytest.mark.skipif(
+    not __import__("pathlib")
+    .Path("assets/PhysicSolver/Package/v7_sorting/parcel_two_mesh.usd")
+    .is_file(),
+    reason="Local V7 source asset required",
+)
+def test_real_usd_mass_override_is_local_and_replayable():
+    import os
+    import sys
+    from pathlib import Path
+
+    usd = next(Path("app/extscache").glob("omni.usd.libs-*/pxr/Gf")).parent.parent.resolve()
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(usd) + os.pathsep + environment.get("PYTHONPATH", "")
+    environment["LD_LIBRARY_PATH"] = (
+        str(usd / "bin") + os.pathsep + environment.get("LD_LIBRARY_PATH", "")
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import runpy,pytest; "
+            "runpy.run_path('tests/test_sorting_package.py')"
+            "['_check_real_usd_mass'](pytest.MonkeyPatch())",
+        ],
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _check_real_usd_mass(monkeypatch):
+    import hashlib
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from pxr import Usd
+
+    from real2sim2real.scene.scene_sorting import SortingScene, SortingSceneConfig
+
+    path = Path("assets/PhysicSolver/Package/v7_sorting/parcel_two_mesh.usd")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    scenes = []
+    for target in (0.2, 0.1):
+        scene = SortingScene(SortingSceneConfig(garment_mass_kg=target))
+        scene.sim_world = SimpleNamespace(stage=Usd.Stage.CreateInMemory())
+        scene.table_top_z = 1.78
+        monkeypatch.setattr(scene, "refresh_poses", lambda: None)
+        scene._arrange_cloth()
+        scenes.append(scene)
+    original, lighter = scenes
+    np.testing.assert_array_equal(original.cloth_vertices, lighter.cloth_vertices)
+    np.testing.assert_array_equal(original.triangle_indices, lighter.triangle_indices)
+    np.testing.assert_array_equal(original.loft_springs, lighter.loft_springs)
+    for before, after in zip(original.package_parts, lighter.package_parts, strict=True):
+        scale = 0.5 if after["name"] == "Garment" else 1
+        np.testing.assert_allclose(after["masses"], before["masses"] * scale)
+        np.testing.assert_allclose(
+            after["mesh"].GetPrim().GetAttribute("physics:masses").Get(), after["masses"], rtol=1e-6
+        )
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+
+
+def test_quintic_transfer_has_bounded_motion_and_zero_endpoint_acceleration():
+    from real2sim2real.planner.planner_sorting import _motion_blend
+
+    values = np.array([_motion_blend(t, "quintic") for t in np.linspace(-0.1, 1.1, 121)])
+    assert values[0] == 0 and values[-1] == 1
+    assert np.all(np.diff(values) >= -1e-12)
+    step = 1e-5
+    for endpoint, direction in ((0, 1), (1, -1)):
+        f0, f1, f2 = [_motion_blend(endpoint + direction * i * step, "quintic") for i in range(3)]
+        assert abs((f1 - f0) / step) < 1e-5
+        assert abs((f2 - 2 * f1 + f0) / step**2) < 0.002
+    cubic_acceleration = (
+        _motion_blend(2 * step, "cubic") - 2 * _motion_blend(step, "cubic")
+    ) / step**2
+    assert cubic_acceleration > 5.9
+
+
+@pytest.mark.parametrize(
+    "success,require_success,expected", [(True, True, 0), (False, True, 1), (False, False, 0)]
+)
+def test_kit_worker_checks_fresh_results_after_fast_exit(
+    tmp_path, success, require_success, expected
+):
+    from real2sim2real.utils.kit_process import run_kit_worker
+
+    worker = tmp_path / "worker.py"
+    output = tmp_path / "result.json"
+    worker.write_text(
+        "import argparse,json,os\n"
+        "p=argparse.ArgumentParser();p.add_argument('--worker-id');a=p.parse_args()\n"
+        f"with open({str(output)!r},'w') as f: "
+        f"json.dump(dict(run_id=a.worker_id,success={success!r}),f)\n"
+        "os._exit(0)\n"
+    )
+    assert (
+        run_kit_worker(
+            str(worker), [], output, marker_field="run_id", require_success=require_success
+        )
+        == expected
+    )
+    worker.write_text("import os;os._exit(0)\n")
+    with pytest.raises(RuntimeError, match="old result"):
+        run_kit_worker(str(worker), [], output, marker_field="run_id")
+
+
+def test_sorting_is_lazy_and_routes_native_components(monkeypatch, tmp_path):
+    monkeypatch.setenv("RSR_JOB__OUTPUT_DIR", str(tmp_path))
+    apply_settings_file("configs/PhysicSolver_mujoco_vbd_sorting_package.toml")
+    try:
+        job = AutoJob.from_config()
+        assert isinstance(job, SortingJob)
+        assert job.sim_world.app is None
+        assert job.sim_world.config.newton_solver == "mujoco"
+        assert job.planner.config.cloth_solver == "vbd"
+        assert job.robot.config.backend == "pro_m6_newton"
+        assert [camera.name for camera in job.recording_cameras] == [
+            "overview",
+            "head",
+            "left_wrist",
+            "right_wrist",
+        ]
+        assert job.record_stride == 4
+        assert job.planner.config.maximum_edge_stretch == 1.3
+        assert job.planner.config.grasp_height_m == pytest.approx(0.048)
+    finally:
+        monkeypatch.delenv("RSR_SETTINGS_FILE")
+        reset_settings()
+
+
+def test_cartesian_phases_preserve_commanded_pose_instead_of_accumulating_tracking_error():
+    from types import SimpleNamespace
+
+    from real2sim2real.planner.planner_sorting import SortingPlanner, SortingPlannerConfig
+
+    planner = object.__new__(SortingPlanner)
+    planner.config = SortingPlannerConfig()
+    commanded = np.array([0.2, -0.9, 1.05])
+    measured = commanded + [0.001, 0.003, -0.002]
+    planner.runtime = SimpleNamespace(tcp_position=lambda side: measured.copy())
+    planner.schedule = [("left", "lift", 3), ("right", "lift", 3)]
+    planner.command_tcp, planner.command_side = commanded.copy(), "left"
+    planner.checkpoint_times, planner.elapsed, planner.support_z = [], 0, 1.0
+    coms = np.array([[0.2, -0.9, 1.02], [0.2, -0.9, 1.02]])
+    planner._enter(0, coms)
+    np.testing.assert_array_equal(planner.start_tcp, commanded)
+    np.testing.assert_array_equal(planner.target[:2], commanded[:2])
+    planner._enter(1, coms)
+    np.testing.assert_array_equal(planner.start_tcp, measured)
+
+
+def test_grasp_offset_moves_the_pick_and_screened_tcp_path_but_keeps_the_com_destination():
+    from types import SimpleNamespace
+
+    from real2sim2real.planner.planner_sorting import SortingPlanner, SortingPlannerConfig
+
+    planner = object.__new__(SortingPlanner)
+    planner.config = SortingPlannerConfig(grasp_offset_xy_m=(0, 0.06))
+    recorded = {}
+
+    def prepare(side, target, waypoints):
+        recorded.update(side=side, target=target.copy(), waypoints=waypoints)
+        return 0.0
+
+    planner.runtime = SimpleNamespace(
+        tcp_position=lambda side: np.array([0.55, -0.9, 2.0]),
+        prepare_approach=prepare,
+        parking_positions={"left": np.array([0.55, -0.9, 2.0])},
+    )
+    planner.scene = SimpleNamespace(
+        supports={
+            "infeed": (np.array([0.3, -2.0, 1.74]), np.array([1.2, 0, 1.78])),
+            "platform": (np.array([-0.35, -1.176, 1.76]), np.array([0.35, -0.576, 1.80])),
+        }
+    )
+    planner.schedule = [("left", "approach", 3), ("left", "transfer", 6)]
+    planner.command_tcp, planner.command_side = None, None
+    planner.checkpoint_times, planner.elapsed, planner.max_tcp_error = [], 0.0, 0.0
+    planner.legs = {"left": {}}
+    coms = np.array([[0.55, -0.9, 1.81], [0.55, -0.9, 1.81]])
+    planner._enter(0, coms)
+    np.testing.assert_allclose(planner.pick[:2], [0.55, -0.84])
+    np.testing.assert_allclose(planner.goal[:2], [0.0, -0.876])
+    np.testing.assert_allclose(recorded["waypoints"][4][:2], [0.0, -0.816])
+    planner.command_tcp = np.array([0.55, -0.84, 2.11])
+    planner._enter(1, coms)
+    np.testing.assert_allclose(planner.target[:2], [0.0, -0.816])
+    np.testing.assert_array_equal(coms[:, :2], [[0.55, -0.9], [0.55, -0.9]])
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required for video export")
+def test_sixteen_joint_export_keeps_named_coordinates_and_video_alignment(tmp_path):
+    names = [f"joint_{i}_rad" for i in range(16)]
+    recorder = LeRobotV3Recorder(
+        tmp_path / "dataset",
+        fps=15,
+        width=64,
+        height=48,
+        task="relay",
+        joint_names=names,
+        action_names=[f"target_{name}" for name in names],
+        robot_type="pro_m6_696_newton",
+    )
+    with pytest.raises(ValueError, match="named finite"):
+        recorder.add_frame(np.zeros(9), np.zeros(9))
+    for index in range(3):
+        Image.new("RGB", (64, 48), (index * 80, 0, 0)).save(recorder.frame_path())
+        recorder.add_frame(np.arange(16) + index, np.arange(16) + index + 0.1)
+    root = recorder.finalize(episode_success=False)
+    info = json.loads((root / "meta/info.json").read_text())
+    assert info["features"]["observation.state"]["shape"] == [16]
+    assert info["features"]["action"]["names"] == [f"target_{name}" for name in names]
+    table = pq.read_table(root / "data/chunk-000/file-000.parquet")
+    np.testing.assert_allclose(
+        table["action"].to_pylist(), [np.arange(16) + i + 0.1 for i in range(3)], atol=1e-6
+    )
+    episode = pq.read_table(root / "meta/episodes/chunk-000/file-000.parquet").to_pylist()[0]
+    assert episode["dataset_use"] == "diagnostic" and not episode["success"]
+    video = root / "videos/observation.images.overview/chunk-000/file-000.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-xerror", "-i", str(video), "-f", "null", "-"],
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_shape_metric_removes_rigid_motion_but_detects_deformation():
+    rest = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], float)
+    weights = np.array([1, 2, 3, 4], float)
+    rotation = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], float)
+    moved = rest @ rotation + np.array([4, 5, 6])
+    assert aligned_shape_rms(rest, moved, weights) < 1e-12
+    moved[3] += np.array([0, 0, 0.5])
+    assert aligned_shape_rms(rest, moved, weights) > 0.1
+
+
+def test_absent_transfer_cannot_pass_shape_acceptance():
+    report = audit_held_shape(
+        np.empty((0, 0, 3)),
+        np.empty((0, 3)),
+        np.empty((0, 3), int),
+        np.empty(0),
+        0,
+        {"left": [], "right": []},
+    )
+    assert not any(report["checks"].values())
+
+
+@pytest.mark.parametrize("early_stop", [True, False])
+def test_diagnostic_continuation_keeps_the_failed_shape_measurement(early_stop):
+    from types import SimpleNamespace
+
+    from real2sim2real.planner.planner_sorting import SortingPlanner, SortingPlannerConfig
+
+    vertices = np.array(
+        [[0, 0, 0], [0.1, 0, 0], [0, 0.1, 0], [0, 0, 0.02], [0.1, 0, 0.02], [0, 0.1, 0.02]]
+    )
+    planner = object.__new__(SortingPlanner)
+    planner.config = SortingPlannerConfig(early_stop_on_shape_failure=early_stop)
+    planner.rest = vertices.copy()
+    planner.scene = SimpleNamespace(
+        garment_count=3, triangle_indices=np.array([[0, 1, 2], [3, 4, 5]])
+    )
+    planner.runtime = SimpleNamespace(_masses=np.ones(6))
+    planner.samples, planner.elapsed = [vertices], 1.0
+    planner.online_held_shape_samples, planner.failure_reason = [], None
+    planner._measure_held_shape(vertices, "left")
+    assert bool(planner.failure_reason) == early_stop
+    measured = planner.online_held_shape_samples[0]
+    assert measured["aligned_garment_shape_rms_m"] < 1e-10
+    assert measured["bag_gap_q95_m"] == pytest.approx(0.02)
+    assert measured["bag_gap_q95_m"] > planner.config.maximum_bag_gap_m
+
+
+def test_final_shape_sampling_cannot_omit_a_recorded_failed_checkpoint():
+    rest = np.array(
+        [[0, 0, 0], [0.1, 0, 0], [0, 0.1, 0], [0, 0, 0.005], [0.1, 0, 0.005], [0, 0.1, 0.005]]
+    )
+    positions = np.repeat(rest[None], 5, axis=0)
+    positions[1, 3:, 2] = 0.02
+    args = (positions, rest, np.array([[0, 1, 2], [3, 4, 5]]), np.ones(6), 3, {"left": range(5)})
+    assert all(audit_held_shape(*args)["checks"].values())
+    report = audit_held_shape(*args, extra_samples={"left": [1]})
+    assert not report["checks"]["held_bag_gap_bounded"]
+    assert {row["sample_index"] for row in report["samples"]} == {0, 1, 2, 4}
+
+
+@pytest.mark.parametrize("half_size", [(2.0, 2.0), (0.2, 0.2)])
+def test_contact_refinement_preserves_surface_mass_uv_provenance_and_closed_edges(half_size):
+    from real2sim2real.utils.package_refinement import lumped_areas, refine_surface
+    from real2sim2real.utils.sorting_quality import unit_box_mesh
+
+    vertices, triangles = unit_box_mesh()
+    areas = lumped_areas(vertices, triangles)
+    masses = 0.2 * areas / areas.sum()
+    refined = refine_surface(vertices, triangles, masses, half_size_xy=half_size)
+    np.testing.assert_array_equal(refined.vertices[: len(vertices)], vertices)
+    assert len(refined.vertices) > len(vertices)
+    assert np.all(refined.masses > 0)
+    assert refined.masses.sum() == pytest.approx(0.2)
+    np.testing.assert_allclose(
+        np.average(refined.vertices, axis=0, weights=refined.masses),
+        np.average(vertices, axis=0, weights=masses),
+        atol=1e-14,
+    )
+    np.testing.assert_allclose(lumped_areas(refined.vertices, refined.triangles).sum(), areas.sum())
+    expected = np.einsum("fci,fij->fcj", refined.barycentric, vertices[triangles[refined.parents]])
+    np.testing.assert_allclose(refined.vertices[refined.triangles], expected, atol=1e-14)
+    old_face = vertices[triangles[refined.parents]]
+    new_face = refined.vertices[refined.triangles]
+    old_normal = np.cross(old_face[:, 1] - old_face[:, 0], old_face[:, 2] - old_face[:, 0])
+    new_normal = np.cross(new_face[:, 1] - new_face[:, 0], new_face[:, 2] - new_face[:, 0])
+    assert np.all(np.sum(old_normal * new_normal, axis=1) > 0)
+    edges = np.sort(
+        np.concatenate(
+            [refined.triangles[:, :2], refined.triangles[:, 1:], refined.triangles[:, [2, 0]]]
+        ),
+        axis=1,
+    )
+    assert np.all(np.unique(edges, axis=0, return_counts=True)[1] == 2)
+    uv = np.tile(np.array([[0, 0], [1, 0], [0, 1]], float), (len(triangles), 1, 1))
+    uv += np.arange(len(triangles))[:, None, None] * 2
+    mapped = np.einsum("fci,fij->fcj", refined.barycentric, uv[refined.parents])
+    assert np.all(refined.barycentric >= 0)
+    np.testing.assert_allclose(refined.barycentric.sum(2), 1)
+    seam = {}
+    for index, value in zip(refined.triangles.ravel(), mapped.reshape(-1, 2), strict=True):
+        if index >= len(vertices):
+            seam.setdefault(index, []).append(value)
+    assert any(np.ptp(values, axis=0).max() > 1 for values in seam.values())
+    with pytest.raises(ValueError, match="uniform areal density"):
+        changed = masses.copy()
+        changed[0] *= 2
+        refine_surface(vertices, triangles, changed)
+
+
+def test_refined_sampling_also_checks_the_original_probe_population():
+    garment = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], float)
+    original_bag = np.array([[0.1, 0.1, 0.02], [0.2, 0.1, 0.005], [0.1, 0.2, 0.005]])
+    grid = np.array(
+        [[x, y, 0.005] for x in np.linspace(0.2, 0.4, 10) for y in np.linspace(0.2, 0.4, 10)]
+    )
+    bag_tri = [[0, 1, 2]]
+    for row in range(9):
+        for col in range(9):
+            a = 3 + row * 10 + col
+            bag_tri.extend([[a, a + 1, a + 10], [a + 1, a + 11, a + 10]])
+    vertices = np.concatenate([garment, original_bag, grid])
+    triangles = np.concatenate([[[0, 1, 2]], np.array(bag_tri) + 3])
+    args = (vertices[None], vertices, triangles, np.ones(len(vertices)), 3, {"left": [0]})
+    assert all(audit_held_shape(*args)["checks"].values())
+    reference = dict(garment_masses=[1, 1, 1], bag_vertex_count=3, bag_triangles=[[0, 1, 2]])
+    report = audit_held_shape(*args, quality_reference=reference)
+    assert report["checks"]["held_bag_gap_bounded"]
+    assert not report["checks"]["held_original_sampling_bounded"]
+    assert report["samples"][0]["reference_bag_gap_q95_m"] > 0.01
+
+
+def test_original_face_probe_follows_the_refined_material_not_a_coarse_chord():
+    from real2sim2real.utils.package_refinement import map_material_probes, refine_surface
+
+    vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], float)
+    triangles = np.array([[0, 1, 2]])
+    refined = refine_surface(vertices, triangles, np.ones(3), half_size_xy=(2, 2))
+    indices, weights = map_material_probes(refined, triangles, triangles, np.full((1, 3), 1 / 3))
+    np.testing.assert_allclose(
+        (refined.vertices[indices] * weights[:, :, None]).sum(1), [[1 / 3, 1 / 3, 0]]
+    )
+    deformed = refined.vertices.copy()
+    deformed[3:, 2] = 1
+    point = (deformed[indices] * weights[:, :, None]).sum(1)[0]
+    assert point[2] == pytest.approx(1)
+    assert deformed[triangles].mean(1)[0, 2] == 0
+
+
+@pytest.mark.skipif(
+    not __import__("pathlib")
+    .Path("assets/PhysicSolver/Package/v7_sorting/parcel_two_mesh.usd")
+    .is_file(),
+    reason="Local V7 source asset required",
+)
+def test_refined_usd_keeps_source_unchanged_and_carries_original_quality_reference(tmp_path):
+    import hashlib
+    import sys
+    from pathlib import Path
+
+    source = Path("assets/PhysicSolver/Package/v7_sorting")
+    digest = hashlib.sha256((source / "parcel_two_mesh.usd").read_bytes()).hexdigest()
+    target = tmp_path / "refined"
+    subprocess.run(
+        [
+            sys.executable,
+            "scripts/refine_package_assets.py",
+            "--source",
+            str(source),
+            "--target",
+            str(target),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    manifest = json.loads((target / "provenance.json").read_text())
+    assert hashlib.sha256((source / "parcel_two_mesh.usd").read_bytes()).hexdigest() == digest
+    assert manifest["source_asset_sha256"] == digest
+    assert manifest["original_sampling_retained"] and not manifest["materials_modified"]
+    assert manifest["usd_roundtrip_verified"]
+    assert manifest["reference_probe_counts"]["garment_vertices"] == 3300
+    assert manifest["reference_probe_counts"]["bag_vertices"] == 1650
+    assert not manifest["loft_spring_anchors_modified"]
+    assert manifest["refinement"]["Garment"]["mass_kg"] == pytest.approx(0.2, abs=1e-7)
+    assert manifest["refinement"]["Garment"]["refined_vertices"] > 3300
+    assert manifest["refinement"]["Bag"]["bag_closed"]
+
+
+def test_replay_uses_exact_physics_times_and_excludes_the_terminal_sample():
+    from scripts.render_sorting_package import replay_indices
+
+    np.testing.assert_array_equal(replay_indices(np.arange(61) / 60, 15), np.arange(0, 60, 4))
+    np.testing.assert_array_equal(replay_indices(np.array([0.0]), 15), [0])
+    with pytest.raises(ValueError, match="coincide"):
+        replay_indices(np.arange(61) / 60, 17)
+    with pytest.raises(ValueError, match="strictly"):
+        replay_indices(np.array([0.0, 0.2, 0.1]), 15)
+
+
+def test_sorting_ik_honors_the_configured_closing_direction():
+    from real2sim2real.planner.planner_sorting import SortingPlannerConfig
+    from real2sim2real.planner.sorting_runtime import SortingRuntime
+
+    runtime = object.__new__(SortingRuntime)
+    runtime.config = SortingPlannerConfig(tcp_orientation_wxyz=(0, 1, 0, 0))
+    np.testing.assert_allclose(runtime.grasp_rotation[:, 1], [0, -1, 0], atol=1e-12)
+    runtime.config.tcp_orientation_wxyz = (0, 2**-0.5, 2**-0.5, 0)
+    np.testing.assert_allclose(runtime.grasp_rotation[:, 1], [1, 0, 0], atol=1e-12)
+
+
+def test_right_approach_switches_the_measured_tcp_and_contact_aliases():
+    from types import SimpleNamespace
+
+    from real2sim2real.planner.sorting_runtime import SortingRuntime
+
+    runtime = object.__new__(SortingRuntime)
+    runtime.active_side = "left"
+    runtime.hand_bodies = dict(left=10, right=20)
+    runtime.contact_body_ids = dict(left_0=11, left_1=12, right_0=21, right_1=22, palm=10)
+    runtime.target_q = np.zeros(14)
+    runtime.robot = SimpleNamespace(arm_indices=dict(right=list(range(7, 14))))
+    runtime.approach_start, runtime.approach_goal = np.zeros(7), np.ones(7)
+    runtime.set_gripper = lambda side, closed: None
+    runtime.command_approach("right", 0.5)
+    assert runtime.active_side == "right"
+    assert runtime.contact_body_ids["palm"] == 20
+    assert (runtime.contact_body_ids["left"], runtime.contact_body_ids["right"]) == (21, 22)
+    np.testing.assert_array_equal(runtime.target_q[:7], 0)
+    np.testing.assert_array_equal(runtime.target_q[7:], 0.5)
+
+
+def test_external_contacts_query_current_rigids_and_previous_particles():
+    from types import SimpleNamespace
+
+    from real2sim2real.planner.sorting_runtime import SortingRuntime
+
+    runtime = object.__new__(SortingRuntime)
+    runtime.state_0 = SimpleNamespace(
+        body_q=object(), body_qd=object(), particle_q=object(), particle_qd=object()
+    )
+    runtime.state_1 = SimpleNamespace(body_q=object(), body_qd=object())
+    runtime._collision_views = {}
+    runtime.newton = SimpleNamespace(State=SimpleNamespace)
+    runtime.model = SimpleNamespace(device="cpu")
+    runtime.wp = SimpleNamespace(launch=lambda *a, **k: None, transform=lambda *a: a)
+    runtime._belt_motion, runtime.belt_body = object(), 0
+    runtime.belt_rest, runtime.belt_speed = np.zeros(7), 0
+    runtime.contacts, runtime.control = object(), object()
+    queries, solves = [], []
+    runtime.pipeline = SimpleNamespace(collide=lambda *args: queries.append(args))
+    runtime.cloth_solver = SimpleNamespace(step=lambda *args: solves.append(args))
+    runtime._advance_soft(1 / 1920)
+    view = queries[0][0]
+    assert view.particle_q is runtime.state_0.particle_q
+    assert view.body_q is runtime.state_1.body_q
+    assert view.body_q is not runtime.state_0.body_q
+    assert solves[0][:2] == (runtime.state_0, runtime.state_1)
+
+
+def test_jaw_audit_detects_a_face_crossing_even_when_all_vertices_are_outside():
+    from real2sim2real.utils.sorting_quality import audit_jaw_penetration
+
+    cube = np.array(
+        [[x, y, z] for x in (-0.01, 0.01) for y in (-0.01, 0.01) for z in (-0.01, 0.01)]
+    )
+    faces = np.array(
+        [
+            [0, 1, 3],
+            [0, 3, 2],
+            [4, 6, 7],
+            [4, 7, 5],
+            [0, 4, 5],
+            [0, 5, 1],
+            [2, 3, 7],
+            [2, 7, 6],
+            [0, 2, 6],
+            [0, 6, 4],
+            [1, 5, 7],
+            [1, 7, 3],
+        ]
+    )
+    vertices = np.array([[[-0.02, 0, 0], [0.02, -0.02, 0], [0.02, 0.02, 0]]])
+    poses = np.array([[[0, 0, 0, 0, 0, 0, 1]]], float)
+    jaws = [dict(body_id=0, vertices=cube, triangles=faces)]
+    report = audit_jaw_penetration(vertices, np.array([[0, 1, 2]]), poses, jaws)
+    assert not report["passed"]
+    assert report["maximum_penetration_m"] == pytest.approx(0.01 - 0.02 / 3)
+    assert report["worst_penetration"]["probe_kind"] == "face_centre"
+    assert report["worst_penetration"]["probe_index"] == 3
+    assert audit_jaw_penetration(vertices + 0.1, np.array([[0, 1, 2]]), poses, jaws)["passed"]
+
+
+@pytest.mark.skipif(
+    not __import__("pathlib").Path("assets/Robot/pro_m6_696/pro_m6_696.usda").is_file(),
+    reason="Local Pro-M6 USD required for native gripper regression",
+)
+def test_native_mimics_are_not_duplicated_and_closed_fingers_clear_the_support():
+    import os
+    import sys
+    from pathlib import Path
+
+    usd = next(Path("app/extscache").glob("omni.usd.libs-*/pxr/Gf")).parent.parent.resolve()
+    newton = Path("app/exts/isaacsim.pip.newton/pip_prebundle").resolve()
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(newton), str(usd), environment.get("PYTHONPATH", "")]
+    )
+    environment["LD_LIBRARY_PATH"] = (
+        str(usd / "bin") + os.pathsep + environment.get("LD_LIBRARY_PATH", "")
+    )
+    code = """
+import numpy as np
+import newton,warp as wp
+from newton.solvers import SolverMuJoCo
+from real2sim2real.robot.robot_sorting import SortingRobot
+from real2sim2real.planner.sorting_kinematics import SortingArmIK
+from real2sim2real.planner.planner_physic_solver import _rotation_wxyz
+from real2sim2real.utils.sorting_quality import unit_box_mesh
+robot=SortingRobot();robot.source_path='assets/Robot/pro_m6_696/pro_m6_696.usda'
+builder=newton.ModelBuilder();SolverMuJoCo.register_custom_attributes(builder)
+robot.add_newton_robot(builder)
+model=builder.finalize(device='cpu')
+assert model.constraint_mimic_count==10
+pairs=list(zip(model.constraint_mimic_joint0.numpy(),model.constraint_mimic_joint1.numpy()))
+assert len(set(pairs))==10
+initial=model.joint_q.numpy().copy()
+q=initial.copy()
+for side,followers in robot.mimic.items():
+    q[robot.gripper_indices[side]]=0.675
+    for index,ratio in followers:q[index]=ratio*0.675
+state=model.state()
+newton.eval_fk(model,wp.array(q,dtype=float,device='cpu'),model.joint_qd,state)
+ik=SortingArmIK(robot,'left')
+hand=state.body_q.numpy()[model.body_label.index(ik.body_path)]
+transform=np.eye(4);transform[:3,:3]=_rotation_wxyz(hand[[6,3,4,5]]);transform[:3,3]=hand[:3]
+tcp=transform@ik.tip
+bounds=[]
+for shape,body in enumerate(builder.shape_body):
+    if (body<0 or '/robotiq_left/' not in builder.body_label[body]
+        or not builder.body_label[body].endswith('inner_finger')):
+        continue
+    mesh=builder.shape_source[shape]
+    if builder.shape_type[shape]==newton.GeoType.BOX:
+        vertices,_=unit_box_mesh()
+    else:
+        assert mesh is not None
+        vertices=mesh.vertices
+    pose=state.body_q.numpy()[body]
+    transform=wp.transform(pose[:3],pose[3:])
+    scale=np.asarray(builder.shape_scale[shape])
+    points=np.array([wp.transform_point(transform,wp.transform_point(
+        builder.shape_transform[shape],wp.vec3(*(v*scale)))) for v in vertices])
+    local=(np.c_[points,np.ones(len(points))]@np.linalg.inv(tcp).T)[:,:3]
+    bounds.append((local.min(0),local.max(0)))
+assert len(bounds)==4  # both native pad boxes and both metal finger meshes
+assert 0.010<0.048-max(high[2] for low,high in bounds)<0.020
+bounds.sort(key=lambda pair:pair[0][1])
+negative=[high[1] for low,high in bounds if high[1]<0]
+positive=[low[1] for low,high in bounds if low[1]>0]
+gap=min(positive)-max(negative)
+assert 0.004<gap<0.006
+np.testing.assert_array_equal(model.joint_q.numpy(),initial)
+
+# Batching only the constant inputs must preserve every solved substep. This
+# compares native integration, mimic equalities and FK, rather than final poses.
+from types import SimpleNamespace
+from real2sim2real.planner.sorting_runtime import SortingRuntime
+from real2sim2real.planner.planner_sorting import SortingPlannerConfig
+runtime=object.__new__(SortingRuntime)
+runtime.model=model;runtime.robot=robot;runtime.wp=wp;runtime.newton=newton
+runtime.state_0=state;runtime.config=SortingPlannerConfig(grasp_pad_bottom_m=.03)
+runtime._create_ik()
+runtime.contact_body_ids=runtime._contact_bodies()
+runtime.pad_colliders=[]
+for shape,body in enumerate(builder.shape_body):
+    if builder.shape_type[shape]!=newton.GeoType.BOX:continue
+    vertices,_=unit_box_mesh()
+    points=np.array([wp.transform_point(builder.shape_transform[shape],
+        wp.vec3(*(v*np.asarray(builder.shape_scale[shape])))) for v in vertices])
+    runtime.pad_colliders.append(dict(body_id=body,vertices=points))
+before=state.body_q.numpy().copy()
+runtime._calibrate_pad_bottom()
+np.testing.assert_array_equal(state.body_q.numpy(),before)
+np.testing.assert_array_equal(model.joint_q.numpy(),initial)
+for angle in [.2825,.6425,.6752]:
+    check_q=initial.copy()
+    for followers in robot.mimic.values():
+        for index,ratio in followers:check_q[index]=ratio*angle
+    scratch=model.state()
+    newton.eval_fk(model,wp.array(check_q,dtype=float,device='cpu'),model.joint_qd,scratch)
+    poses=scratch.body_q.numpy()
+    for side in ('left','right'):
+        pose=poses[runtime.hand_bodies[side]]
+        transform=np.eye(4);transform[:3,:3]=_rotation_wxyz(pose[[6,3,4,5]])
+        transform[:3,3]=pose[:3];tcp=transform@runtime.iks[side].tip
+        height=runtime.pad_bottom_tcp_height(side,angle,.03)
+        bottoms=[]
+        for shape,body in enumerate(builder.shape_body):
+            if (builder.shape_type[shape]!=newton.GeoType.BOX
+                or f'/robotiq_{side}/' not in builder.body_label[body]):continue
+            vertices,_=unit_box_mesh();pose=poses[body]
+            transform=wp.transform(pose[:3],pose[3:])
+            points=np.array([wp.transform_point(transform,wp.transform_point(
+                builder.shape_transform[shape],wp.vec3(*(v*np.asarray(builder.shape_scale[shape])))))
+                for v in vertices])
+            local=(np.c_[points,np.ones(len(points))]@np.linalg.inv(tcp).T)[:,:3]
+            bottoms.append((local@runtime.grasp_rotation.T)[:,2].min()+height)
+        assert abs(min(bottoms)-.03)<2e-6
+assert runtime.pad_bottom_tcp_height('left',.28,.03)<runtime.pad_bottom_tcp_height('left',.64,.03)
+robot.sim_world=SimpleNamespace(config=SimpleNamespace(physics_dt=1/60))
+histories=[]
+for batched in (False,True):
+    runtime=object.__new__(SortingRuntime)
+    runtime.model=model;runtime.robot=robot;runtime.wp=wp
+    runtime.belt_speed=0.0
+    runtime.config=SimpleNamespace(newton_substeps=32,mujoco_cpu=True,
+        mujoco_control_per_frame=batched,mujoco_iterations=100,
+        mimic_time_constant_s=.0015,mimic_impedance=.999,newton_use_cuda_graph=False)
+    runtime.state_0=model.state();runtime.state_1=model.state()
+    for state in (runtime.state_0,runtime.state_1):
+        newton.eval_fk(model,model.joint_q,model.joint_qd,state)
+    runtime.control=model.control()
+    runtime.rigid_solver=runtime._create_mujoco_solver()
+    runtime.cloth_solver=SimpleNamespace(rebuild_bvh=lambda state:None)
+    history=[]
+    runtime._advance_soft=lambda dt:history.append(runtime.state_1.joint_q.numpy().copy())
+    for frame in range(3):
+        target=initial.copy()
+        target[robot.arm_indices['left']]+=0.01*(frame+1)
+        runtime.control.joint_target_q.assign(target)
+        runtime._advance_direct(1/60)
+    histories.append(history)
+assert len(histories[0])==96
+np.testing.assert_allclose(histories[0],histories[1],atol=1e-9,rtol=0)
+
+# Only the original robot geometry is allowed, including its native pads.
+from real2sim2real.robot.robot_sorting import SortingRobotConfig
+from pydantic import ValidationError
+try:
+    SortingRobotConfig(pad_width_m=.06)
+except ValidationError:
+    pass
+else:
+    raise AssertionError("Widened pads must be rejected")
+other=newton.ModelBuilder();SolverMuJoCo.register_custom_attributes(other)
+robot.add_newton_robot(other)
+native=newton.ModelBuilder();SolverMuJoCo.register_custom_attributes(native)
+native.add_usd(robot.source_stage, floating=False, collapse_fixed_joints=True,
+    enable_self_collisions=False, load_visual_shapes=False)
+for field in ("body_mass", "body_inertia", "body_com", "shape_type", "shape_scale",
+              "shape_body", "shape_transform"):
+    np.testing.assert_array_equal(np.asarray(getattr(other,field)),np.asarray(getattr(native,field)))
+assert other.shape_count==native.shape_count
+
+opened=SortingRobot(SortingRobotConfig(initial_gripper_rad=.28))
+opened.source_path=robot.source_path
+open_builder=newton.ModelBuilder();SolverMuJoCo.register_custom_attributes(open_builder)
+opened.add_newton_robot(open_builder)
+for side,pairs in opened.mimic.items():
+    assert open_builder.joint_q[opened.gripper_indices[side]]==.28
+    for index,ratio in pairs:assert open_builder.joint_q[index]==ratio*.28
+np.testing.assert_array_equal(open_builder.body_mass,native.body_mass)
+np.testing.assert_array_equal(open_builder.body_inertia,native.body_inertia)
+assert open_builder.shape_count==native.shape_count
+
+# Translating the entire solver frame must preserve articulated FK, free-body
+# poses, world-static geometry, masses and the native MuJoCo dynamics.
+origin=np.array([.55,-.9,1.78])
+floor=other.add_shape_box(-1,xform=wp.transform((-3,-.8,1.78),wp.quat_identity()),
+    hx=.3,hy=.3,hz=.02)
+belt=other.add_body(xform=wp.transform((-1,-.8,1.78),wp.quat_identity()),is_kinematic=True)
+other.add_shape_box(belt,hx=.3,hy=.3,hz=.02)
+other.add_particle(pos=wp.vec3(.55,-.9,1.8),vel=wp.vec3(0),mass=.1)
+other.color(include_bending=True)
+reference=other.finalize(device='cpu')
+runtime=object.__new__(SortingRuntime)
+runtime.newton=newton;runtime.wp=wp;runtime.physics_origin=origin
+runtime.robot=SimpleNamespace(sim_world=SimpleNamespace(config=SimpleNamespace(device='cpu')))
+local=runtime._finalize_model(other)
+np.testing.assert_array_equal(local.body_mass.numpy(),reference.body_mass.numpy())
+np.testing.assert_array_equal(local.body_label,reference.body_label)
+assert local.constraint_mimic_count==reference.constraint_mimic_count==10
+np.testing.assert_allclose(local.shape_transform.numpy()[floor,:3]+origin,
+    reference.shape_transform.numpy()[floor,:3],atol=3e-7)
+world_states=[]
+for model,offset in [(reference,np.zeros(3)),(local,origin)]:
+    a,z=model.state(),model.state()
+    for state in (a,z):newton.eval_fk(model,model.joint_q,model.joint_qd,state)
+    runtime.state_0=a;runtime.physics_origin=offset
+    initial_poses=runtime.body_poses()
+    initial_particles=runtime.vertices()
+    solver=SolverMuJoCo(model,use_mujoco_cpu=True,update_data_interval=0,
+        integrator='implicitfast',iterations=100)
+    solver.reset(a)
+    control=model.control()
+    for _ in range(32):
+        count=model.particle_count;model.particle_count=0
+        try:solver.step(a,z,control,None,1/1920)
+        finally:model.particle_count=count
+        a,z=z,a
+    runtime.state_0=a
+    world_states.append((initial_poses,initial_particles,runtime.body_poses(),a.joint_q.numpy()))
+for i in range(3):
+    np.testing.assert_allclose(world_states[0][i],world_states[1][i],atol=8e-7,rtol=0)
+np.testing.assert_allclose(world_states[0][3][:26],world_states[1][3][:26],atol=2e-7,rtol=0)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code], env=environment, capture_output=True, text=True, check=False
+    )
+    assert completed.returncode == 0, completed.stderr

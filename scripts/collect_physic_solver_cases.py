@@ -65,7 +65,13 @@ def validate_dataset(
     )
     for feature in ("observation.state", "action"):
         values = np.array(data[feature].to_pylist())
-        if values.shape != (frames, 9) or not np.isfinite(values).all():
+        metadata = info["features"][feature]
+        size = metadata["shape"][0]
+        if (
+            values.shape != (frames, size)
+            or len(metadata["names"]) != size
+            or not np.isfinite(values).all()
+        ):
             raise ValueError(f"Invalid {feature}")
         if feature == "observation.state":
             arm_range = float(np.ptp(values[:, :7], axis=0).max())
@@ -109,6 +115,13 @@ def validate_dataset(
             raise ValueError("Video/data FPS mismatch")
         if (stream["width"], stream["height"]) != tuple(feature["shape"][1::-1]):
             raise ValueError(f"Video/metadata dimensions mismatch: {video_key}")
+        if stream["codec_name"] != "h264":
+            raise ValueError(f"Expected H.264 video: {video_key}")
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-xerror", "-i", str(video), "-f", "null", "-"],
+            check=True,
+            capture_output=True,
+        )
         if episode[f"videos/{video_key}/from_timestamp"] != 0.0:
             raise ValueError("Video must start at timestamp zero")
         if abs(episode[f"videos/{video_key}/to_timestamp"] - frames / info["fps"]) > 1e-6:
@@ -180,7 +193,11 @@ def main() -> int:
             if kind == "cloth"
             else config["sim_world"]["physx_solver"].lower()
         )
-        row["task"] = f"pickplace_{kind}"
+        row["task"] = (
+            "sorting_package"
+            if config["scene"]["backend"] == "sorting_package"
+            else f"pickplace_{kind}"
+        )
         started = time.monotonic()
         try:
             try:

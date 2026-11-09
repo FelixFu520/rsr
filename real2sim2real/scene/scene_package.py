@@ -32,6 +32,12 @@ class PackageScene(PickPlaceClothScene):
         if UsdGeom.GetStageMetersPerUnit(source) != 1 or UsdGeom.GetStageUpAxis(source) != "Z":
             raise ValueError("Package asset must use metres and Z up")
         root = source.GetPrimAtPath("/World/Parcel")
+        reference = root.GetAttribute("parcel:qualityReference")
+        self.quality_reference = (
+            json.loads(reference.Get())
+            if reference and reference.HasAuthoredValueOpinion()
+            else None
+        )
         self.package_parameters = json.loads(root.GetAttribute("parcel:runtimeParameters").Get())
         self.loft_springs = np.asarray(root.GetAttribute("parcel:loftSpringIndices").Get(), int)
         weights = root.GetAttribute("parcel:loftSpringStiffnessWeights")

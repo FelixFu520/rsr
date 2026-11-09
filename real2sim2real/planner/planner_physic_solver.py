@@ -287,7 +287,7 @@ class NewtonClothRuntime:
             mass_per_vertex = total_mass / builder.particle_count
             builder.particle_mass[:] = [mass_per_vertex] * builder.particle_count
         builder.color(include_bending=self.color_bending)
-        self.model = builder.finalize(device=robot.sim_world.config.device or "cuda:0")
+        self.model = self._finalize_model(builder)
         if xpbd and not config.xpbd_self_contact:
             # This kernel has no cloth-adjacency exclusion. Preserve the
             # particle radii for shape contacts while disabling its all-pairs
@@ -327,9 +327,7 @@ class NewtonClothRuntime:
         else:
             self.cloth_solver = self._create_cloth_solver()
             if self.pure_newton and self.solver_name == "mujoco":
-                self.rigid_solver = SolverMuJoCo(
-                    self.model, solver="newton", integrator="implicitfast", iterations=30
-                )
+                self.rigid_solver = self._create_mujoco_solver()
             elif self.pure_newton and self.solver_name == "xpbd":
                 self.rigid_solver = SolverXPBD(self.model, iterations=config.solver_iterations)
             elif self.pure_newton:
@@ -353,14 +351,7 @@ class NewtonClothRuntime:
         self.last_contacts = 0
         self.last_contact_counts = dict(left=0, right=0, palm=0, table=0)
         if self.pure_newton:
-            labels = self.model.body_label
-            self.contact_body_ids = {
-                "left": next(i for i, name in enumerate(labels) if name.endswith("fr3_leftfinger")),
-                "right": next(
-                    i for i, name in enumerate(labels) if name.endswith("fr3_rightfinger")
-                ),
-                "palm": self.hand_body,
-            }
+            self.contact_body_ids = self._contact_bodies()
         else:
             self.contact_body_ids = dict(
                 zip(("left", "right", "palm"), self.proxy_body_ids, strict=True)
@@ -389,6 +380,21 @@ class NewtonClothRuntime:
                 robot.sim_world.config.physics_dt / config.newton_substeps,
                 use_graph=config.newton_use_cuda_graph,
             )
+
+    def _contact_bodies(self) -> dict[str, int]:
+        """Identify the native Franka fingers; other robot runtimes override this mapping."""
+        labels = self.model.body_label
+        return {
+            "left": next(i for i, name in enumerate(labels) if name.endswith("fr3_leftfinger")),
+            "right": next(i for i, name in enumerate(labels) if name.endswith("fr3_rightfinger")),
+            "palm": self.hand_body,
+        }
+
+    def _create_mujoco_solver(self) -> Any:
+        """Create the standard GPU MuJoCo solver; task runtimes may select native CPU."""
+        from newton.solvers import SolverMuJoCo
+
+        return SolverMuJoCo(self.model, solver="newton", integrator="implicitfast", iterations=30)
 
     def _add_deformables(self, builder: Any, *, xpbd: bool) -> None:
         """Add the physical cloth; specialized assets may contain multiple meshes."""
@@ -452,6 +458,10 @@ class NewtonClothRuntime:
 
     def _configure_builder(self, builder: Any) -> None:
         """Allow specialized contact geometry before importing rigid assets."""
+
+    def _finalize_model(self, builder: Any) -> Any:
+        """Finalize the assembled model without changing the default coordinate frame."""
+        return builder.finalize(device=self.robot.sim_world.config.device or "cuda:0")
 
     def _create_collision_pipeline(self) -> Any:
         return self.newton.CollisionPipeline(

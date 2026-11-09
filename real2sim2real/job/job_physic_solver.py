@@ -136,8 +136,9 @@ class PhysicSolverJob(BaseJob):
             width=settings.width,
             height=settings.height,
             task=settings.task,
-            robot_type="franka_fr3_newton" if self.robot.pure_newton else "franka_panda_physx",
-            joint_names=None
+            robot_type=getattr(self.robot, "recording_robot_type", None)
+            or ("franka_fr3_newton" if self.robot.pure_newton else "franka_panda_physx"),
+            joint_names=getattr(self.robot, "recording_joint_names", None)
             if self.robot.pure_newton
             else ([f"panda_joint{i}" for i in range(1, 8)] + ["left_finger_m", "right_finger_m"]),
             cameras={cam.name: cam.resolution for cam in self.recording_cameras} or None,
