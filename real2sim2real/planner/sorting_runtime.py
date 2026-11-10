@@ -135,6 +135,10 @@ class SortingRuntime(PackageRuntime):
             stiffness = self.model.shape_material_ke.numpy()
             stiffness[self.floor_shape] = self.config.floor_contact_stiffness
             self.model.shape_material_ke.assign(stiffness)
+        if hasattr(self, "floor_shape") and self.config.floor_contact_margin_m is not None:
+            margins = self.model.shape_margin.numpy()
+            margins[self.floor_shape] = self.config.floor_contact_margin_m
+            self.model.shape_margin.assign(margins)
         supports = (bodies < 0) | (bodies == self.belt_body)
         self.contact_friction = dict(
             particle_material_mu=particle_mu,

@@ -270,7 +270,10 @@ def test_right_grasp_offset_preserves_left_pick_and_screens_offset_destination(
 @pytest.mark.parametrize("target", [None, 0.0, 2.0])
 @pytest.mark.parametrize("platform", [None, 0.1])
 @pytest.mark.parametrize("floor_stiffness", [None, 400000.0])
-def test_contact_materials_change_only_declared_roles(target, platform, floor_stiffness):
+@pytest.mark.parametrize("floor_margin", [None, 0.004])
+def test_contact_materials_change_only_declared_roles(
+    target, platform, floor_stiffness, floor_margin
+):
     from types import SimpleNamespace
 
     from real2sim2real.planner.planner_sorting import SortingPlannerConfig
@@ -291,6 +294,7 @@ def test_contact_materials_change_only_declared_roles(target, platform, floor_st
         gripper_package_friction=target,
         platform_friction=platform,
         floor_contact_stiffness=floor_stiffness,
+        floor_contact_margin_m=floor_margin,
     )
     runtime.contact_body_ids = dict(left_0=1, left_1=2, right_0=3, right_1=4)
     runtime.belt_body, runtime.belt_shape = 5, 6
@@ -301,6 +305,7 @@ def test_contact_materials_change_only_declared_roles(target, platform, floor_st
         shape_body=Array([-1, 0, 1, 2, 3, 4, 5, -1]),
         shape_material_mu=Array(original),
         shape_material_ke=Array(np.full(8, 40000.0)),
+        shape_margin=Array(np.full(8, 0.0002)),
         soft_contact_mu=1.4,
         soft_contact_ke=40000.0,
     )
@@ -316,6 +321,10 @@ def test_contact_materials_change_only_declared_roles(target, platform, floor_st
         40000.0 if floor_stiffness is None else floor_stiffness
     )
     assert runtime.model.soft_contact_ke == 40000.0
+    np.testing.assert_array_equal(runtime.model.shape_margin.numpy()[:7], 0.0002)
+    assert runtime.model.shape_margin.numpy()[7] == (
+        0.0002 if floor_margin is None else floor_margin
+    )
     np.testing.assert_allclose(runtime.contact_friction["effective_gripper_package_mu"], [expected])
     np.testing.assert_allclose(
         runtime.contact_friction["effective_support_package_mu"],
@@ -958,7 +967,7 @@ def test_presentation_profile_cannot_modify_physics_or_camera_mounts():
     assert rendered["planner"] == source["planner"]
     for section in ("scene", "robot"):
         camera = rendered[section]["cameras"][0]
-        assert camera["resolution"] == [1920, 1440]
+        assert camera["resolution"] == [1024, 768]
         camera["resolution"] = source[section]["cameras"][0]["resolution"]
         assert rendered[section] == source[section]
     for invalid in (
@@ -1311,6 +1320,9 @@ def test_stream_config_keeps_successful_soft_asset_and_native_head_mount(tmp_pat
         assert "v10_station" in job.scene.config.cloth_usd_path
         assert job.scene.config.clear_legacy_parcels
         assert job.scene.config.infeed_travel_m == 0.75
+        assert job.scene.config.platform_target_xy == (0.0, -0.96)
+        assert job.planner.config.lift_height_m == 0.28
+        assert job.planner.config.floor_contact_margin_m == 0.004
         assert job.planner.config.continuous_outfeed
         head = next(camera for camera in job.robot.config.cameras if camera.name == "head")
         assert head.pose_relative_to.endswith("/tn__Headdepth_Link_oE/Camera_Head")
@@ -1330,7 +1342,7 @@ def test_showcase_config_uses_four_hd_views_without_starting_simulation(tmp_path
         original = SortingJob(config=base_config)
         apply_settings_file("configs/PhysicSolver_mujoco_vbd_sorting_stream_showcase.toml")
         config = SortingJobConfig.from_settings("job")
-        assert config.output_dir == "outputs/sorting_stream_showcase_sync"
+        assert config.output_dir == "outputs/sorting_stream_showcase_1k"
         config.output_dir = str(tmp_path / "showcase")
         showcase = SortingJob(config=config)
         assert showcase.sim_world.app is None
@@ -1351,7 +1363,7 @@ def test_showcase_config_uses_four_hd_views_without_starting_simulation(tmp_path
         for camera, source in zip(
             showcase.recording_cameras, original.recording_cameras, strict=True
         ):
-            assert camera.resolution == (1920, 1440)
+            assert camera.resolution == (1024, 768)
             assert camera.model_dump(exclude={"resolution"}) == source.model_dump(
                 exclude={"resolution"}
             )
@@ -1406,7 +1418,10 @@ def test_all_four_views_share_one_physics_step(monkeypatch, tmp_path, advance_ph
 
 
 @pytest.mark.parametrize("fail_capture", [False, True])
-def test_synchronous_pt_flushes_view_before_locking_history(monkeypatch, tmp_path, fail_capture):
+@pytest.mark.parametrize("camera_sequence", [False, True])
+def test_synchronous_pt_flushes_view_before_locking_history(
+    monkeypatch, tmp_path, fail_capture, camera_sequence
+):
     import asyncio
     import sys
     from pathlib import Path
@@ -1497,46 +1512,51 @@ def test_synchronous_pt_flushes_view_before_locking_history(monkeypatch, tmp_pat
         assert values["/rtx/pathtracing/lightcache/cached/enabled"] is False
         assert values["/rtx/pathtracing/optixDenoiser/temporalMode/enabled"] is False
         renderer.set_capture_sync.assert_called_once_with(True)
+        if camera_sequence:
+            viewport.camera_path, viewport.resolution = "/World/overview", (1024, 768)
+            values[control] = True
         if fail_capture:
             with pytest.raises(RuntimeError, match="capture unavailable"):
                 capture_viewport_frame(
                     world,
                     tmp_path / "failed.png",
-                    width=1920,
-                    height=1440,
+                    width=1024,
+                    height=768,
+                    camera_sequence=camera_sequence,
                 )
         else:
             for name in ("overview", "head", "left_wrist", "right_wrist"):
                 capture_viewport_frame(
                     world,
                     tmp_path / f"{name}.png",
-                    width=1920,
-                    height=1440,
-                    camera_prim=f"/World/{name}",
+                    width=1024,
+                    height=768,
+                    camera_prim="/World/overview" if camera_sequence else f"/World/{name}",
+                    camera_sequence=camera_sequence,
                 )
             assert captured == [1, 2, 3, 4]
-        assert rendered == [(8, False), (3, True)] * len(captured)
-        assert values[control] is False
-        assert reset.call_count == len(captured)
+        assert rendered == ([(3, True)] if camera_sequence else [(8, False), (3, True)]) * len(
+            captured
+        )
+        assert values[control] is camera_sequence
+        assert reset.call_count == (0 if camera_sequence else len(captured))
         assert world.physics_steps == 0
     finally:
         loop.close()
 
 
 @pytest.mark.parametrize("advance_physics", [False, True])
-def test_replay_captures_complete_four_view_groups_before_next_source_sample(
+def test_replay_renders_complete_camera_sequences_with_identical_source_samples(
     monkeypatch, tmp_path, advance_physics
 ):
-    import sys
-    from types import ModuleType, SimpleNamespace
+    from types import SimpleNamespace
     from unittest.mock import Mock
 
-    import real2sim2real.job.job_physic_solver as capture_module
+    import scripts.render_sorting_package as replay_module
     from real2sim2real.utils.cameras import CameraConfig
-    from scripts.render_sorting_package import SortingReplayJob
 
     names = ["overview", "head", "left_wrist", "right_wrist"]
-    job = object.__new__(SortingReplayJob)
+    job = object.__new__(replay_module.SortingReplayJob)
     job.output = tmp_path
     job.indices = np.array([0, 4])
     job.saved = dict(
@@ -1544,18 +1564,23 @@ def test_replay_captures_complete_four_view_groups_before_next_source_sample(
         state=np.arange(10).reshape(5, 2),
         action=np.arange(10, 20).reshape(5, 2),
     )
-    job.sim_world = SimpleNamespace(physics_steps=0)
-    viewport = SimpleNamespace(camera_path="/World/GUI", resolution=(800, 600))
-    utility = ModuleType("omni.kit.viewport.utility")
-    utility.get_active_viewport = lambda: viewport
-    monkeypatch.setitem(sys.modules, utility.__name__, utility)
+    values = {}
+    control = "/rtx-transient/resetPtAccumOnlyWhenExternalFrameCounterChanges"
+    job.sim_world = SimpleNamespace(
+        physics_steps=0,
+        config=SimpleNamespace(synchronous_capture=True, renderer="PathTracing"),
+        _settings=SimpleNamespace(
+            get=values.get, set_bool=lambda key, value: values.__setitem__(key, value)
+        ),
+    )
     job.recording_cameras = [
         CameraConfig(
             name=name, prim_path=f"/World/{name}", pose_relative_to="/World", resolution=(64, 48)
         )
         for name in names
     ]
-    captured, current = [], {}
+    captured, current, warmed = [], {}, []
+    job._prepare_offline_render = lambda index, camera: warmed.append((index, camera.name))
     recorder = LeRobotV3Recorder(
         tmp_path / "lerobot_v3",
         fps=15,
@@ -1567,17 +1592,16 @@ def test_replay_captures_complete_four_view_groups_before_next_source_sample(
     )
 
     def capture(world, path, **kwargs):
+        assert kwargs["camera_sequence"]
         captured.append((path.parent.name, current["index"]))
         Image.new("RGB", (64, 48), (current["index"], 10, 20)).save(path)
         if advance_physics:
             world.physics_steps += 1
 
-    monkeypatch.setattr(capture_module, "capture_viewport_frame", capture)
+    monkeypatch.setattr(replay_module, "capture_viewport_frame", capture)
 
     def publish(index):
-        # A new source pose may only be published after the previous group has
-        # been accepted, with all four matching images and joint coordinates.
-        assert len(captured) == len(recorder.rows) * 4
+        assert not recorder.rows
         current["index"] = index
 
     job._publish_sample = publish
@@ -1590,16 +1614,20 @@ def test_replay_captures_complete_four_view_groups_before_next_source_sample(
         original_add = recorder.add_frame
 
         def add_frame(state, action):
-            assert len(captured) == (len(recorder.rows) + 1) * 4
+            assert len(captured) == 8
             original_add(state, action)
 
         recorder.add_frame = Mock(side_effect=add_frame)
         job._capture_samples(recorder, 0)
-        assert captured == [(name, index) for index in (0, 4) for name in names]
+        assert captured == [(name, index) for name in names for index in (0, 4)]
+        assert warmed == [(0, name) for name in names]
         assert [row["timestamp"] for row in recorder.rows] == [0, 1 / 15]
         assert [row["observation.state"] for row in recorder.rows] == [[0, 1], [8, 9]]
         assert [row["action"] for row in recorder.rows] == [[10, 11], [18, 19]]
-    assert (viewport.camera_path, viewport.resolution) == ("/World/GUI", (800, 600))
+        progress = json.loads((tmp_path / "render_progress.json").read_text())
+        assert progress["camera"] == "right_wrist"
+        assert progress["source_index"] == 4
+    assert values[control] is False
 
 
 @pytest.mark.parametrize("exit_code", [0, 3])
@@ -1640,6 +1668,86 @@ def test_manual_synchronized_render_cli_only_launches_when_invoked(
     assert arguments[2] == str(source)
     assert arguments[-2:] == ["--fps", "15"]
     assert "--capture-order" not in arguments
+
+
+@pytest.mark.parametrize("physics_exit", [0, 3])
+def test_manual_camera_pipeline_solves_once_and_rejects_failed_physics(
+    monkeypatch, tmp_path, physics_exit
+):
+    from pathlib import Path
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from typer.testing import CliRunner
+
+    from real2sim2real.job.cli import app
+
+    config = tmp_path / "physics.toml"
+    config.write_text('[job]\nbackend="sorting_package"\nmax_steps=16000\n')
+    monkeypatch.setenv("RSR_SETTINGS_FILE", str(config))
+    profile = tmp_path / "profile.json"
+    profile.write_text('{"resolution":[1024,768]}')
+    launch = Mock(
+        side_effect=[SimpleNamespace(returncode=physics_exit), SimpleNamespace(returncode=0)]
+    )
+    monkeypatch.setattr(subprocess, "run", launch)
+    try:
+        result = CliRunner().invoke(
+            app,
+            [
+                "render-sorting",
+                "-c",
+                str(config),
+                "--output",
+                str(tmp_path / "render"),
+                "--render-profile",
+                str(profile),
+            ],
+        )
+        assert result.exit_code == physics_exit, result.output
+        assert launch.call_count == (1 if physics_exit else 2)
+        arguments = launch.call_args_list[0].args[0]
+        assert Path(arguments[1]).name == "check_sorting_package.py"
+        assert arguments[-2:] == ["--max-steps", "16000"]
+        if not physics_exit:
+            arguments = launch.call_args_list[1].args[0]
+            assert Path(arguments[1]).name == "render_sorting_package.py"
+            assert arguments[2] == str(tmp_path / "render/physics")
+        assert not (tmp_path / "render").exists()
+    finally:
+        reset_settings()
+
+
+def test_capture_updates_disable_eco_after_stopped_timeline_callbacks():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from real2sim2real.simworld.isaacsim import IsaacsimWorld, IsaacsimWorldConfig
+
+    world = IsaacsimWorld(
+        IsaacsimWorldConfig(
+            physics_engine="newton",
+            newton_execution="direct",
+            synchronous_capture=True,
+        )
+    )
+    values = {"/app/player/playSimulations": True}
+    world._settings = SimpleNamespace(
+        get=values.get,
+        set=lambda key, value: values.__setitem__(key, value),
+        set_bool=lambda key, value: values.__setitem__(key, value),
+    )
+    world._timeline = Mock()
+    world._timeline.stop.side_effect = lambda: values.update({"/rtx/ecoMode/enabled": True})
+
+    def update():
+        assert values["/rtx/ecoMode/enabled"] is False
+        assert values["/app/player/playSimulations"] is False
+
+    world.app = Mock(update=update)
+    world.update()
+    assert world.physics_steps == 0
+    assert values["/app/player/playSimulations"] is True
 
 
 def test_cached_soft_success_cannot_hide_damage_during_the_later_rigid_relay():
@@ -1824,3 +1932,178 @@ def test_fallen_or_edge_overhanging_parcel_is_not_below_an_infinite_support_plan
     assert scene.support_penetration(np.array([[0.5, 0.5, 0.5]])) == 0.0
     assert scene.support_penetration(np.array([[0.9999, 0.5, 0.98]])) == pytest.approx(0.0001)
     assert scene.support_penetration(np.array([[0.5, 0.5, 0.999]])) == pytest.approx(0.001)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_close_relief_reaches_native_command_and_is_preserved_at_lift(enabled):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from real2sim2real.planner.planner_sorting import SortingPlanner, SortingPlannerConfig
+
+    config = SortingPlannerConfig(
+        strain_limited_grip=enabled,
+        open_gripper_rad=0.28,
+        grasp_pad_bottom_m=0.015,
+        grip_strain_target=1.22,
+        grip_relief_rate_rad_s=0.1,
+    )
+    planner = SortingPlanner(config=config)
+    rest = np.array([[0, 0, 1], [1, 0, 1], [0, 1, 1]] * 2, dtype=float)
+    points = rest.copy()
+    target_q = np.array([0.28, 0.64])
+    planner.robot = SimpleNamespace(
+        sim_world=SimpleNamespace(config=SimpleNamespace(physics_dt=1 / 60)),
+        gripper_indices={"left": 0, "right": 1},
+        mimic={"left": [(0, 1)], "right": [(1, 1)]},
+    )
+
+    def command(side, target, angle):
+        target_q[planner.robot.gripper_indices[side]] = angle
+        return 0.0
+
+    planner.runtime = SimpleNamespace(
+        vertices=lambda: points.copy(),
+        _masses=np.ones(6),
+        recording_coordinates=lambda: (target_q.copy(), target_q.copy()),
+        body_poses=lambda: np.array([[0, 0, 0, 0, 0, 0, 1]] * 2),
+        hand_bodies={"left": 0, "right": 1},
+        robot_body_count=2,
+        state_0=SimpleNamespace(joint_q=SimpleNamespace(numpy=lambda: target_q.copy())),
+        target_q=target_q,
+        jaw_colliders=[],
+        last_contact_counts={},
+        tcp_position=lambda side: np.array([0, 0, 1.1]),
+        pad_bottom_tcp_height=lambda side, angle, bottom: angle + bottom,
+        pad_bottom_z=lambda side, poses: 0.1,
+        command_arm=Mock(side_effect=command),
+    )
+    planner.scene = SimpleNamespace(
+        config=SimpleNamespace(infeed_travel_m=0),
+        triangle_indices=np.array([[0, 1, 2], [3, 4, 5]]),
+        garment_count=3,
+        support_penetration=lambda vertices: 0.0,
+    )
+    planner._initialize_tracking()
+    planner._edge_indices = np.array([[0, 1]])
+    planner._edge_lengths = np.array([1.0])
+    points[:, 0] *= 1.25
+    planner.schedule = [("right", "close", 1.0), ("right", "lift", 1.0)]
+    planner.ends = np.array([1.0, 2.0])
+    planner._index, planner._frame, planner.elapsed = 0, 59, 59 / 60
+    planner.start_tcp = planner.target = np.array([0, 0, 1.1])
+    planner.support_z = 0.0
+    planner.legs["right"]["baseline"] = np.ones(2)
+    planner.rows = []
+
+    assert planner.on_physics_step(planner.robot) is False
+    closed = float(target_q[1])
+    expected = config.closed_gripper_rad - (0.1 / 60 if enabled else 0)
+    assert closed == pytest.approx(expected)
+    assert planner.rows[-1]["grip_relief_rad"] == pytest.approx(0.1 / 60 if enabled else 0)
+    # FK compensation must use the relieved angle, so relief cannot also push
+    # the pad bottom into the parcel as the linkage opens.
+    np.testing.assert_allclose(
+        planner.runtime.command_arm.call_args.args[1][2], closed + config.grasp_pad_bottom_m
+    )
+
+    assert planner.on_physics_step(planner.robot) is False
+    if enabled:
+        assert planner.legs["right"]["acquired_gripper_rad"] == pytest.approx(closed)
+    assert target_q[1] == pytest.approx(closed)
+    assert planner.grip_limiters["left"].relief_rad == 0
+
+
+@pytest.mark.parametrize(
+    "saved_result",
+    [
+        None,
+        "invalid JSON",
+        {
+            "success": False,
+            "failure_reason": "Surface stretch exceeded the fixed V7 limit",
+            "failed_checks": ["soft_parcel"],
+            "physics_duration_s": 41.016667,
+            "maximum_edge_stretch": 1.300869,
+        },
+    ],
+)
+def test_render_cli_reports_physics_failure_after_worker_shutdown(
+    monkeypatch, tmp_path, saved_result
+):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from typer.testing import CliRunner
+
+    from real2sim2real.core.config import reset_settings
+    from real2sim2real.job import cli
+
+    config = tmp_path / "physics.toml"
+    config.write_text('[job]\nbackend="sorting_package"\nmax_steps=16000\n')
+    profile = tmp_path / "profile.json"
+    profile.write_text("{}")
+    source = tmp_path / "render/physics"
+
+    def fail_worker(arguments, **kwargs):
+        if saved_result is not None:
+            source.mkdir(parents=True)
+            (source / "result.json").write_text(
+                json.dumps(saved_result) if isinstance(saved_result, dict) else saved_result
+            )
+        return SimpleNamespace(returncode=1)
+
+    launch, log = Mock(side_effect=fail_worker), Mock()
+    monkeypatch.setattr(cli, "log", log)
+    monkeypatch.setattr("subprocess.run", launch)
+    try:
+        result = CliRunner().invoke(
+            cli.app,
+            [
+                "render-sorting",
+                "-c",
+                str(config),
+                "--output",
+                str(tmp_path / "render"),
+                "--render-profile",
+                str(profile),
+            ],
+        )
+        assert result.exit_code == 1, result.output
+        assert launch.call_count == 1
+        log.error.assert_called_once()
+        details = log.error.call_args.kwargs
+        assert details["result"] == str(source / "result.json")
+        assert details["failure_reason"] == (
+            saved_result["failure_reason"] if isinstance(saved_result, dict) else None
+        )
+    finally:
+        reset_settings()
+
+
+@pytest.mark.parametrize("done", [True, False])
+def test_physics_stop_callback_does_not_mark_a_failed_sequence_completed(tmp_path, done):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from scripts.check_sorting_package import SortingPhysicsCheck
+
+    settings = SimpleNamespace(model_dump=lambda **kwargs: {})
+    job = SimpleNamespace(
+        config=SimpleNamespace(output_dir=str(tmp_path), max_steps=1, timeout_s=60),
+        sim_world=SimpleNamespace(config=settings, play=Mock(), step=Mock()),
+        scene=SimpleNamespace(config=settings),
+        robot=SimpleNamespace(config=settings),
+        planner=SimpleNamespace(
+            config=settings,
+            on_physics_step=Mock(return_value=True),
+            write_diagnostics=Mock(),
+            result=lambda: {"success": done},
+            state={"done": done},
+            rows=[],
+        ),
+        log=Mock(),
+    )
+    SortingPhysicsCheck.simulate(job)
+    assert json.loads((tmp_path / "result.json").read_text())["completed"] is done
+    job.sim_world.step.assert_not_called()

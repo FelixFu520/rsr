@@ -3,6 +3,7 @@ inherit = "PhysicSolver_mujoco_vbd_sorting_package_collect.toml"
 
 [scene]
 clear_legacy_parcels = true
+platform_target_xy = "@reset [0.0, -0.96]"  # 给软包后缘与固定基座留出释放余量。
 infeed_travel_m = 0.75
 floor_z_m = 0.0
 rigid_usd_path = "assets/PhysicSolver/Package/v10_box02/source.usd"
@@ -14,10 +15,12 @@ cameras = '''@reset [{ name = "overview", prim_path = "/World/Cameras/overview",
 
 [planner]
 backend = "sorting_stream"
+lift_height_m = 0.28  # 前移的平台落点需要避开高位转运时右腕的关节限位。
 infeed_speed_mps = 0.12
 infeed_settle_s = 2.0
 continuous_outfeed = true
 floor_contact_stiffness = 400000.0
+floor_contact_margin_m = 0.004  # 约 6 m/s 落地冲击的单子步行程超过 3 mm，提前建立地面接触。
 infeed_grasp_pad_bottom_m = 0.020
 regrasp_surface_indent_m = 0.025
 outfeed_place_height_m = 0.20

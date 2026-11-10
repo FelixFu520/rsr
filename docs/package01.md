@@ -307,24 +307,71 @@
 
 复现使用第 8 节的新配置；完整命令见交付说明。物理、回放、独立审计依次执行，正式导出不使用 `--allow-failure`。本轮相关 67 项回归、改动 Python 文件的 Ruff 与格式检查通过；未将全仓历史缺失模块的收集错误记为通过。
 
-## 10. 高清路径追踪与手动四相机同步采集
+## 10. 当前采集入口：1K 路径追踪，按相机依次渲染
 
-最终采集方式统一为每个物理时刻的四相机同步观测。已移除按相机整段渲染的分支、切换参数和预热复用逻辑，在线采集与离线回放都先完成一组四路图像，再处理下个物理时刻。用户已停止上一轮采集并删除 `outputs/`；第 9 节保留为历史验收记录，其中的产物链接不表示当前文件仍存在。本次代码整理没有启动新仿真或采集。
+当前流程先生成一次完整连续物理轨迹，再按 `overview → head → left_wrist → right_wrist` 依次渲染整段。四路均为 **1024×768、15 FPS**，保持原有 4:3 画幅、相机挂载和镜头参数。四路使用完全一致的源物理样本、关节状态、动作和时间戳，生成文件的墙钟时间可以不同。
 
-手动采集入口为 [PhysicSolver_mujoco_vbd_sorting_stream_showcase.toml](../configs/PhysicSolver_mujoco_vbd_sorting_stream_showcase.toml)，在仓库根目录执行：
+在仓库根目录执行：
 
 ```bash
-./scripts/rsr collect run -c configs/PhysicSolver_mujoco_vbd_sorting_stream_showcase.toml
+./scripts/rsr collect render-sorting \
+  -c configs/PhysicSolver_mujoco_vbd_sorting_stream_showcase.toml \
+  --output outputs/sorting_stream_showcase_1k_by_camera
 ```
 
-该命令从初态重新运行连续物理和在线采集，自动创建 `outputs/sorting_stream_showcase_sync/`，不依赖旧 `outputs/`。每个 15 Hz 采样时刻，先保持当前物理状态，依次读取 `overview → head → left_wrist → right_wrist`，四路完成后写入同一行状态、动作及时间戳，再推进后续物理步。这是同一物理时刻的四路观测；GPU 使用共享 viewport 依次渲染。相机之间只刷新渲染；单相机与整组采集均检查物理步数，发生变化则拒收该组。
+此命令先运行完整分拣物理，不采集 RGB，保存至输出目录的 `physics/`；物理阶段失败时不启动渲染。配置中的 `max_steps=16000` 会传给物理脚本。随后在独立进程中渲染同一份成功轨迹，渲染期间不推进物理，也不会为不同相机重新求解。
 
-四路原始图像均为 **1920×1440**，保留原有 4:3 画幅、相机位置、头部原生光学朝向和镜头参数；采样率为 **15 FPS**。使用 **PathTracing、32 SPP、4 次反弹、空间 OptiX 降噪**。关闭自动曝光、DLSS、时间降噪、路径追踪缓存和多光源缓存，启用同步渲染与材质加载。每次切换相机，先等待实际渲染帧刷新 USD 和材质，再以独立外部帧计数控制当前画面的累积，等待渲染和文件写入完成。参数由具体 `IsaacsimWorldConfig` 提供，物理参数和包裹资产继承第 9 节配置。
+每台相机开始时预热灯光和材质，随后连续处理该视角。使用 **PathTracing、32 SPP、4 次反弹、空间 OptiX 降噪**，关闭自动曝光、DLSS、时间降噪和两项光照缓存。每个源样本单独重置累积计数；同一相机序列复用已完成的视角预热。同步采集时在时间轴停止回调之后关闭 RTX ECO，避免自动暂停渲染干扰采集等待；这项设置不推进物理。
 
-此前光照诊断记录中，旧 overview 固定地面区域的相邻帧平均亮度最大变化约 **7.842/255**，已停止的无缓存路径追踪局部采集在约 600 帧范围内观测到约 **0.203/255**。这些是清理产物前的历史记录，不代表本次在线四视角全片已验收。本次整理只检查 CLI 帮助、配置构造、模拟渲染接口与同步逻辑回归以及 Ruff；完整画质和物理结果需对手动运行后的产物复核。
+全部相机完成后，才逐行校验四路图像并提交共享状态、动作和时间戳，最终编码四路 LeRobot v3 视频。来源记录为 `observation_capture_order="camera"`，同时检查 `rendering_physics_steps_advanced=0`。正式输出仍拒绝失败、不完整或恢复诊断的物理源。
 
-本轮 67 项相关回归通过，覆盖世界步进、四路同步、渲染失败恢复、完整图像组提交及 CLI 转发；Ruff 和改动文件格式检查通过。配置构造未启动 Kit，检查完成后 `outputs/` 仍不存在，没有自动采集。
+| 输出 | 内容 |
+| --- | --- |
+| `outputs/sorting_stream_showcase_1k_by_camera/physics/` | 本次完整物理源、配置和结果 |
+| `outputs/sorting_stream_showcase_1k_by_camera/render_progress.json` | 当前相机、帧索引和源时间戳 |
+| `outputs/sorting_stream_showcase_1k_by_camera/lerobot_v3/` | 四路视频、状态、动作及元数据 |
+| 输出目录中的 `.lerobot-v3-*/frames/` | 渲染时的临时分相机 PNG，正式发布后清理 |
 
-成功导出后，四路视频位于新输出目录的 `lerobot_v3/videos/observation.images.{overview,head,left_wrist,right_wrist}/chunk-000/file-000.mp4`，状态和动作共享相同的帧索引与时间戳。正式数据仍要求在线物理门禁通过；已有 `lerobot_v3` 时入口拒绝覆盖，重复采集应换用新的 `job.output_dir`。
+渲染过程中只看到当前及已经处理的相机属于正常进度。四路视频最终分别位于 `lerobot_v3/videos/observation.images.{overview,head,left_wrist,right_wrist}/chunk-000/file-000.mp4`。
 
-采集中四路 PNG 临时保存在输出目录的隐藏目录 `.lerobot-v3-*/frames/{overview,head,left_wrist,right_wrist}/`，同名 `frame_XXXXXX.png` 属于同一组观测；抓取一组的过程中，某些目录可能暂时领先一张。整组完成后才写入状态与动作，物理验收通过后统一编码四路视频并发布正式数据。`collect render-sorting --source ... --output ...` 仅用于已有完整物理缓存时的同步重渲染；本次重新采集使用上面的 `collect run` 命令。
+已有完整物理源时，可以跳过物理阶段并重新渲染到新目录：
+
+```bash
+./scripts/rsr collect render-sorting \
+  --source outputs/sorting_stream_showcase_1k_by_camera/physics \
+  --output outputs/sorting_stream_showcase_1k_rerender
+```
+
+入口拒绝覆盖已有正式 `lerobot_v3`；未指定 `--source` 时也拒绝覆盖已有 `physics/`。`collect run` 保留为原有在线采集入口，本次逐相机渲染使用上面的 `collect render-sorting`。
+
+### 10.1 物理阶段拉伸超限时的退出诊断
+
+2026-11-10 的一次 showcase 重跑在软包右臂闭合末段退出：保存 2462 个物理样本，最后时刻 41.016667 s，最大边长比 1.300869 超过 1.3。纸箱尚未生成，四路渲染尚未开始。末尾的材质绑定、USD 和 conveyor 节点告警不是此次退出状态的来源；`check_sorting_package.py` 的父进程根据失败的物理结果返回非零。
+
+该次记录中已启用 `strain_limited_grip`，但原控制器只在提升、持握、转运和下降时使用反馈，闭合阶段没有放宽。现在闭合也调用同一反馈，并用放宽后的角度补偿原生连杆的指垫底边高度；进入提升时保留闭合末帧实际下发的目标角，避免立即恢复到造成过度压缩的名义角。原有拉伸、形状、穿透和接触门限保持不变。
+
+物理子进程退出后，CLI 会再次输出失败原因、失败检查项、仿真时长、最大边长比及 `physics/result.json` 路径。物理回调返回“停止”不再被等同于流程完成，提前中止且 `state.done=false` 的运行写入 `completed=false`。
+
+本次失败源保留于 `outputs/sorting_stream_showcase_1k_by_camera/physics/`，不能用 `--source` 将其作为正式渲染源。重新从初态求解时使用新输出目录，例如把原命令的 `--output` 改为 `outputs/sorting_stream_showcase_1k_by_camera_retry`。
+
+闭合反馈的局部对照从同一 40.75 s 缓存恢复，初始粒子位置和关节角逐元素相同，两组生效配置仅 `strain_limited_grip` 不同。关闭反馈时，在 41.016667 s 再次因拉伸比 1.301512 中止；开启反馈时，继续至 41.75 s，最大拉伸比为 1.253976、最大放宽为 0.035 rad，未触发在线失败。对照与初态核对见 `outputs/debug/closure_feedback_audit.json`。恢复未覆盖全部求解器内部状态，且仅运行局部闭合片段；两组均为 `accepted_demonstration=false`，不能据此宣称完整连续流程或四路视频已通过。
+
+另从源时刻 37.75 s 恢复的 13 s 路径回归完成右臂闭合、提升、60 帧悬停和 180 帧转运，悬停和转运均全程双侧接触，三次持握 RMS 为 32.180／32.336／32.670 mm。该试验最大边长比为 1.135907，放宽反馈没有介入，不能将这次通过归因于反馈；同样只作为诊断，保留 `accepted_demonstration=false`。
+
+### 10.2 固定基座避让与完整执行脚本
+
+后续完整重跑在 34.75 s 因左臂释放失败中止。末帧夹爪接触为零，但固定基座仍有 28 个接触，软包后缘与基座凸包的最小半空间距离约 0.550 mm，低于粒子半径与 shape margin 合计的 1 mm 接触包络。此时落点误差仅 17.680 mm、质心高于平台约 18.201 mm、完整足迹受支撑，不能将问题当作夹爪未张开或直接忽略基座接触。
+
+流式配置现将平台目标从 `[0,-0.93]` 调到 `[0,-0.96]` m，为释放后的软包后缘留出余量。原 0.33 m 提升高度在该目标下使右臂高位转运触及第六、七关节限位；提升高度改为 0.28 m 后，双臂完整抓取、转运、放手及撤离路径的原生 USD 关节限位筛查通过。未修改机器人结构、碰撞体、质量、摩擦和验收门限。
+
+完整入口为 `./scripts/run_sorting_showcase.sh [输出目录]`。省略目录时按纽约时间创建新目录；脚本依次执行连续物理、逐相机渲染、`validate_sorting_stream.py` 独立验收，任一阶段失败均返回非零并保留 `logs/pipeline_*.log`。再次指定已完成物理的目录时，仅接受成功、完整、连续且非恢复诊断的源；已有最终数据时重新执行独立验收。
+
+完整验证另暴露了首次落地的离散接触问题：在 63.966667 s，软包以约 6 m/s 下落时的单个 VBD 子步行程超过 3 mm，原地面接触包络只有约 1 mm，保存样本出现 2.361 mm 地面穿透，超过 1.5 mm 门限。地面刚度从 400000 单独提高到 2000000 的局部对照仍超限，不能仅靠刚度解决。现在新增可选 `floor_contact_margin_m`，仅覆盖地面的 VBD shape margin；流式示例设置为 0.004 m，与 0.8 mm 粒子半径合成约 4.8 mm 提前接触包络，袋体厚度、夹指、平台、输送带和验收门限不变。该接触皮层也会使静置软包与可视地面保持数毫米间隔。
+
+从同一落地前缓存近似恢复的 120 帧对照中，4 mm 地面提前量的最大穿透为 0.082 mm、最大边长比 1.166687、最小面积比 0.539625，接触容量无溢出。此对照仍为诊断；正式流程需按新配置从初态重新运行。
+
+2026-11-10 按新配置从初态完成连续物理，运行 ID `0f632352be004983995724280f2cdd25`。同一世界连续 134.516667 s，软包完成后在 67.25 s 生成纸箱，两件均通过完整流程，`success=true`、`completed=true`、`failed_checks=[]`。全时间线软包最大边长比 1.248942，保存样本地面穿透为 0。平台释放末帧对全部 14534 个顶点与面中心探针复核，固定基座最小保守间距为 25.678 mm，大于 1 mm 接触包络；只有地面 shape 45 的 margin 从 0.2 mm 改为 4 mm，其余 shape margin 不变。证据见 `outputs/sorting_stream_showcase_1k_final/qa/physical_fix_verification.json`。
+
+本条右臂闭合反馈实际放宽峰值为 0.035 rad。末次右臂持握袋衣间隙 q95 为 10.030 mm，超过严格的 10 mm 门限，仍按原 `workflow_gap_advisory` 配置保留严格失败，`strict_quality_success=false`；没有把流程成功改写为严格贴合通过。
+
+本次修改只运行配置、CLI 帮助、模拟渲染与步进接口的回归以及 Ruff，没有启动新的物理或渲染采集。当前方案的实际总耗时和完整视频画质尚未实测。此前 1920×1440 局部光照诊断结果不能替代本次 1K 全片验收；第 9 节保留为历史记录，链接不保证产物当前仍存在。

@@ -101,6 +101,7 @@ backend = "stub"
 # continuous_outfeed=false：设为 true 后出料带从初帧持续运行，离带后仍保持速度。
 # outfeed_place_height_m=None：可单独提高右臂松手 TCP，不改变平台交接高度。
 # floor_contact_stiffness=None：可单独设置地面 VBD 法向接触刚度，不改变抓取或带面材料。
+# floor_contact_margin_m=None：仅覆盖地面接触提前量（米）；未设置时沿用资产的 shape margin。
 # sorting_stream：同一连续 MuJoCo/VBD 世界先柔性后刚性；参见 sorting_stream 示例。
 # rigid_closed_gripper_rad=0.40、rigid_hold_gripper_rad=0.42、rigid_pad_bottom_m=0.015。
 # sleep_soft_when_settled=true：仅已落地静止且距纸箱超过 0.2 m 的柔性包裹可休眠；接近时唤醒。

@@ -49,7 +49,7 @@ class SortingPhysicsCheck(SortingJob):
             self.planner.write_diagnostics(output)
             result = self.planner.result()
             result.update(
-                completed=completed,
+                completed=bool(completed and self.planner.state.get("done")),
                 rigid_solver="mujoco",
                 contact_solver="vbd",
                 elapsed_s=time.monotonic() - started,

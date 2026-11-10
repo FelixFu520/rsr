@@ -590,6 +590,10 @@ class IsaacsimWorld(BaseSimWorld):
         self._require_app()
         if self.uses_direct_newton:
             self._timeline_action("stop")
+        if self.config.synchronous_capture:
+            # Isaac's timeline stop handler enables ECO mode. Explicit capture
+            # still needs render events while Newton owns the physical clock.
+            self._settings.set_bool("/rtx/ecoMode/enabled", False)
         key = "/app/player/playSimulations"
         previous = self._settings.get(key)
         self._settings.set_bool(key, False)

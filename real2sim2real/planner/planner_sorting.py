@@ -132,6 +132,7 @@ class SortingPlannerConfig(PackagePlannerConfig):
     continuous_outfeed: bool = False
     outfeed_place_height_m: FiniteFloat | None = Field(default=None, gt=0)
     floor_contact_stiffness: FiniteFloat | None = Field(default=None, gt=0)
+    floor_contact_margin_m: FiniteFloat | None = Field(default=None, ge=0)
     minimum_belt_displacement_m: float = Field(default=0.30, gt=0)
     maximum_edge_stretch: float = Field(default=1.3, gt=1)
     minimum_triangle_area_ratio: float = Field(default=0.03, gt=0, lt=1)
@@ -320,14 +321,21 @@ class SortingPlanner(PickPlaceClothPlanner):
         }
         self.instantaneous_stretch = 1.0
 
-    def _limited_gripper_angle(self, side: str, nominal_rad: float) -> float:
+    def _limited_gripper_angle(
+        self, side: str, nominal_rad: float, *, closing: bool = False
+    ) -> float:
         if not self.config.strain_limited_grip:
             return nominal_rad
+        minimum = (
+            self.config.open_gripper_rad
+            if closing
+            else self.legs[side].get("acquired_gripper_rad", self.config.closed_gripper_rad)
+        )
         return self.grip_limiters[side].command(
             nominal_rad,
             self.instantaneous_stretch,
             self.robot.sim_world.config.physics_dt,
-            minimum_rad=min(nominal_rad, self.config.closed_gripper_rad),
+            minimum_rad=min(nominal_rad, minimum),
         )
 
     def _coms(self, vertices: np.ndarray) -> np.ndarray:
@@ -538,6 +546,13 @@ class SortingPlanner(PickPlaceClothPlanner):
             )
             self.target = np.r_[self.pick[:2], self.support_z + self._grasp_tcp_height(side, angle)]
         elif phase == "lift":
+            # Preserve the grip acquired with strain relief instead of forcing
+            # the nominal closed angle back onto the parcel at the phase boundary.
+            if self.config.strain_limited_grip:
+                self.legs[side]["acquired_gripper_rad"] = min(
+                    self.config.closed_gripper_rad,
+                    float(self.runtime.target_q[self.robot.gripper_indices[side]]),
+                )
             self.target[2] = self.support_z + self.config.lift_height_m
         elif phase == "hold":
             self.target = previous_target
@@ -766,6 +781,8 @@ class SortingPlanner(PickPlaceClothPlanner):
                 if phase == "close"
                 else opening + (1 - grip_blend) * (self.release_start_angle - opening)
             )
+            if phase == "close":
+                angle = self._limited_gripper_angle(side, angle, closing=True)
             if phase == "close" and self.config.grasp_pad_bottom_m is not None:
                 target = self.start_tcp.copy()
                 target[2] = self.support_z + self._grasp_tcp_height(side, angle)
