@@ -1630,6 +1630,226 @@ def test_replay_renders_complete_camera_sequences_with_identical_source_samples(
     assert values[control] is False
 
 
+@pytest.mark.parametrize(
+    "trajectory,expected_exit,expected_ground",
+    [
+        (
+            [
+                [(0.1, 0, 1.8), (-0.1, 0, 1.8)],
+                [(-0.1, 0, 0.3), (-0.3, 0, 0.3)],
+                [(0.03, 0, 0.04), (-0.3, 0, 0.02)],
+            ],
+            True,
+            True,
+        ),
+        ([[(0.1, 0, 1.8), (-0.1, 0, 1.8)], [(0.03, 0, 0.04), (-0.3, 0, 0.02)]], False, False),
+        ([[(0.03, 0, 0.04), (-0.3, 0, 0.02)], [(-0.1, 0, 0.3), (-0.3, 0, 0.3)]], True, False),
+        ([[(-0.1, 0, 0.3), (-0.3, 0, 0.3)], [(0.03, 0, 0.12), (-0.3, 0, 0.02)]], True, False),
+        ([[(-0.1, 0, 0.04), (-0.3, 0, 0.02)]], True, True),
+    ],
+)
+def test_outfeed_fall_requires_departure_before_landing_not_simultaneous_xy_clearance(
+    trajectory, expected_exit, expected_ground
+):
+    from scripts.validate_sorting_stream import outfeed_departure
+
+    report = outfeed_departure(np.asarray(trajectory), edge=0, floor=0)
+    assert report["fully_exits_outfeed"] is expected_exit
+    assert report["falls_to_ground"] is expected_ground
+    if expected_ground:
+        assert report["first_full_exit_sample"] <= report["first_ground_sample"]
+
+
+def test_render_cache_rejects_changed_source_settings_and_incomplete_images(tmp_path):
+    from scripts.render_sorting_package import prepare_frame_cache, valid_cached_frame
+
+    source = tmp_path / "physics"
+    source.mkdir()
+    (source / "result.json").write_text('{"success":true}')
+    configuration = dict(scene=dict(cameras=[dict(name="overview")]), robot=dict(cameras=[]))
+    indices = np.array([0, 4])
+    frames = prepare_frame_cache(source, tmp_path, configuration, 15, indices)
+    assert prepare_frame_cache(source, tmp_path, configuration, 15, indices) == frames
+    path = frames / "overview/frame_000000.png"
+    assert not valid_cached_frame(path, (64, 48))
+    Image.new("RGB", (64, 48)).save(path)
+    assert valid_cached_frame(path, (64, 48))
+    assert not valid_cached_frame(path, (48, 64))
+    data = path.read_bytes()
+    path.write_bytes(data[: len(data) // 2])
+    assert not valid_cached_frame(path, (64, 48))
+    for fps, samples in ((30, indices), (15, np.array([0, 8]))):
+        with pytest.raises(ValueError, match="source or settings changed"):
+            prepare_frame_cache(source, tmp_path, configuration, fps, samples)
+    (source / "result.json").write_text('{"success":false}')
+    with pytest.raises(ValueError, match="source or settings changed"):
+        prepare_frame_cache(source, tmp_path, configuration, 15, indices)
+
+
+@pytest.mark.parametrize("chunk_frames", [1, 600])
+def test_camera_worker_resume_recaptures_only_missing_or_corrupt_source_frames(
+    monkeypatch, tmp_path, chunk_frames
+):
+    from types import SimpleNamespace
+
+    import scripts.render_sorting_package as module
+    from real2sim2real.utils.cameras import CameraConfig
+
+    job = object.__new__(module.SortingReplayJob)
+    job.output = tmp_path
+    job.indices = np.array([0, 4, 8])
+    job.saved = dict(times=np.arange(9) / 60)
+    job.frame_cache = tmp_path / "frames"
+    job.capture_camera = "head"
+    job.capture_chunk_frames = chunk_frames
+    job.recording_cameras = [
+        CameraConfig(
+            name=name, prim_path=f"/World/{name}", pose_relative_to="/World", resolution=(64, 48)
+        )
+        for name in ("overview", "head")
+    ]
+    job.sim_world = SimpleNamespace(
+        physics_steps=0,
+        config=SimpleNamespace(synchronous_capture=False, renderer="PathTracing"),
+    )
+    directory = job.frame_cache / "head"
+    directory.mkdir(parents=True)
+    valid = directory / "frame_000000.png"
+    Image.new("RGB", (64, 48), (9, 8, 7)).save(valid)
+    original = valid.read_bytes()
+    (directory / "frame_000001.png").write_bytes(b"truncated PNG")
+    warmed, published = [], []
+    job._prepare_offline_render = lambda index, camera: warmed.append((index, camera.name))
+    job._publish_sample = published.append
+
+    def capture(world, path, **kwargs):
+        Image.new("RGB", (64, 48), (published[-1], 0, 0)).save(path)
+
+    monkeypatch.setattr(module, "capture_viewport_frame", capture)
+    job._capture_samples(None, 0)
+    assert warmed == [(4, "head")]
+    assert published == ([4] if chunk_frames == 1 else [4, 8])
+    assert valid.read_bytes() == original
+    assert not (job.frame_cache / "overview").exists()
+    published.clear()
+    warmed.clear()
+    job._capture_samples(None, 0)
+    assert published == ([8] if chunk_frames == 1 else [])
+    assert warmed == ([(8, "head")] if chunk_frames == 1 else [])
+    published.clear()
+    warmed.clear()
+    job._capture_samples(None, 0)
+    assert published == warmed == []
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_render_camera_workers_finish_before_dataset_encoding(monkeypatch, tmp_path, failure):
+    import scripts.render_sorting_package as module
+
+    (tmp_path / "configuration.json").write_text(
+        json.dumps(
+            dict(
+                scene=dict(cameras=[dict(name="overview")]),
+                robot=dict(cameras=[dict(name="head")]),
+            )
+        )
+    )
+    calls = []
+
+    def run(script, arguments, result, **kwargs):
+        calls.append((arguments, result))
+        result.parent.mkdir(parents=True, exist_ok=True)
+        result.write_text(json.dumps(dict(complete=True, completed_frames=2018)))
+        return 2 if failure and len(calls) == 2 else 0
+
+    monkeypatch.setattr(module, "run_kit_worker", run)
+    assert module.run_camera_workers(tmp_path, tmp_path, ["source"]) == (2 if failure else 0)
+    assert calls[0][0] == ["source", "--capture-camera", "overview"]
+    assert calls[1][0] == ["source", "--capture-camera", "head"]
+    if failure:
+        assert len(calls) == 2
+    else:
+        assert calls[2] == (["source"], tmp_path / "result.json")
+
+
+@pytest.mark.parametrize("no_progress", [False, True])
+def test_camera_batches_must_finish_and_make_progress_before_encoding(
+    monkeypatch, tmp_path, no_progress
+):
+    import scripts.render_sorting_package as module
+
+    (tmp_path / "configuration.json").write_text(
+        json.dumps(dict(scene=dict(cameras=[dict(name="overview")]), robot=dict(cameras=[])))
+    )
+    calls = []
+
+    def run(script, arguments, result, **kwargs):
+        calls.append(arguments)
+        result.parent.mkdir(parents=True, exist_ok=True)
+        complete = len(calls) >= 2 and not no_progress
+        result.write_text(
+            json.dumps(dict(complete=complete, completed_frames=2 if complete else 1))
+        )
+        return 0
+
+    monkeypatch.setattr(module, "run_kit_worker", run)
+    if no_progress:
+        with pytest.raises(RuntimeError, match="made no progress"):
+            module.run_camera_workers(tmp_path, tmp_path, ["source"])
+        assert len(calls) == 2
+    else:
+        assert module.run_camera_workers(tmp_path, tmp_path, ["source"]) == 0
+        assert calls == [["source", "--capture-camera", "overview"]] * 2 + [["source"]]
+
+
+def test_complete_render_cache_commits_matching_state_and_action_without_recapture(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from real2sim2real.utils.cameras import CameraConfig
+    from scripts.render_sorting_package import SortingReplayJob
+
+    job = object.__new__(SortingReplayJob)
+    job.output = tmp_path
+    job.indices = np.array([0, 4])
+    job.saved = dict(
+        times=np.arange(5) / 60,
+        state=np.arange(10).reshape(5, 2),
+        action=np.arange(10, 20).reshape(5, 2),
+    )
+    job.frame_cache = tmp_path / "cache"
+    job.recording_cameras = [
+        CameraConfig(
+            name=name, prim_path=f"/World/{name}", pose_relative_to="/World", resolution=(64, 48)
+        )
+        for name in ("overview", "head")
+    ]
+    for camera in job.recording_cameras:
+        directory = job.frame_cache / camera.name
+        directory.mkdir(parents=True)
+        for frame in range(2):
+            Image.new("RGB", (64, 48), (frame, 8, 9)).save(directory / f"frame_{frame:06d}.png")
+    job.sim_world = SimpleNamespace(
+        physics_steps=0,
+        config=SimpleNamespace(synchronous_capture=False, renderer="PathTracing"),
+    )
+    job._prepare_offline_render = Mock(side_effect=AssertionError("Unexpected renderer warmup"))
+    job._publish_sample = Mock(side_effect=AssertionError("Unexpected source recapture"))
+    recorder = LeRobotV3Recorder(
+        tmp_path / "lerobot_v3",
+        fps=15,
+        width=64,
+        height=48,
+        task="cached source replay",
+        cameras={camera.name: (64, 48) for camera in job.recording_cameras},
+        joint_names=["a", "b"],
+    )
+    job._capture_samples(recorder, 0)
+    assert [row["observation.state"] for row in recorder.rows] == [[0, 1], [8, 9]]
+    assert [row["action"] for row in recorder.rows] == [[10, 11], [18, 19]]
+    assert [row["timestamp"] for row in recorder.rows] == [0, 1 / 15]
+
+
 @pytest.mark.parametrize("exit_code", [0, 3])
 def test_manual_synchronized_render_cli_only_launches_when_invoked(
     monkeypatch, tmp_path, exit_code

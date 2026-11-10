@@ -61,6 +61,23 @@ def soft_geometry_quality(positions: np.ndarray, rest: np.ndarray, triangles: np
     return dict(maximum_edge_stretch=maximum_stretch, minimum_triangle_area_ratio=minimum_area)
 
 
+def outfeed_departure(points: np.ndarray, edge: float, floor: float) -> dict:
+    """Require complete belt departure before landing, allowing the parcel to spread below it."""
+    exited = points[:, :, 0].max(1) < edge
+    # A soft parcel can rotate/spread back underneath the belt after fully leaving
+    # its edge. Landing must follow departure; their XY predicates need not coincide.
+    departed = np.logical_or.accumulate(exited)
+    grounded = departed & (points[:, :, 2].max(1) < floor + 0.12)
+    exit_samples = np.flatnonzero(exited)
+    ground_samples = np.flatnonzero(grounded)
+    return dict(
+        fully_exits_outfeed=bool(len(exit_samples)),
+        falls_to_ground=bool(len(ground_samples)),
+        first_full_exit_sample=int(exit_samples[0]) if len(exit_samples) else None,
+        first_ground_sample=int(ground_samples[0]) if len(ground_samples) else None,
+    )
+
+
 def audit(output: Path) -> dict:
     """Recompute source continuity, motion, geometry, and video/state synchronization."""
     result = json.loads((output / "result.json").read_text())
@@ -209,12 +226,18 @@ def audit(output: Path) -> dict:
     floor = config["scene"]["floor_z_m"]
     edge = soft["support_bounds"][2, 0, 0]
     floor_penetration = {}
+    departures = {}
     for kind, points in (("soft", stream["positions"]), ("rigid", carton[visible])):
-        exited = points[:, :, 0].max(1) < edge
-        checks[f"{kind}_fully_exits_outfeed"] = bool(exited.any())
-        checks[f"{kind}_falls_to_ground"] = bool(
-            np.any(exited & (points[:, :, 2].max(1) < floor + 0.12))
-        )
+        departure = outfeed_departure(points, edge, floor)
+        for name in ("fully_exits_outfeed", "falls_to_ground"):
+            checks[f"{kind}_{name}"] = departure[name]
+        sample_times = times if kind == "soft" else times[visible]
+        for event in ("full_exit", "ground"):
+            index = departure[f"first_{event}_sample"]
+            departure[f"first_{event}_time_s"] = (
+                float(sample_times[index]) if index is not None else None
+            )
+        departures[kind] = departure
         checks[f"{kind}_floor_penetration_bounded"] = bool(points[:, :, 2].min() >= floor - 0.0015)
         floor_penetration[kind] = max(0.0, floor - float(points[:, :, 2].min()))
     separation = np.maximum(
@@ -301,6 +324,7 @@ def audit(output: Path) -> dict:
         physics_samples=len(times),
         native_substeps=len(residuals),
         infeed_displacement_m=infeed,
+        outfeed_departure=departures,
         maximum_finite_support_depth_m=support_depths,
         maximum_floor_penetration_m=floor_penetration,
         final_parcel_aabb_separation_m=float(np.linalg.norm(separation)),

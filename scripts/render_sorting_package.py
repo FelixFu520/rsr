@@ -10,6 +10,7 @@ import argparse
 import copy
 import hashlib
 import json
+import os
 import shutil
 import sys
 import time
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import numpy as np
+from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from real2sim2real.core.config import apply_settings_file
@@ -107,6 +109,53 @@ def override_camera_poses(configuration: dict, overrides: dict) -> dict:
     return updated
 
 
+def valid_cached_frame(path: Path, resolution: tuple[int, int]) -> bool:
+    """Accept only complete PNGs with the requested image dimensions."""
+    try:
+        with Image.open(path) as image:
+            if image.format != "PNG" or image.size != tuple(resolution):
+                return False
+            image.verify()
+        return True
+    except (OSError, SyntaxError, ValueError):
+        return False
+
+
+def prepare_frame_cache(
+    cache: Path, output: Path, configuration: dict, fps: int, indices: np.ndarray
+) -> Path:
+    """Bind resumable RGB frames to exact source files, optics and rendering settings."""
+    sources = {}
+    for name in ("configuration.json", "result.json", "particles.npz", "stream.npz"):
+        path = cache / name
+        if path.is_file():
+            with path.open("rb") as source:
+                sources[name] = hashlib.file_digest(source, "sha256").hexdigest()
+    manifest = dict(
+        version=1,
+        sources=sources,
+        configuration=configuration,
+        fps=fps,
+        frames=len(indices),
+        indices_sha256=hashlib.sha256(np.asarray(indices, dtype="<i8").tobytes()).hexdigest(),
+    )
+    # Normalize tuples and JSON lists before comparing persisted settings.
+    manifest = json.loads(json.dumps(manifest, allow_nan=False))
+    root = output / ".render_cache"
+    path = root / "manifest.json"
+    if path.is_file() and json.loads(path.read_text()) != manifest:
+        raise ValueError("Render cache source or settings changed; choose a new output directory")
+    root.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        if (root / "frames").exists():
+            raise ValueError("Render cache has frames without a provenance manifest")
+        path.write_text(json.dumps(manifest, indent=2) + "\n")
+    for section in ("scene", "robot"):
+        for camera in configuration[section]["cameras"]:
+            (root / "frames" / camera["name"]).mkdir(parents=True, exist_ok=True)
+    return root / "frames"
+
+
 class SortingReplayJob(SortingJob):
     """Use the standard Job lifecycle and native visuals, keeping the world paused."""
 
@@ -117,9 +166,15 @@ class SortingReplayJob(SortingJob):
         fps: int,
         camera_poses: Path | None = None,
         render_profile: Path | None = None,
+        capture_camera: str | None = None,
+        capture_chunk_frames: int = 600,
     ) -> None:
         self.cache, self.output = cache, output
         self.diagnostic_source = False
+        self.capture_camera = capture_camera
+        if capture_chunk_frames < 1:
+            raise ValueError("Capture chunk size must be positive")
+        self.capture_chunk_frames = capture_chunk_frames
         self.configuration = json.loads((cache / "configuration.json").read_text())
         self.physical_result = json.loads((cache / "result.json").read_text())
         if (
@@ -186,6 +241,10 @@ class SortingReplayJob(SortingJob):
                 component.config = component.config_cls(**self.configuration[section])
             self.recording_cameras = [*self.scene.config.cameras, *self.robot.config.cameras]
             self.config.recorder.width, self.config.recorder.height = self.render_profile.resolution
+        if capture_camera is not None and capture_camera not in {
+            camera.name for camera in self.recording_cameras
+        }:
+            raise ValueError(f"Unknown capture camera: {capture_camera}")
 
     def _prepare_offline_render(self, first_index: int, camera: CameraConfig) -> None:
         """Load materials/lights before externally controlling progressive accumulation."""
@@ -236,6 +295,37 @@ class SortingReplayJob(SortingJob):
                 )
             for name in ("particle_radius", "shape_margin"):
                 np.testing.assert_array_equal(saved[name], getattr(runtime.model, name).numpy())
+        self.frame_cache = prepare_frame_cache(
+            self.cache, self.output, self.configuration, self.config.recorder.fps, self.indices
+        )
+        if self.capture_camera is not None:
+            before = self.sim_world.physics_steps
+            self._capture_samples(None, before)
+            camera = next(c for c in self.recording_cameras if c.name == self.capture_camera)
+            completed_frames = sum(
+                valid_cached_frame(
+                    self.frame_cache / camera.name / f"frame_{frame:06d}.png", camera.resolution
+                )
+                for frame in range(len(self.indices))
+            )
+            destination = self.output / "capture_workers" / f"{self.capture_camera}.json"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(
+                json.dumps(
+                    dict(
+                        success=True,
+                        render_run_id=self.worker_id,
+                        camera=self.capture_camera,
+                        frames=len(self.indices),
+                        completed_frames=completed_frames,
+                        complete=completed_frames == len(self.indices),
+                        physics_steps_advanced=self.sim_world.physics_steps - before,
+                    ),
+                    indent=2,
+                )
+                + "\n"
+            )
+            return
         run = self.output / "diagnostics" / datetime.now(UTC).strftime("%Y%m%dT%H%M%S_%fZ")
         run.mkdir(parents=True)
         recorder = LeRobotV3Recorder(
@@ -312,7 +402,7 @@ class SortingReplayJob(SortingJob):
             recorder.discard(run)
             raise
 
-    def _capture_samples(self, recorder: LeRobotV3Recorder, before: int) -> None:
+    def _capture_samples(self, recorder: LeRobotV3Recorder | None, before: int) -> None:
         """Render every camera against the same saved physical samples, without physics steps."""
         controlled = (
             self.sim_world.config.synchronous_capture
@@ -322,25 +412,49 @@ class SortingReplayJob(SortingJob):
         settings = self.sim_world._settings if controlled else None
         previous_control = bool(settings.get(control)) if controlled else False
         started = time.monotonic()
+        frame_cache = getattr(self, "frame_cache", None)
+        frame_root = frame_cache if frame_cache is not None else recorder.frame_dir
+        captured = 0
         try:
             for camera_index, camera in enumerate(self.recording_cameras):
-                self._prepare_offline_render(int(self.indices[0]), camera)
-                if controlled:
-                    settings.set_bool(control, True)
+                if getattr(self, "capture_camera", None) not in (None, camera.name):
+                    continue
+                paths = [
+                    frame_root / camera.name / f"frame_{frame:06d}.png"
+                    for frame in range(len(self.indices))
+                ]
+                cached = [
+                    frame_cache is not None and valid_cached_frame(path, camera.resolution)
+                    for path in paths
+                ]
+                missing = [frame for frame, valid in enumerate(cached) if not valid]
+                if missing:
+                    self._prepare_offline_render(int(self.indices[missing[0]]), camera)
+                    if controlled:
+                        settings.set_bool(control, True)
                 self.log.info("Sorting camera sequence started", camera=camera.name)
                 for frame, index in enumerate(self.indices):
-                    self._publish_sample(int(index))
-                    capture_viewport_frame(
-                        self.sim_world,
-                        recorder.frame_dir / camera.name / f"frame_{frame:06d}.png",
-                        width=camera.resolution[0],
-                        height=camera.resolution[1],
-                        camera_prim=camera.prim_path,
-                        camera_sequence=True,
+                    if not cached[frame]:
+                        self._publish_sample(int(index))
+                        capture_viewport_frame(
+                            self.sim_world,
+                            paths[frame],
+                            width=camera.resolution[0],
+                            height=camera.resolution[1],
+                            camera_prim=camera.prim_path,
+                            camera_sequence=True,
+                        )
+                        if frame_cache is not None and not valid_cached_frame(
+                            paths[frame], camera.resolution
+                        ):
+                            raise RuntimeError(f"Incomplete captured image: {paths[frame]}")
+                        captured += 1
+                    chunk_done = recorder is None and captured >= getattr(
+                        self, "capture_chunk_frames", 600
                     )
                     if self.sim_world.physics_steps != before:
                         raise RuntimeError("Rendering replay advanced physics")
-                    if frame % 15 == 0 or frame == len(self.indices) - 1:
+                    if frame % 15 == 0 or frame == len(self.indices) - 1 or chunk_done:
                         progress = dict(
                             capture_order="camera",
                             camera=camera.name,
@@ -352,14 +466,30 @@ class SortingReplayJob(SortingJob):
                             source_timestamp_s=float(self.saved["times"][index]),
                             elapsed_s=time.monotonic() - started,
                             physics_steps_advanced=0,
+                            reused_frames=sum(cached),
                         )
                         (self.output / "render_progress.json").write_text(
                             json.dumps(progress, indent=2) + "\n"
                         )
                         self.log.info("Sorting camera sequence progress", **progress)
+                    if chunk_done:
+                        return
             # Validate all matching images before accepting shared state/action rows.
-            for index in self.indices:
-                recorder.add_frame(self.saved["state"][index], self.saved["action"][index])
+            if recorder is not None:
+                if frame_cache is not None:
+                    for camera in self.recording_cameras:
+                        for frame in range(len(self.indices)):
+                            name = f"frame_{frame:06d}.png"
+                            source = frame_cache / camera.name / name
+                            if not valid_cached_frame(source, camera.resolution):
+                                raise RuntimeError(f"Incomplete camera sequence: {source}")
+                            target = recorder.frame_dir / camera.name / name
+                            try:
+                                os.link(source, target)
+                            except OSError:
+                                shutil.copy2(source, target)
+                for index in self.indices:
+                    recorder.add_frame(self.saved["state"][index], self.saved["action"][index])
         finally:
             if controlled:
                 settings.set_bool(control, previous_control)
@@ -375,6 +505,33 @@ class SortingReplayJob(SortingJob):
         )
 
 
+def run_camera_workers(cache: Path, output: Path, arguments: list[str]) -> int:
+    """Capture bounded batches in fresh Kit processes, then encode the complete dataset."""
+    configuration = json.loads((cache / "configuration.json").read_text())
+    for section in ("scene", "robot"):
+        for camera in configuration[section]["cameras"]:
+            name = camera["name"]
+            checkpoint = output / "capture_workers" / f"{name}.json"
+            previous_frames = 0
+            while True:
+                status = run_kit_worker(
+                    __file__,
+                    [*arguments, "--capture-camera", name],
+                    checkpoint,
+                    marker_field="render_run_id",
+                    require_success=True,
+                )
+                if status:
+                    return status
+                captured = json.loads(checkpoint.read_text())
+                if captured["complete"]:
+                    break
+                if captured["completed_frames"] <= previous_frames:
+                    raise RuntimeError(f"Camera capture made no progress: {name}")
+                previous_frames = captured["completed_frames"]
+    return run_kit_worker(__file__, arguments, output / "result.json", marker_field="render_run_id")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("cache", type=Path)
@@ -388,13 +545,17 @@ if __name__ == "__main__":
         "--render-profile", type=Path, help="Strict presentation-only JSON settings"
     )
     parser.add_argument("--worker-id", help=argparse.SUPPRESS)
+    parser.add_argument("--capture-camera", help=argparse.SUPPRESS)
+    parser.add_argument("--capture-chunk-frames", type=int, default=600, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.worker_id is None:
+        if args.capture_camera is None:
+            raise SystemExit(run_camera_workers(args.cache, args.output, sys.argv[1:]))
         raise SystemExit(
             run_kit_worker(
                 __file__,
                 sys.argv[1:],
-                args.output / "result.json",
+                args.output / "capture_workers" / f"{args.capture_camera}.json",
                 marker_field="render_run_id",
             )
         )
@@ -424,6 +585,8 @@ if __name__ == "__main__":
         args.fps,
         args.camera_poses,
         args.render_profile,
+        args.capture_camera,
+        args.capture_chunk_frames,
     )
     job.diagnostic_source = not accepted
     job.worker_id = args.worker_id
