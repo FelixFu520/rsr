@@ -111,7 +111,7 @@ def render_sorting(
     ] = Path("configs/sorting_stream_showcase_render.json"),
     fps: Annotated[int, typer.Option("--fps", min=1, help="四路共享的采样率")] = 15,
 ) -> None:
-    """复用已保存的分拣物理轨迹，按 overview、head、左右腕依次渲染整段。"""
+    """复用分拣轨迹，每个物理时刻拍完四路相机，再读取下个时刻。"""
     import subprocess
     import sys
 
@@ -129,8 +129,6 @@ def render_sorting(
             str(render_profile),
             "--fps",
             str(fps),
-            "--capture-order",
-            "camera",
         ],
         check=False,
     )

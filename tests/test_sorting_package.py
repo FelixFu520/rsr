@@ -1406,10 +1406,7 @@ def test_all_four_views_share_one_physics_step(monkeypatch, tmp_path, advance_ph
 
 
 @pytest.mark.parametrize("fail_capture", [False, True])
-@pytest.mark.parametrize("camera_sequence", [False, True])
-def test_synchronous_pt_flushes_view_before_locking_history(
-    monkeypatch, tmp_path, fail_capture, camera_sequence
-):
+def test_synchronous_pt_flushes_view_before_locking_history(monkeypatch, tmp_path, fail_capture):
     import asyncio
     import sys
     from pathlib import Path
@@ -1500,11 +1497,6 @@ def test_synchronous_pt_flushes_view_before_locking_history(
         assert values["/rtx/pathtracing/lightcache/cached/enabled"] is False
         assert values["/rtx/pathtracing/optixDenoiser/temporalMode/enabled"] is False
         renderer.set_capture_sync.assert_called_once_with(True)
-        if camera_sequence:
-            # The camera-batched caller already warmed this view and keeps
-            # accumulation externally controlled across the full sequence.
-            viewport.camera_path, viewport.resolution = "/World/overview", (1920, 1440)
-            values[control] = True
         if fail_capture:
             with pytest.raises(RuntimeError, match="capture unavailable"):
                 capture_viewport_frame(
@@ -1512,7 +1504,6 @@ def test_synchronous_pt_flushes_view_before_locking_history(
                     tmp_path / "failed.png",
                     width=1920,
                     height=1440,
-                    camera_sequence=camera_sequence,
                 )
         else:
             for name in ("overview", "head", "left_wrist", "right_wrist"):
@@ -1521,32 +1512,31 @@ def test_synchronous_pt_flushes_view_before_locking_history(
                     tmp_path / f"{name}.png",
                     width=1920,
                     height=1440,
-                    camera_prim="/World/overview" if camera_sequence else f"/World/{name}",
-                    camera_sequence=camera_sequence,
+                    camera_prim=f"/World/{name}",
                 )
             assert captured == [1, 2, 3, 4]
-        assert rendered == ([(3, True)] if camera_sequence else [(8, False), (3, True)]) * len(
-            captured
-        )
-        assert values[control] is camera_sequence
-        assert reset.call_count == (0 if camera_sequence else len(captured))
+        assert rendered == [(8, False), (3, True)] * len(captured)
+        assert values[control] is False
+        assert reset.call_count == len(captured)
         assert world.physics_steps == 0
     finally:
         loop.close()
 
 
 @pytest.mark.parametrize("advance_physics", [False, True])
-def test_camera_batches_keep_exact_source_samples_and_commit_only_complete_groups(
+def test_replay_captures_complete_four_view_groups_before_next_source_sample(
     monkeypatch, tmp_path, advance_physics
 ):
-    from types import SimpleNamespace
+    import sys
+    from types import ModuleType, SimpleNamespace
     from unittest.mock import Mock
 
-    import scripts.render_sorting_package as module
+    import real2sim2real.job.job_physic_solver as capture_module
     from real2sim2real.utils.cameras import CameraConfig
+    from scripts.render_sorting_package import SortingReplayJob
 
     names = ["overview", "head", "left_wrist", "right_wrist"]
-    job = object.__new__(module.SortingReplayJob)
+    job = object.__new__(SortingReplayJob)
     job.output = tmp_path
     job.indices = np.array([0, 4])
     job.saved = dict(
@@ -1554,24 +1544,18 @@ def test_camera_batches_keep_exact_source_samples_and_commit_only_complete_group
         state=np.arange(10).reshape(5, 2),
         action=np.arange(10, 20).reshape(5, 2),
     )
-    values = {}
-    control = "/rtx-transient/resetPtAccumOnlyWhenExternalFrameCounterChanges"
-    job.sim_world = SimpleNamespace(
-        physics_steps=0,
-        config=SimpleNamespace(synchronous_capture=True, renderer="PathTracing"),
-        _settings=SimpleNamespace(
-            get=values.get, set_bool=lambda key, value: values.__setitem__(key, value)
-        ),
-    )
+    job.sim_world = SimpleNamespace(physics_steps=0)
+    viewport = SimpleNamespace(camera_path="/World/GUI", resolution=(800, 600))
+    utility = ModuleType("omni.kit.viewport.utility")
+    utility.get_active_viewport = lambda: viewport
+    monkeypatch.setitem(sys.modules, utility.__name__, utility)
     job.recording_cameras = [
         CameraConfig(
             name=name, prim_path=f"/World/{name}", pose_relative_to="/World", resolution=(64, 48)
         )
         for name in names
     ]
-    warmed, captured, current = [], [], {}
-    job._prepare_offline_render = lambda index, camera: warmed.append((index, camera.name))
-    job._publish_sample = lambda index: current.update(index=index)
+    captured, current = [], {}
     recorder = LeRobotV3Recorder(
         tmp_path / "lerobot_v3",
         fps=15,
@@ -1583,41 +1567,45 @@ def test_camera_batches_keep_exact_source_samples_and_commit_only_complete_group
     )
 
     def capture(world, path, **kwargs):
-        assert kwargs["camera_sequence"]
         captured.append((path.parent.name, current["index"]))
         Image.new("RGB", (64, 48), (current["index"], 10, 20)).save(path)
         if advance_physics:
             world.physics_steps += 1
 
-    monkeypatch.setattr(module, "capture_viewport_frame", capture)
+    monkeypatch.setattr(capture_module, "capture_viewport_frame", capture)
+
+    def publish(index):
+        # A new source pose may only be published after the previous group has
+        # been accepted, with all four matching images and joint coordinates.
+        assert len(captured) == len(recorder.rows) * 4
+        current["index"] = index
+
+    job._publish_sample = publish
     # Leave the normal logger lazy; no Isaac Sim resources are created.
     if advance_physics:
         with pytest.raises(RuntimeError, match="advanced physics"):
-            job._capture_camera_sequences(recorder, 0)
+            job._capture_samples(recorder, 0)
         assert recorder.rows == []
     else:
         original_add = recorder.add_frame
 
         def add_frame(state, action):
-            assert len(captured) == 8
+            assert len(captured) == (len(recorder.rows) + 1) * 4
             original_add(state, action)
 
         recorder.add_frame = Mock(side_effect=add_frame)
-        job._capture_camera_sequences(recorder, 0)
-        assert warmed == [(0, name) for name in names]
-        assert captured == [(name, index) for name in names for index in (0, 4)]
+        job._capture_samples(recorder, 0)
+        assert captured == [(name, index) for index in (0, 4) for name in names]
         assert [row["timestamp"] for row in recorder.rows] == [0, 1 / 15]
         assert [row["observation.state"] for row in recorder.rows] == [[0, 1], [8, 9]]
         assert [row["action"] for row in recorder.rows] == [[10, 11], [18, 19]]
-        progress = json.loads((tmp_path / "render_progress.json").read_text())
-        assert progress["camera"] == "right_wrist"
-        assert progress["source_index"] == 4
-        assert progress["physics_steps_advanced"] == 0
-    assert values[control] is False
+    assert (viewport.camera_path, viewport.resolution) == ("/World/GUI", (800, 600))
 
 
 @pytest.mark.parametrize("exit_code", [0, 3])
-def test_manual_camera_render_cli_only_launches_when_invoked(monkeypatch, tmp_path, exit_code):
+def test_manual_synchronized_render_cli_only_launches_when_invoked(
+    monkeypatch, tmp_path, exit_code
+):
     import sys
     from pathlib import Path
     from types import SimpleNamespace
@@ -1650,7 +1638,8 @@ def test_manual_camera_render_cli_only_launches_when_invoked(monkeypatch, tmp_pa
     assert arguments[0] == sys.executable
     assert Path(arguments[1]).name == "render_sorting_package.py"
     assert arguments[2] == str(source)
-    assert arguments[-2:] == ["--capture-order", "camera"]
+    assert arguments[-2:] == ["--fps", "15"]
+    assert "--capture-order" not in arguments
 
 
 def test_cached_soft_success_cannot_hide_damage_during_the_later_rigid_relay():

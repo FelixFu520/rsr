@@ -12,7 +12,6 @@ import hashlib
 import json
 import shutil
 import sys
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
@@ -23,9 +22,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from real2sim2real.core.config import apply_settings_file
 from real2sim2real.job.job_sorting import SortingJob, SortingJobConfig
 from real2sim2real.utils.asset_utils import resolve_usd_path
-from real2sim2real.utils.cameras import CameraConfig, CameraPose
+from real2sim2real.utils.cameras import CameraPose
 from real2sim2real.utils.kit_process import run_kit_worker
-from real2sim2real.utils.lerobot_v3 import LeRobotV3Recorder, capture_viewport_frame
+from real2sim2real.utils.lerobot_v3 import LeRobotV3Recorder
 
 
 class ReplayRenderProfile(BaseModel):
@@ -117,12 +116,8 @@ class SortingReplayJob(SortingJob):
         fps: int,
         camera_poses: Path | None = None,
         render_profile: Path | None = None,
-        capture_order: Literal["camera", "frame"] = "camera",
     ) -> None:
         self.cache, self.output = cache, output
-        if capture_order not in {"camera", "frame"}:
-            raise ValueError("capture_order must be camera or frame")
-        self.capture_order = capture_order
         self.diagnostic_source = False
         self.configuration = json.loads((cache / "configuration.json").read_text())
         self.physical_result = json.loads((cache / "result.json").read_text())
@@ -191,12 +186,12 @@ class SortingReplayJob(SortingJob):
             self.recording_cameras = [*self.scene.config.cameras, *self.robot.config.cameras]
             self.config.recorder.width, self.config.recorder.height = self.render_profile.resolution
 
-    def _prepare_offline_render(self, first_index: int, camera: CameraConfig | None = None) -> None:
+    def _prepare_offline_render(self, first_index: int) -> None:
         """Load materials/lights before externally controlling progressive accumulation."""
         from omni.kit.viewport.utility import get_active_viewport
 
         viewport = get_active_viewport()
-        camera = camera or self.recording_cameras[0]
+        camera = self.recording_cameras[0]
         if self.sim_world.config.synchronous_capture:
             self.sim_world._settings.set_bool(
                 "/rtx-transient/resetPtAccumOnlyWhenExternalFrameCounterChanges", False
@@ -260,19 +255,9 @@ class SortingReplayJob(SortingJob):
             self._publish_sample(first)
             for _ in range(8):
                 self.sim_world.update()
-            if self.capture_order == "camera":
-                self._capture_camera_sequences(recorder, before)
-            else:
-                if self.render_profile is not None:
-                    self._prepare_offline_render(first)
-                for frame, index in enumerate(self.indices):
-                    self._publish_sample(index)
-                    self._capture_cameras(recorder)
-                    recorder.add_frame(saved["state"][index], saved["action"][index])
-                    if self.sim_world.physics_steps != before:
-                        raise RuntimeError("Rendering replay advanced physics")
-                    if frame % 30 == 0:
-                        self.log.info("Sorting replay", frame=frame, total_frames=len(self.indices))
+            if self.render_profile is not None:
+                self._prepare_offline_render(first)
+            self._capture_samples(recorder, before)
             result = dict(self.physical_result)
             if self.diagnostic_source:
                 result.update(
@@ -302,7 +287,7 @@ class SortingReplayJob(SortingJob):
                     self.render_profile.model_dump(mode="json") if self.render_profile else None
                 ),
                 rendering_physics_steps_advanced=self.sim_world.physics_steps - before,
-                observation_capture_order=self.capture_order,
+                observation_capture_order="frame",
             )
             shutil.copy2(self.cache / "particles.npz", run / "particles.npz")
             if self.is_stream:
@@ -329,59 +314,16 @@ class SortingReplayJob(SortingJob):
             recorder.discard(run)
             raise
 
-    def _capture_camera_sequences(self, recorder: LeRobotV3Recorder, before: int) -> None:
-        """Render complete camera sequences, then commit rows sharing exact source samples."""
-        settings = self.sim_world._settings
-        control = "/rtx-transient/resetPtAccumOnlyWhenExternalFrameCounterChanges"
-        controlled = (
-            self.sim_world.config.synchronous_capture
-            and self.sim_world.config.renderer == "PathTracing"
-        )
-        previous_control = bool(settings.get(control)) if controlled else False
-        started = time.monotonic()
-        try:
-            for camera_index, camera in enumerate(self.recording_cameras):
-                self._prepare_offline_render(int(self.indices[0]), camera)
-                if controlled:
-                    settings.set_bool(control, True)
-                self.log.info("Sorting camera sequence started", camera=camera.name)
-                for frame, index in enumerate(self.indices):
-                    self._publish_sample(int(index))
-                    path = recorder.frame_dir / camera.name / f"frame_{frame:06d}.png"
-                    capture_viewport_frame(
-                        self.sim_world,
-                        path,
-                        width=camera.resolution[0],
-                        height=camera.resolution[1],
-                        camera_prim=camera.prim_path,
-                        camera_sequence=True,
-                    )
-                    if self.sim_world.physics_steps != before:
-                        raise RuntimeError("Camera sequence rendering advanced physics")
-                    if frame % 15 == 0 or frame == len(self.indices) - 1:
-                        progress = dict(
-                            capture_order="camera",
-                            camera=camera.name,
-                            camera_index=camera_index,
-                            cameras=len(self.recording_cameras),
-                            frame=frame,
-                            frames=len(self.indices),
-                            source_index=int(index),
-                            source_timestamp_s=float(self.saved["times"][index]),
-                            elapsed_s=time.monotonic() - started,
-                            physics_steps_advanced=0,
-                        )
-                        (self.output / "render_progress.json").write_text(
-                            json.dumps(progress, indent=2) + "\n"
-                        )
-                        self.log.info("Sorting camera sequence progress", **progress)
-            # Every view exists before a row is accepted. Recorder validation
-            # rejects missing/mis-sized images while preserving shared timestamps.
-            for index in self.indices:
-                recorder.add_frame(self.saved["state"][index], self.saved["action"][index])
-        finally:
-            if controlled:
-                settings.set_bool(control, previous_control)
+    def _capture_samples(self, recorder: LeRobotV3Recorder, before: int) -> None:
+        """Capture every view and commit one row before reading the next source sample."""
+        for frame, index in enumerate(self.indices):
+            self._publish_sample(int(index))
+            self._capture_cameras(recorder)
+            if self.sim_world.physics_steps != before:
+                raise RuntimeError("Rendering replay advanced physics")
+            recorder.add_frame(self.saved["state"][index], self.saved["action"][index])
+            if frame % 30 == 0:
+                self.log.info("Sorting replay", frame=frame, total_frames=len(self.indices))
 
     def _publish_sample(self, index: int) -> None:
         options = {}
@@ -407,12 +349,6 @@ if __name__ == "__main__":
         "--render-profile", type=Path, help="Strict presentation-only JSON settings"
     )
     parser.add_argument("--worker-id", help=argparse.SUPPRESS)
-    parser.add_argument(
-        "--capture-order",
-        choices=("camera", "frame"),
-        default="camera",
-        help="camera: complete each view in order; frame: capture every view per timestamp",
-    )
     args = parser.parse_args()
     if args.worker_id is None:
         raise SystemExit(
@@ -449,7 +385,6 @@ if __name__ == "__main__":
         args.fps,
         args.camera_poses,
         args.render_profile,
-        args.capture_order,
     )
     job.diagnostic_source = not accepted
     job.worker_id = args.worker_id

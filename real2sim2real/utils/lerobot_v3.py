@@ -317,9 +317,8 @@ def capture_viewport_frame(
     width: int,
     height: int,
     camera_prim: str | None = None,
-    camera_sequence: bool = False,
 ) -> None:
-    """Capture without physics steps; camera_sequence reuses an already warmed fixed view."""
+    """Capture the current USD pose without physics steps; wait for file completion."""
     import asyncio
 
     import omni.usd
@@ -367,23 +366,15 @@ def capture_viewport_frame(
 
     try:
         for _attempt in range(3):
-            continuing_sequence = (
-                controlled
-                and camera_sequence
-                and previous_control
-                and not changed_view
-                and not _attempt
-            )
             # Flush USD camera/material updates before locking accumulation. Doing
             # this after locking can retain an empty or previous-camera frame.
-            if controlled and not continuing_sequence:
+            if controlled:
                 settings.set_bool(history_control, False)
-            if changed_view or _attempt or (controlled and not continuing_sequence):
+            if changed_view or _attempt or controlled:
                 omni.usd.get_context().reset_renderer_accumulation()
             subframes = max(2, world.config.rt_subframes)
             if controlled:
-                if not continuing_sequence:
-                    wait_rendered_frames(max(8, subframes))
+                wait_rendered_frames(max(8, subframes))
                 settings.set_bool(history_control, True)
                 counter = int(settings.get("/rtx/externalFrameCounter") or 0) + 1
                 settings.set_int("/rtx/externalFrameCounter", counter)
