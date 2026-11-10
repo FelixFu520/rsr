@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-from pydantic import Field, field_validator
+from pydantic import Field, FiniteFloat, field_validator
 
 from real2sim2real.scene.scene_package import PackageScene, PackageSceneConfig
 from real2sim2real.utils.asset_utils import prim_aabb
@@ -25,9 +25,11 @@ class SortingSceneConfig(PackageSceneConfig):
     outfeed_path: str = "ConveyorBelt_A06/Belt"
     target_xy: list[float] = Field(default_factory=lambda: [0.55, -1.0])
     garment_mass_kg: float = Field(default=0.2, gt=0, allow_inf_nan=False)
+    bag_mass_kg: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     initial_clearance_m: float = Field(default=0.002, ge=0)
     support_depth_m: float = Field(default=0.04, gt=0)
     outfeed_target_xy: tuple[float, float] = (-0.55, -0.876)
+    platform_target_xy: tuple[FiniteFloat, FiniteFloat] | None = None
     label_uv_bounds: tuple[float, float, float, float] = (0.20, 0.44, 0.66, 0.65)
 
     @field_validator("label_uv_bounds")
@@ -84,13 +86,18 @@ class SortingScene(PackageScene):
         self.refresh_poses()
 
     def _arrange_cloth(self) -> None:
-        """Scale only garment masses, preserving geometry and relative mass distribution."""
+        """Apply declared masses without changing either surface or its relative mass weights."""
         super()._arrange_cloth()
-        garment = next(part for part in self.package_parts if part["name"] == "Garment")
-        self.authored_garment_mass_kg = float(garment["masses"].sum())
-        self.garment_mass_scale = self.config.garment_mass_kg / self.authored_garment_mass_kg
-        garment["masses"] = garment["masses"] * self.garment_mass_scale
-        garment["mesh"].GetPrim().GetAttribute("physics:masses").Set(garment["masses"].tolist())
+        for part in self.package_parts:
+            name = part["name"].lower()
+            authored = float(part["masses"].sum())
+            target = getattr(self.config, f"{name}_mass_kg")
+            scale = target / authored if target is not None else 1.0
+            setattr(self, f"authored_{name}_mass_kg", authored)
+            setattr(self, f"{name}_mass_scale", scale)
+            if target is not None:
+                part["masses"] = part["masses"] * scale
+                part["mesh"].GetPrim().GetAttribute("physics:masses").Set(part["masses"].tolist())
 
     def _cache_label_triangles(self) -> None:
         """Use the visible V7 photograph's label UV rectangle as an orientation marker."""

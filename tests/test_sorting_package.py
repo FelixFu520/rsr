@@ -16,8 +16,214 @@ from real2sim2real.utils.lerobot_v3 import LeRobotV3Recorder
 from real2sim2real.utils.sorting_quality import aligned_shape_rms, audit_held_shape
 
 
+def test_surface_distance_pruning_matches_all_triangles_including_degenerate_faces():
+    from real2sim2real.utils.package_geometry import _surface_distance, _surface_distance_dense
+
+    rng = np.random.default_rng(42)
+    triangles = rng.normal(size=(256, 3, 3))
+    triangles[:4, 1:] = triangles[:4, :1]
+    points = rng.normal(size=(256, 3))
+    np.testing.assert_allclose(
+        _surface_distance(points, triangles),
+        _surface_distance_dense(points, triangles),
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+
+def test_surface_distance_does_not_discard_a_large_face_with_a_remote_centroid():
+    from real2sim2real.utils.package_geometry import _surface_distance, _surface_distance_dense
+
+    rng = np.random.default_rng(7)
+    small = rng.normal(size=(256, 3, 3)) * 0.01 + [0, 0, 0.1]
+    large = np.array([[[-100, -100, 0], [100, -100, 0], [0, 100, 0]]])
+    triangles = np.concatenate([small, large])
+    points = np.c_[rng.uniform(-0.01, 0.01, (256, 2)), np.full(256, 0.005)]
+    np.testing.assert_allclose(_surface_distance(points, triangles), 0.005, atol=1e-12)
+    np.testing.assert_allclose(
+        _surface_distance(points, triangles),
+        _surface_distance_dense(points, triangles),
+        atol=1e-12,
+    )
+
+
+def test_fixed_robot_root_contacts_count_as_robot_and_supports_do_not():
+    from types import SimpleNamespace
+
+    from real2sim2real.planner.planner_sorting import _robot_contact_count
+
+    runtime = SimpleNamespace(
+        last_active_contact_shapes=np.array([8, 25, 25, 44, 45, 46]),
+        last_active_contact_bodies=np.array([5, -1, -1, -1, -1, 26]),
+        robot_shape_count=44,
+        robot_body_count=26,
+    )
+    assert _robot_contact_count(runtime) == 3
+
+
+def test_fixed_root_clearance_includes_particle_radius_and_shape_margin():
+    from real2sim2real.utils.sorting_quality import audit_fixed_robot_clearance, unit_box_mesh
+
+    box, triangles = unit_box_mesh()
+    collider = dict(shape_id=0, vertices=box, triangles=triangles)
+    probes = np.array([[1.0005, 0, 0], [1.0005, 0.1, 0], [1.0005, 0, 0.1]])
+    result = audit_fixed_robot_clearance(
+        probes, np.array([[0, 1, 2]]), [collider], 0.0005, np.array([0.0001])
+    )
+    assert not result["passed"]
+    probes[:, 0] += 0.001
+    assert audit_fixed_robot_clearance(
+        probes, np.array([[0, 1, 2]]), [collider], 0.0005, np.array([0.0001])
+    )["passed"]
+
+
+def test_diagnostic_cache_writes_native_substeps_from_runtime_frequency(tmp_path):
+    from types import SimpleNamespace
+
+    from real2sim2real.planner.planner_sorting import SortingPlanner, SortingPlannerConfig
+
+    planner = object.__new__(SortingPlanner)
+    planner.config = SortingPlannerConfig(mujoco_substeps_per_vbd_step=4)
+    planner.robot = SimpleNamespace(
+        sim_world=SimpleNamespace(config=SimpleNamespace(physics_dt=1 / 60)),
+        mimic={"left": [(0, 1), (1, -1)], "right": [(2, 1), (3, -1)]},
+        gripper_indices={"left": 0, "right": 2},
+    )
+    array = SimpleNamespace(numpy=lambda: np.array([0.5, 1.4]))
+    residuals = np.arange(128 * 4).reshape(128, 4) * 1e-8
+    planner.runtime = SimpleNamespace(
+        config=SimpleNamespace(newton_substeps=32),
+        jaw_colliders=[],
+        _masses=np.ones(3),
+        model=SimpleNamespace(
+            shape_material_mu=array,
+            shape_body=array,
+            soft_contact_mu=1.4,
+            particle_radius=array,
+            shape_margin=array,
+        ),
+        belt_body=1,
+        platform_shape=0,
+        robot_shape_count=1,
+        fixed_robot_colliders=[
+            dict(shape_id=0, vertices=np.eye(3), triangles=np.array([[0, 1, 2]]))
+        ],
+        native_mimic_residuals=[residuals],
+    )
+    planner.scene = SimpleNamespace(
+        triangle_indices=np.array([[0, 1, 2]]),
+        garment_count=2,
+        supports={"infeed": np.zeros((2, 3))},
+        label_triangles=np.array([[0, 1, 2]]),
+    )
+    planner.rest = np.zeros((3, 3))
+    planner.samples = [planner.rest, planner.rest + 0.01]
+    planner.sample_times = [0.0, 1 / 60]
+    planner.checkpoint_times = [0.0]
+    planner.joints = planner.actions = np.zeros((2, 16))
+    planner.hand_poses = planner.body_samples = np.zeros((2, 2, 7))
+    planner.articulation_samples = np.zeros((2, 4))
+    planner.transfer_samples = []
+    planner.transfer_groups = {"left": [], "right": []}
+    planner.write_diagnostics(tmp_path)
+    with np.load(tmp_path / "particles.npz") as saved:
+        np.testing.assert_array_equal(saved["native_mimic_residuals"], residuals)
+        assert saved["native_mimic_dt_s"] == pytest.approx(1 / 7680)
+        assert saved["platform_shape"] == 0
+        assert saved["robot_shape_count"] == 1
+        np.testing.assert_array_equal(saved["fixed_robot_shape_ids"], [0])
+        np.testing.assert_array_equal(saved["fixed_robot_vertices_0"], np.eye(3))
+        np.testing.assert_array_equal(saved["particle_radius"], array.numpy())
+        np.testing.assert_array_equal(saved["times"], planner.sample_times)
+
+
+def test_live_regrasp_uses_the_deformed_central_surface_and_preserves_floor_clearance():
+    from real2sim2real.planner.planner_sorting import SortingPlannerConfig, _regrasp_pad_bottom
+
+    # A layered parcel left arched after release needs a higher regrasp than its spawn plane.
+    xy = np.array([[x, y] for x in (-0.02, 0, 0.02) for y in (-0.02, 0, 0.02)])
+    garment = np.concatenate([np.c_[xy, np.full(len(xy), z)] for z in (1.82, 1.87, 1.90)])
+    raised = _regrasp_pad_bottom(garment, np.zeros(2), 1.8, 0.03, 0.02)
+    assert raised == pytest.approx(0.08)
+    flattened = garment.copy()
+    flattened[:, 2] -= 0.075
+    assert _regrasp_pad_bottom(flattened, np.zeros(2), 1.8, 0.03, 0.02) == 0.03
+    # Remote high folds must not raise a grasp elsewhere on the parcel.
+    remote = np.array([[0.2, 0.2, 2.2]])
+    assert _regrasp_pad_bottom(np.r_[garment, remote], np.zeros(2), 1.8, 0.03, 0.02) == raised
+    with pytest.raises(ValueError, match="No live garment surface"):
+        _regrasp_pad_bottom(remote, np.zeros(2), 1.8, 0.03, 0.02)
+    with pytest.raises(ValueError, match="pad-bottom calibration"):
+        SortingPlannerConfig(regrasp_surface_indent_m=0.02)
+    with pytest.raises(ValueError, match="minimum surface indentation"):
+        SortingPlannerConfig(regrasp_surface_indent_fraction=0.3)
+
+
+@pytest.mark.parametrize("height, expected", [(0.114, 0.0798), (0.0714, 0.04998), (0.04, 0.02)])
+def test_relative_regrasp_depth_adapts_to_handoff_height_with_minimum_indentation(height, expected):
+    from real2sim2real.planner.planner_sorting import _regrasp_pad_bottom
+
+    xy = np.array([[x, y] for x in (-0.02, 0, 0.02) for y in (-0.02, 0, 0.02)])
+    garment = np.concatenate([np.c_[xy, np.full(len(xy), 1.8 + z)] for z in (0.002, height)])
+    assert _regrasp_pad_bottom(garment, np.zeros(2), 1.8, 0.015, 0.02, 0.3) == pytest.approx(
+        expected
+    )
+
+
+@pytest.mark.parametrize("regrasp", [None, (0.0, 0.055)])
+@pytest.mark.parametrize("platform_target", [None, (0.0, -0.94)])
+def test_right_grasp_offset_preserves_left_pick_and_screens_offset_destination(
+    regrasp, platform_target
+):
+    from types import SimpleNamespace
+
+    from real2sim2real.planner.planner_sorting import SortingPlanner, SortingPlannerConfig
+
+    calls = []
+
+    def prepare(side, target, waypoints):
+        calls.append((side, target.copy(), np.array(waypoints)))
+        return 0.0
+
+    planner = object.__new__(SortingPlanner)
+    planner.config = SortingPlannerConfig(
+        grasp_offset_xy_m=(0.01, 0.02), regrasp_offset_xy_m=regrasp
+    )
+    planner.runtime = SimpleNamespace(
+        tcp_position=lambda side: np.array([0.4, -0.8, 2.2]),
+        prepare_approach=prepare,
+        parking_positions={"left": np.array([0.55, -0.9, 2.03]), "right": np.zeros(3)},
+    )
+    bounds = (np.array([-0.3, -1.1, 1.76]), np.array([0.3, -0.6, 1.8]))
+    planner.scene = SimpleNamespace(
+        supports={name: bounds for name in ("infeed", "platform", "outfeed")},
+        config=SimpleNamespace(
+            outfeed_target_xy=(-0.55, -0.876), platform_target_xy=platform_target
+        ),
+    )
+    planner.schedule = [(side, "approach", 3.0) for side in ("left", "right")]
+    planner.checkpoint_times, planner.elapsed = [], 0.0
+    planner.command_side = planner.command_tcp = None
+    planner.max_tcp_error = 0.0
+    planner.legs = {"left": {}, "right": {}}
+    coms = np.array([[0.1, -0.8, 1.84], [0.1, -0.8, 1.84]])
+    planner._enter(0, coms)
+    np.testing.assert_allclose(planner.pick[:2], [0.11, -0.78])
+    np.testing.assert_allclose(
+        planner.goal[:2], [0.0, -0.85] if platform_target is None else platform_target
+    )
+    planner._enter(1, coms)
+    right_offset = np.array(regrasp if regrasp is not None else [0.01, 0.02])
+    np.testing.assert_allclose(planner.pick[:2], coms[0, :2] + right_offset)
+    np.testing.assert_allclose(calls[1][1][:2], planner.pick[:2])
+    np.testing.assert_allclose(calls[1][2][4, :2], [-0.55, -0.876] + right_offset)
+    with pytest.raises(ValueError):
+        SortingPlannerConfig(regrasp_offset_xy_m=(float("nan"), 0))
+
+
 @pytest.mark.parametrize("target", [None, 0.0, 2.0])
-def test_pair_friction_changes_only_native_fingers_and_preserves_supports(target):
+@pytest.mark.parametrize("platform", [None, 0.1])
+def test_pair_friction_changes_only_declared_roles_and_preserves_belts(target, platform):
     from types import SimpleNamespace
 
     from real2sim2real.planner.planner_sorting import SortingPlannerConfig
@@ -34,25 +240,34 @@ def test_pair_friction_changes_only_native_fingers_and_preserves_supports(target
             self.values = values.copy()
 
     runtime = object.__new__(SortingRuntime)
-    runtime.config = SortingPlannerConfig(gripper_package_friction=target)
+    runtime.config = SortingPlannerConfig(
+        gripper_package_friction=target, platform_friction=platform
+    )
     runtime.contact_body_ids = dict(left_0=1, left_1=2, right_0=3, right_1=4)
     runtime.belt_body, runtime.belt_shape = 5, 6
-    original = np.array([0.5, 1.4, 1.4, 1.4, 1.4, 1.4, 0.5, 1.4])
+    runtime.platform_shape = 0
+    original = np.array([0.5, 1.4, 1.4, 1.4, 1.4, 1.4, 0.5, 0.5])
     runtime.model = SimpleNamespace(
-        shape_body=Array([-1, 0, 1, 2, 3, 4, 5, 6]),
+        shape_body=Array([-1, 0, 1, 2, 3, 4, 5, -1]),
         shape_material_mu=Array(original),
         soft_contact_mu=1.4,
     )
     runtime._configure_contact_friction()
     actual = runtime.model.shape_material_mu.numpy()
-    np.testing.assert_array_equal(actual[[0, 1, 6, 7]], original[[0, 1, 6, 7]])
+    np.testing.assert_array_equal(actual[[1, 6, 7]], original[[1, 6, 7]])
+    assert actual[0] == (0.5 if platform is None else platform)
     expected = 1.4 if target is None else target
     np.testing.assert_allclose(np.sqrt(1.4 * actual[2:6]), expected)
     assert runtime.model.soft_contact_mu == 1.4
     np.testing.assert_allclose(runtime.contact_friction["effective_gripper_package_mu"], [expected])
     np.testing.assert_allclose(
-        runtime.contact_friction["effective_support_package_mu"], [np.sqrt(0.7)]
+        runtime.contact_friction["effective_support_package_mu"],
+        np.unique(np.sqrt(1.4 * np.array([0.5, actual[0]]))),
     )
+    assert runtime.contact_friction["platform_material_mu"] == actual[0]
+    for invalid in (-0.1, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            SortingPlannerConfig(platform_friction=invalid)
     with pytest.raises(ValueError):
         SortingPlannerConfig(gripper_package_friction=2, cloth_friction=0)
     for invalid in (-1, float("nan"), float("inf")):
@@ -83,6 +298,20 @@ def test_strain_grip_opens_with_bounded_relief_and_recovers_slowly():
     assert restorative.command(0.66, 1.235, 0.2) == pytest.approx(0.65)
     assert restorative.command(0.66, 1.21, 0.2) == pytest.approx(0.655)
     assert restorative.command(0.66, 1.28, 0.1) == pytest.approx(0.65)
+
+
+def test_strain_relief_preserves_the_acquired_grip_during_lift_ramp():
+    from real2sim2real.planner.planner_sorting import StrainGripController
+
+    controller = StrainGripController(1.2, 0.01, 0.05)
+    commands = [
+        controller.command(nominal, 1.25, 1 / 60, minimum_rad=0.64)
+        for nominal in np.linspace(0.64, 0.68, 120)
+    ]
+    assert commands[0] == 0.64
+    assert min(commands) >= 0.64
+    assert commands[-1] == pytest.approx(0.67)
+    assert controller.peak_relief_rad == pytest.approx(0.01)
 
 
 def test_sorting_mass_override_preserves_bag_geometry_and_original_asset(monkeypatch):
@@ -116,6 +345,17 @@ def test_sorting_mass_override_preserves_bag_geometry_and_original_asset(monkeyp
     for invalid in (0, -0.1, float("nan"), float("inf")):
         with pytest.raises(ValueError):
             SortingSceneConfig(garment_mass_kg=invalid)
+        with pytest.raises(ValueError):
+            SortingSceneConfig(bag_mass_kg=invalid)
+    parts[0]["masses"] = garment.copy()
+    parts[1].update(masses=bag.copy(), mesh=mesh)
+    scene.config = SortingSceneConfig(garment_mass_kg=0.05, bag_mass_kg=float(bag.sum()) * 0.25)
+    scene._arrange_cloth()
+    np.testing.assert_allclose(parts[0]["masses"], garment * 0.25)
+    np.testing.assert_allclose(parts[1]["masses"], bag * 0.25)
+    np.testing.assert_array_equal(scene.cloth_vertices, geometry)
+    np.testing.assert_array_equal(bag, [0.004, 0.006, 0.010542])
+    assert scene.bag_mass_scale == pytest.approx(0.25)
 
 
 @pytest.mark.skipif(
@@ -162,23 +402,31 @@ def _check_real_usd_mass(monkeypatch):
     path = Path("assets/PhysicSolver/Package/v7_sorting/parcel_two_mesh.usd")
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     scenes = []
-    for target in (0.2, 0.1):
-        scene = SortingScene(SortingSceneConfig(garment_mass_kg=target))
+    for target in (0.2, 0.1, 0.05):
+        bag_target = (
+            float(scenes[0].package_parts[1]["masses"].sum()) * 0.25 if target == 0.05 else None
+        )
+        scene = SortingScene(SortingSceneConfig(garment_mass_kg=target, bag_mass_kg=bag_target))
         scene.sim_world = SimpleNamespace(stage=Usd.Stage.CreateInMemory())
         scene.table_top_z = 1.78
         monkeypatch.setattr(scene, "refresh_poses", lambda: None)
         scene._arrange_cloth()
         scenes.append(scene)
-    original, lighter = scenes
-    np.testing.assert_array_equal(original.cloth_vertices, lighter.cloth_vertices)
-    np.testing.assert_array_equal(original.triangle_indices, lighter.triangle_indices)
-    np.testing.assert_array_equal(original.loft_springs, lighter.loft_springs)
-    for before, after in zip(original.package_parts, lighter.package_parts, strict=True):
-        scale = 0.5 if after["name"] == "Garment" else 1
-        np.testing.assert_allclose(after["masses"], before["masses"] * scale)
-        np.testing.assert_allclose(
-            after["mesh"].GetPrim().GetAttribute("physics:masses").Get(), after["masses"], rtol=1e-6
-        )
+    original = scenes[0]
+    for lighter in scenes[1:]:
+        np.testing.assert_array_equal(original.cloth_vertices, lighter.cloth_vertices)
+        np.testing.assert_array_equal(original.triangle_indices, lighter.triangle_indices)
+        np.testing.assert_array_equal(original.loft_springs, lighter.loft_springs)
+        for before, after in zip(original.package_parts, lighter.package_parts, strict=True):
+            target_mass = getattr(lighter.config, f"{after['name'].lower()}_mass_kg")
+            scale = target_mass / before["masses"].sum() if target_mass is not None else 1
+            np.testing.assert_allclose(after["masses"], before["masses"] * scale)
+            np.testing.assert_allclose(
+                after["mesh"].GetPrim().GetAttribute("physics:masses").Get(),
+                after["masses"],
+                rtol=1e-6,
+            )
+            assert np.all(after["masses"] > 0)
     assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
 
 
@@ -272,6 +520,36 @@ def test_cartesian_phases_preserve_commanded_pose_instead_of_accumulating_tracki
     np.testing.assert_array_equal(planner.start_tcp, measured)
 
 
+def test_release_lowering_preserves_command_continuity_into_retraction():
+    from types import SimpleNamespace
+
+    from real2sim2real.planner.planner_sorting import SortingPlanner, SortingPlannerConfig
+
+    planner = object.__new__(SortingPlanner)
+    planner.config = SortingPlannerConfig(place_height_m=0.13, release_lowering_m=0.064)
+    command = np.array([0.0, -0.9, 1.93])
+    planner.runtime = SimpleNamespace(
+        tcp_position=lambda side: command + [0.001, 0, -0.002],
+        target_q=np.array([0.675]),
+    )
+    planner.robot = SimpleNamespace(gripper_indices={"left": 0})
+    planner.legs = {"left": {}}
+    planner.schedule = [("left", "release", 3), ("left", "retract", 1.5)]
+    planner.command_tcp, planner.command_side = command.copy(), "left"
+    planner.checkpoint_times, planner.elapsed = [], 0.0
+    coms = np.array([[0.0, -0.9, 1.84], [0.0, -0.9, 1.84]])
+    planner._enter(0, coms)
+    np.testing.assert_array_equal(planner.start_tcp, command)
+    np.testing.assert_allclose(planner.target, command - [0, 0, 0.064])
+    planner.command_tcp = planner.target.copy()
+    planner._enter(1, coms)
+    np.testing.assert_allclose(planner.start_tcp, command - [0, 0, 0.064])
+    np.testing.assert_allclose(planner.target, command + [0, 0, 0.116])
+    for invalid in (-0.01, 0.13, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            SortingPlannerConfig(place_height_m=0.13, release_lowering_m=invalid)
+
+
 def test_grasp_offset_moves_the_pick_and_screened_tcp_path_but_keeps_the_com_destination():
     from types import SimpleNamespace
 
@@ -294,7 +572,8 @@ def test_grasp_offset_moves_the_pick_and_screened_tcp_path_but_keeps_the_com_des
         supports={
             "infeed": (np.array([0.3, -2.0, 1.74]), np.array([1.2, 0, 1.78])),
             "platform": (np.array([-0.35, -1.176, 1.76]), np.array([0.35, -0.576, 1.80])),
-        }
+        },
+        config=SimpleNamespace(platform_target_xy=None),
     )
     planner.schedule = [("left", "approach", 3), ("left", "transfer", 6)]
     planner.command_tcp, planner.command_side = None, None
@@ -547,6 +826,56 @@ def test_replay_uses_exact_physics_times_and_excludes_the_terminal_sample():
         replay_indices(np.array([0.0, 0.2, 0.1]), 15)
 
 
+def test_workflow_gap_policy_retains_grasp_and_original_shape_failures():
+    from real2sim2real.utils.sorting_quality import without_bag_gap_checks
+
+    checks = dict(
+        sequence_completed=True,
+        left_bilateral_transfer=True,
+        held_shape_rms_bounded=True,
+        held_bag_gap_bounded=False,
+        held_original_sampling_bounded=False,
+    )
+    shape = dict(
+        maximum_shape_rms_m=0.037413,
+        samples=[dict(reference_aligned_garment_shape_rms_m=0.03)],
+    )
+    assert all(without_bag_gap_checks(checks, shape).values())
+    assert checks["held_bag_gap_bounded"] is False
+    checks["left_bilateral_transfer"] = False
+    assert not all(without_bag_gap_checks(checks, shape).values())
+    checks["left_bilateral_transfer"] = True
+    shape["samples"][0]["reference_aligned_garment_shape_rms_m"] = 0.04
+    assert not without_bag_gap_checks(checks, shape)["held_original_shape_rms_bounded"]
+    checks["held_shape_rms_bounded"] = False
+    assert not without_bag_gap_checks(checks, shape)["held_shape_rms_bounded"]
+
+
+def test_replay_optical_overrides_reject_nonoptical_fields_and_preserve_source():
+    from scripts.render_sorting_package import override_camera_poses
+
+    source = {
+        "scene": {"cameras": [], "garment_mass_kg": 0.05},
+        "robot": {
+            "cameras": [{"name": "left_wrist", "pose": {"position": [0, 0, 0]}}],
+            "usd_path": "native.usda",
+        },
+        "planner": {"gripper_package_friction": 2.0},
+    }
+    updated = override_camera_poses(source, {"left_wrist": {"position": [0.22, 0, 0.1]}})
+    assert source["robot"]["cameras"][0]["pose"]["position"] == [0, 0, 0]
+    assert updated["scene"] == source["scene"]
+    assert updated["planner"] == source["planner"]
+    assert updated["robot"]["usd_path"] == source["robot"]["usd_path"]
+    assert updated["robot"]["cameras"][0]["pose"]["position"] == [0.22, 0, 0.1]
+    with pytest.raises(ValueError, match="Unknown replay cameras"):
+        override_camera_poses(source, {"not_a_camera": {}})
+    with pytest.raises(ValueError):
+        override_camera_poses(source, {"left_wrist": {"usd_path": "modified.usda"}})
+    with pytest.raises(ValueError):
+        override_camera_poses(source, {"left_wrist": {"position": [float("nan"), 0, 0]}})
+
+
 def test_sorting_ik_honors_the_configured_closing_direction():
     from real2sim2real.planner.planner_sorting import SortingPlannerConfig
     from real2sim2real.planner.sorting_runtime import SortingRuntime
@@ -651,9 +980,10 @@ def test_native_mimics_are_not_duplicated_and_closed_fingers_clear_the_support()
 
     usd = next(Path("app/extscache").glob("omni.usd.libs-*/pxr/Gf")).parent.parent.resolve()
     newton = Path("app/exts/isaacsim.pip.newton/pip_prebundle").resolve()
+    warp_sdk = next(Path("app/extscache").glob("omni.warp.core-*/warp")).parent.resolve()
     environment = os.environ.copy()
     environment["PYTHONPATH"] = os.pathsep.join(
-        [str(newton), str(usd), environment.get("PYTHONPATH", "")]
+        [str(newton), str(warp_sdk), str(usd), environment.get("PYTHONPATH", "")]
     )
     environment["LD_LIBRARY_PATH"] = (
         str(usd / "bin") + os.pathsep + environment.get("LD_LIBRARY_PATH", "")
@@ -661,6 +991,7 @@ def test_native_mimics_are_not_duplicated_and_closed_fingers_clear_the_support()
     code = """
 import numpy as np
 import newton,warp as wp
+wp.set_device('cpu')
 from newton.solvers import SolverMuJoCo
 from real2sim2real.robot.robot_sorting import SortingRobot
 from real2sim2real.planner.sorting_kinematics import SortingArmIK
@@ -759,11 +1090,14 @@ for angle in [.2825,.6425,.6752]:
 assert runtime.pad_bottom_tcp_height('left',.28,.03)<runtime.pad_bottom_tcp_height('left',.64,.03)
 robot.sim_world=SimpleNamespace(config=SimpleNamespace(physics_dt=1/60))
 histories=[]
-for batched in (False,True):
+for batched,soft_steps,rigid_steps in (
+    (False,32,1),(True,32,1),(True,8,4),(True,32,4),(True,64,2)
+):
     runtime=object.__new__(SortingRuntime)
     runtime.model=model;runtime.robot=robot;runtime.wp=wp
     runtime.belt_speed=0.0
-    runtime.config=SimpleNamespace(newton_substeps=32,mujoco_cpu=True,
+    runtime.config=SimpleNamespace(newton_substeps=soft_steps,mujoco_cpu=True,
+        mujoco_substeps_per_vbd_step=rigid_steps,
         mujoco_control_per_frame=batched,mujoco_iterations=100,
         mimic_time_constant_s=.0015,mimic_impedance=.999,newton_use_cuda_graph=False)
     runtime.state_0=model.state();runtime.state_1=model.state()
@@ -779,9 +1113,16 @@ for batched in (False,True):
         target[robot.arm_indices['left']]+=0.01*(frame+1)
         runtime.control.joint_target_q.assign(target)
         runtime._advance_direct(1/60)
+    if batched:
+        residuals=np.concatenate(runtime.native_mimic_residuals)
+        assert residuals.shape==(3*soft_steps*rigid_steps,12)
+        assert runtime.maximum_native_mimic_error==np.max(abs(residuals))
     histories.append(history)
 assert len(histories[0])==96
 np.testing.assert_allclose(histories[0],histories[1],atol=1e-9,rtol=0)
+assert len(histories[2])==24
+np.testing.assert_allclose(histories[1][3::4],histories[2],atol=1e-9,rtol=0)
+np.testing.assert_allclose(histories[3],histories[4][1::2],atol=1e-9,rtol=0)
 
 # Only the original robot geometry is allowed, including its native pads.
 from real2sim2real.robot.robot_sorting import SortingRobotConfig

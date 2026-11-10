@@ -29,7 +29,7 @@ def _inside(points: np.ndarray, triangles: np.ndarray) -> np.ndarray:
     return np.concatenate(result)
 
 
-def _surface_distance(points: np.ndarray, triangles: np.ndarray) -> np.ndarray:
+def _surface_distance_dense(points: np.ndarray, triangles: np.ndarray) -> np.ndarray:
     a, b, c = triangles[:, 0], triangles[:, 1], triangles[:, 2]
     ab, ac = b - a, c - a
     aa, bb, cc = (ab * ab).sum(1), (ab * ac).sum(1), (ac * ac).sum(1)
@@ -51,6 +51,49 @@ def _surface_distance(points: np.ndarray, triangles: np.ndarray) -> np.ndarray:
             distance = np.minimum(distance, (residual * residual).sum(2))
         result.append(np.sqrt(distance.min(1)))
     return np.concatenate(result)
+
+
+def _surface_distance(points: np.ndarray, triangles: np.ndarray) -> np.ndarray:
+    """Exact triangle distances with conservative AABB pruning for large probe sets."""
+    if len(points) * len(triangles) <= 32768 or len(triangles) <= 32:
+        return _surface_distance_dense(points, triangles)
+    lower, upper = triangles.min(1), triangles.max(1)
+    centres = (lower + upper) / 2
+
+    def build(indices: np.ndarray) -> tuple:
+        low, high = lower[indices].min(0), upper[indices].max(0)
+        if len(indices) <= 32:
+            return low, high, indices, None, None
+        axis = int(np.ptp(centres[indices], axis=0).argmax())
+        middle = len(indices) // 2
+        ordered = indices[np.argpartition(centres[indices, axis], middle)]
+        return low, high, None, build(ordered[:middle]), build(ordered[middle:])
+
+    def bound(node: tuple, indices: np.ndarray) -> np.ndarray:
+        delta = np.maximum(np.maximum(node[0] - points[indices], points[indices] - node[1]), 0)
+        return np.sum(delta * delta, axis=1)
+
+    best = np.full(len(points), np.inf)
+
+    def visit(node: tuple, indices: np.ndarray) -> None:
+        indices = indices[bound(node, indices) <= best[indices] ** 2]
+        if not len(indices):
+            return
+        if node[2] is not None:
+            best[indices] = np.minimum(
+                best[indices], _surface_distance_dense(points[indices], triangles[node[2]])
+            )
+            return
+        left, right = node[3], node[4]
+        first_left = bound(left, indices) <= bound(right, indices)
+        left_points, right_points = indices[first_left], indices[~first_left]
+        visit(left, left_points)
+        visit(right, right_points)
+        visit(right, left_points)
+        visit(left, right_points)
+
+    visit(build(np.arange(len(triangles))), np.arange(len(points)))
+    return best
 
 
 def check_package_containment(

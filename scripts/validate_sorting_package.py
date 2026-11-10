@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import io
 import json
@@ -18,7 +19,12 @@ from PIL import Image, ImageDraw
 from real2sim2real.core.logger import get_logger
 from real2sim2real.utils.asset_utils import resolve_usd_path
 from real2sim2real.utils.package_geometry import check_package_containment
-from real2sim2real.utils.sorting_quality import audit_held_shape, audit_jaw_penetration
+from real2sim2real.utils.sorting_quality import (
+    audit_fixed_robot_clearance,
+    audit_held_shape,
+    audit_jaw_penetration,
+    without_bag_gap_checks,
+)
 from scripts.collect_physic_solver_cases import validate_dataset
 
 
@@ -39,6 +45,23 @@ def audit(output: Path) -> dict:
     ):
         raise ValueError("Rendered trajectory differs from the recorded physical source")
     config = json.loads((run / "configuration.json").read_text())
+    if "source_configuration_sha256" in result:
+        source_config_path = Path(result["source_physics"]) / "configuration.json"
+        if (
+            hashlib.sha256(source_config_path.read_bytes()).hexdigest()
+            != result["source_configuration_sha256"]
+        ):
+            raise ValueError("Source physical configuration changed after recording")
+        expected = copy.deepcopy(json.loads(source_config_path.read_text()))
+        overrides = result.get("observation_camera_pose_overrides", {})
+        observed = set()
+        for section in ("scene", "robot"):
+            for camera in expected[section]["cameras"]:
+                if camera["name"] in overrides:
+                    camera["pose"] = overrides[camera["name"]]
+                    observed.add(camera["name"])
+        if observed != set(overrides) or expected != config:
+            raise ValueError("Replay changed configuration beyond declared optical poses")
     cameras = {
         camera["name"]: tuple(camera["resolution"])
         for section in ("scene", "robot")
@@ -82,6 +105,9 @@ def audit(output: Path) -> dict:
         for name in ("Garment", "Bag")
     }
     expected_garment_mass = config["scene"].get("garment_mass_kg", 0.2)
+    expected_bag_mass = config["scene"].get("bag_mass_kg")
+    if expected_bag_mass is None:
+        expected_bag_mass = float(authored["Bag"].sum())
     mass_distribution_matches = bool(
         n == len(authored["Garment"])
         and len(mass) - n == len(authored["Bag"])
@@ -91,7 +117,12 @@ def audit(output: Path) -> dict:
             rtol=1e-6,
             atol=1e-12,
         )
-        and np.allclose(mass[n:], authored["Bag"], rtol=1e-6, atol=1e-12)
+        and np.allclose(
+            mass[n:],
+            authored["Bag"] * expected_bag_mass / authored["Bag"].sum(),
+            rtol=1e-6,
+            atol=1e-12,
+        )
     )
     if not np.isfinite(x).all() or not np.all(mass > 0) or not np.all(np.diff(times) > 0):
         raise ValueError("Nonfinite particles, fixed vertices or nonmonotonic physical time")
@@ -139,6 +170,10 @@ def audit(output: Path) -> dict:
                 penetration = max(penetration, float(high[2] - vertices[inside, 2].min()))
     planner = config["planner"]
     groups = {side: saved[f"{side}_transfer_indices"].astype(int) for side in ("left", "right")}
+    video_indices = set(indices.tolist())
+    video_transfer_samples = {
+        side: sorted(set(group.tolist()) & video_indices) for side, group in groups.items()
+    }
     shape = audit_held_shape(
         x,
         rest,
@@ -150,13 +185,21 @@ def audit(output: Path) -> dict:
         maximum_bag_gap_m=planner["maximum_bag_gap_m"],
         quality_reference=json.loads(str(saved.get("quality_reference_json", "null"))),
         extra_samples={
-            side: [
+            side: video_transfer_samples[side]
+            + [
                 row["sample_index"]
                 for row in result.get("online_held_shape_samples", [])
                 if row["side"] == side
             ]
             for side in groups
         },
+    )
+    shape["video_transfer_frames_checked"] = {
+        side: len(samples) for side, samples in video_transfer_samples.items()
+    }
+    shape["scope"] = (
+        "All recorded video frames during each transfer, three physical transfer samples, "
+        "and saved online checkpoints; all bag vertices and face centres."
     )
     containment = check_package_containment(
         x, tri, n, times=times, checkpoint_times_s=saved["checkpoint_times_s"].tolist()
@@ -166,7 +209,8 @@ def audit(output: Path) -> dict:
             float(mass[:n].sum()) - config["scene"].get("garment_mass_kg", 0.2)
         )
         < 1e-6,
-        original_bag_and_proportional_garment_masses=mass_distribution_matches,
+        declared_proportional_mesh_masses=mass_distribution_matches,
+        bag_mass_matches_config=abs(float(mass[n:].sum()) - expected_bag_mass) < 1e-6,
         native_robot_structure=config["robot"].get("pad_width_m", 0.03) == 0.03,
         surface_stretch_bounded=maximum_stretch < planner["maximum_edge_stretch"],
         no_collapsed_triangles=minimum_area > planner["minimum_triangle_area_ratio"],
@@ -183,6 +227,13 @@ def audit(output: Path) -> dict:
         fingers = np.isin(body, saved["jaw_body_ids"])
         supports = (body < 0) | (body == int(saved["belt_body"]))
         expected = np.where(supports, planner["table_friction"], planner["shape_contact_friction"])
+        if planner.get("platform_friction") is not None:
+            if "platform_shape" not in saved:
+                raise ValueError("Missing platform collider mapping for declared platform friction")
+            platform_shape = int(saved["platform_shape"])
+            if not 0 <= platform_shape < len(body) or body[platform_shape] >= 0:
+                raise ValueError("Platform friction must identify the static platform collider")
+            expected[platform_shape] = planner["platform_friction"]
         target = planner.get("gripper_package_friction")
         if target is not None:
             expected[fingers] = target**2 / particle_mu if target > 0 else 0
@@ -198,6 +249,11 @@ def audit(output: Path) -> dict:
                 np.sqrt(particle_mu * saved["shape_material_mu"][supports])
             ).tolist(),
         )
+        if planner.get("platform_friction") is not None:
+            friction["platform_material_mu"] = float(saved["shape_material_mu"][platform_shape])
+            friction["effective_platform_package_mu"] = float(
+                np.sqrt(particle_mu * saved["shape_material_mu"][platform_shape])
+            )
     jaws = [
         dict(
             body_id=int(body),
@@ -215,8 +271,34 @@ def audit(output: Path) -> dict:
         saved["articulation_q"][:, mimic[:, 1].astype(int)] * mimic[:, 2]
     )
     checks["mimic_constraints_maintained"] = bool(np.max(np.abs(residual)) < 0.03)
+    native_mimic_audit = None
+    if "native_mimic_residuals" in saved and saved["native_mimic_residuals"].size:
+        native = saved["native_mimic_residuals"]
+        steps = config["sim_world"]["newton_substeps"] * planner.get(
+            "mujoco_substeps_per_vbd_step", 1
+        )
+        expected_dt = config["sim_world"]["physics_dt"] / steps
+        checks["native_substep_mimic_recording_complete"] = bool(
+            native.shape == ((len(times) - 1) * steps, len(mimic))
+            and np.isfinite(native).all()
+            and np.isclose(float(saved["native_mimic_dt_s"]), expected_dt, rtol=1e-9)
+        )
+        checks["native_substep_mimic_constraints_maintained"] = bool(np.max(np.abs(native)) < 0.03)
+        native_mimic_audit = dict(
+            samples=len(native),
+            dt_s=float(saved["native_mimic_dt_s"]),
+            maximum_error_rad=float(np.max(np.abs(native))),
+        )
     rows = [json.loads(line) for line in (run / "trajectory.jsonl").read_text().splitlines()]
     placements = {}
+    fixed_robot = [
+        dict(
+            shape_id=int(shape),
+            vertices=saved[f"fixed_robot_vertices_{i}"],
+            triangles=saved[f"fixed_robot_triangles_{i}"],
+        )
+        for i, shape in enumerate(saved.get("fixed_robot_shape_ids", []))
+    ]
     for side, support_index in (("left", 1), ("right", 2)):
         resting = [row for row in rows if row["phase"] == f"{side}_rest"]
         checks[f"{side}_rest_observed"] = bool(resting)
@@ -228,6 +310,8 @@ def audit(output: Path) -> dict:
         goal = (low + high) / 2
         if side == "right":
             goal[:2] = config["scene"]["outfeed_target_xy"]
+        elif config["scene"].get("platform_target_xy") is not None:
+            goal[:2] = config["scene"]["platform_target_xy"]
         coms = np.array(
             [
                 np.average(vertices[:n], axis=0, weights=mass[:n]),
@@ -240,6 +324,20 @@ def audit(output: Path) -> dict:
         footprint = bool(np.all((vertices[:, :2] >= low[:2]) & (vertices[:, :2] <= high[:2])))
         error = float(np.max(np.linalg.norm(coms[:, :2] - goal[:2], axis=1)))
         height = float(np.max(coms[:, 2] - high[2]))
+        fixed_clearance = (
+            audit_fixed_robot_clearance(
+                vertices,
+                tri,
+                fixed_robot,
+                float(np.max(saved["particle_radius"])),
+                saved["shape_margin"],
+            )
+            if fixed_robot
+            else None
+        )
+        checks[f"{side}_released_from_entire_robot"] = bool(
+            fixed_clearance and fixed_clearance["passed"] and resting[-1]["robot_contacts"] == 0
+        )
         checks[f"{side}_label_up"] = label_up >= planner["label_up_min_cos"]
         checks[f"{side}_destination_support"] = (
             footprint and error <= planner["maximum_place_error_m"] and height < 0.07
@@ -249,6 +347,7 @@ def audit(output: Path) -> dict:
             footprint_supported=footprint,
             maximum_com_xy_error_m=error,
             maximum_com_height_m=height,
+            fixed_robot_clearance=fixed_clearance,
         )
     outfeed_low, outfeed_high = saved["support_bounds"][2]
     final_coms = np.array(
@@ -261,6 +360,9 @@ def audit(output: Path) -> dict:
         x[-1, :, 0].max() < outfeed_low[0]
         and np.all((final_coms[:, 1] >= outfeed_low[1]) & (final_coms[:, 1] <= outfeed_high[1]))
     )
+    strict_checks = checks.copy()
+    if not planner.get("require_bag_gap_quality", True):
+        checks = without_bag_gap_checks(checks, shape)
     if result["success"] and not all(checks.values()):
         raise ValueError(f"Successful label contradicts independent geometry audit: {checks}")
     selected = [0.0]
@@ -348,6 +450,9 @@ def audit(output: Path) -> dict:
     report = dict(
         dataset_validated=True,
         physical_success=result["success"],
+        acceptance_profile=result.get("acceptance_profile", "strict_v7"),
+        workflow_success=result.get("workflow_success", result["success"]),
+        strict_quality_success=result.get("strict_quality_success", result["success"]),
         dataset_use=dataset["dataset_use"],
         video_frames=len(data),
         physics_samples=len(times),
@@ -355,13 +460,18 @@ def audit(output: Path) -> dict:
         garment_mass_kg=float(mass[:n].sum()),
         bag_mass_kg=float(mass[n:].sum()),
         state_action_video_alignment_verified=True,
+        observation_camera_pose_overrides=result.get("observation_camera_pose_overrides", {}),
         independent_geometry_checks=checks,
         independent_geometry_passed=all(checks.values()),
+        strict_independent_geometry_checks=strict_checks,
+        strict_independent_geometry_passed=all(strict_checks.values()),
         maximum_edge_stretch=maximum_stretch,
         minimum_triangle_area_ratio=minimum_area,
         maximum_support_penetration_m=penetration,
         held_shape_audit=shape,
         finger_geometry_audit=finger_geometry,
+        maximum_sampled_mimic_error_rad=float(np.max(np.abs(residual))),
+        native_substep_mimic_audit=native_mimic_audit,
         independent_placements=placements,
         containment=containment,
         failed_checks=[name for name, value in result["checks"].items() if not value],
@@ -369,8 +479,9 @@ def audit(output: Path) -> dict:
         keyframes=str(qa / "keyframes.jpg"),
         synchronized_four_view=str(montage),
         scope=(
-            "Geometry at 60 Hz; containment at phase boundaries; shape/gap at three frames "
-            "per transfer. No continuous-time proof or hardware load certification."
+            "Geometry at 60 Hz; containment at phase boundaries; shape/gap at every recorded "
+            "transfer video frame plus physical checkpoints. No continuous-time proof "
+            "or hardware load certification."
         ),
     )
     (qa / "physical_audit.json").write_text(json.dumps(report, indent=2) + "\n")

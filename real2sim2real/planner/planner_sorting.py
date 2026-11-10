@@ -16,7 +16,11 @@ from real2sim2real.planner.planner_package import PackagePlannerConfig
 from real2sim2real.planner.planner_physic_solver import PickPlaceClothPlanner
 from real2sim2real.planner.sorting_runtime import SortingRuntime
 from real2sim2real.utils.package_geometry import check_package_containment
-from real2sim2real.utils.sorting_quality import audit_held_shape, audit_jaw_penetration
+from real2sim2real.utils.sorting_quality import (
+    audit_held_shape,
+    audit_jaw_penetration,
+    without_bag_gap_checks,
+)
 
 
 def _motion_blend(progress: float, profile: Literal["cubic", "quintic"]) -> float:
@@ -25,6 +29,34 @@ def _motion_blend(progress: float, profile: Literal["cubic", "quintic"]) -> floa
     if profile == "quintic":
         return t**3 * (10 - 15 * t + 6 * t**2)
     return t * t * (3 - 2 * t)
+
+
+def _robot_contact_count(runtime: Any) -> int:
+    """Count authored robot shapes, including fixed-root colliders with body id -1."""
+    shapes = getattr(runtime, "last_active_contact_shapes", None)
+    if shapes is not None:
+        return int(np.count_nonzero((shapes >= 0) & (shapes < runtime.robot_shape_count)))
+    bodies = getattr(runtime, "last_active_contact_bodies", np.empty(0, dtype=int))
+    return int(np.count_nonzero((bodies >= 0) & (bodies < runtime.robot_body_count)))
+
+
+def _regrasp_pad_bottom(
+    garment: np.ndarray,
+    xy: np.ndarray,
+    support_z: float,
+    minimum_m: float,
+    indent_m: float,
+    indent_fraction: float | None = None,
+) -> float:
+    """Choose the pad bottom from the current central garment surface, in support metres."""
+    selected = np.all(np.abs(garment[:, :2] - xy) <= 0.03, axis=1)
+    if not selected.any():
+        raise ValueError("No live garment surface in the regrasp region")
+    surface_z = float(np.quantile(garment[selected, 2], 0.9))
+    surface_height = surface_z - support_z
+    if indent_fraction is not None:
+        indent_m = max(indent_m, surface_height * indent_fraction)
+    return max(minimum_m, surface_height - indent_m)
 
 
 @dataclass
@@ -39,14 +71,17 @@ class StrainGripController:
     relief_rad: float = 0.0
     peak_relief_rad: float = 0.0
 
-    def command(self, nominal_rad: float, stretch: float, dt: float) -> float:
+    def command(
+        self, nominal_rad: float, stretch: float, dt: float, *, minimum_rad: float = 0.0
+    ) -> float:
         """Relieve high strain and restore grip below the configured dead band."""
         if stretch > self.target:
             self.relief_rad += self.rate_rad_s * dt
         elif stretch < self.target - self.hysteresis:
             recovery = self.recovery_rate_rad_s
             self.relief_rad -= (0.1 * self.rate_rad_s if recovery is None else recovery) * dt
-        self.relief_rad = float(np.clip(self.relief_rad, 0, self.maximum_relief_rad))
+        available = min(self.maximum_relief_rad, max(0.0, nominal_rad - minimum_rad))
+        self.relief_rad = float(np.clip(self.relief_rad, 0, available))
         self.peak_relief_rad = max(self.peak_relief_rad, self.relief_rad)
         return max(0.0, nominal_rad - self.relief_rad)
 
@@ -56,9 +91,11 @@ class SortingPlannerConfig(PackagePlannerConfig):
 
     backend: str = "sorting_package"
     gripper_package_friction: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    platform_friction: FiniteFloat | None = Field(default=None, ge=0)
     tcp_orientation_wxyz: tuple[float, float, float, float] = (0, 2**-0.5, 2**-0.5, 0)
     mujoco_cpu: bool = True
     mujoco_control_per_frame: bool = True
+    mujoco_substeps_per_vbd_step: int = Field(default=1, ge=1, le=16)
     mujoco_iterations: int = Field(default=100, gt=0)
     mimic_time_constant_s: float = Field(default=0.0015, gt=0)
     mimic_impedance: float = Field(default=0.999, gt=0, lt=0.9999)
@@ -67,8 +104,12 @@ class SortingPlannerConfig(PackagePlannerConfig):
     hold_gripper_rad: float = Field(default=0.675, gt=0, le=0.7)
     grasp_height_m: float = Field(default=0.048, ge=0, le=0.10)
     grasp_pad_bottom_m: float | None = Field(default=None, ge=0, le=0.08)
+    regrasp_surface_indent_m: float | None = Field(default=None, gt=0, le=0.08, allow_inf_nan=False)
+    regrasp_surface_indent_fraction: FiniteFloat | None = Field(default=None, gt=0, lt=1)
     grasp_offset_xy_m: tuple[FiniteFloat, FiniteFloat] = (0.0, 0.0)
+    regrasp_offset_xy_m: tuple[FiniteFloat, FiniteFloat] | None = None
     place_height_m: float = Field(default=0.20, gt=0)
+    release_lowering_m: float = Field(default=0.0, ge=0, le=0.1, allow_inf_nan=False)
     lift_height_m: float = Field(default=0.25, gt=0)
     belt_speed_mps: float = Field(default=0.35, gt=0)
     belt_transport_s: float = Field(default=6, gt=0)
@@ -77,6 +118,7 @@ class SortingPlannerConfig(PackagePlannerConfig):
     minimum_triangle_area_ratio: float = Field(default=0.03, gt=0, lt=1)
     maximum_shape_rms_m: float = Field(default=0.037413, gt=0)
     maximum_bag_gap_m: float = Field(default=0.01, gt=0)
+    require_bag_gap_quality: bool = True
     early_stop_on_shape_failure: bool = True
     maximum_tcp_error_m: float = Field(default=0.03, gt=0)
     return_s: float = Field(default=2.0, gt=0)
@@ -93,8 +135,21 @@ class SortingPlannerConfig(PackagePlannerConfig):
 
     @model_validator(mode="after")
     def _pair_friction(self) -> SortingPlannerConfig:
+        if self.mujoco_substeps_per_vbd_step > 1 and not (
+            self.mujoco_cpu and self.mujoco_control_per_frame
+        ):
+            raise ValueError("MuJoCo subcycling requires batched native CPU control")
+        if self.regrasp_surface_indent_m is not None and self.grasp_pad_bottom_m is None:
+            raise ValueError("Live regrasp height requires native pad-bottom calibration")
+        if (
+            self.regrasp_surface_indent_fraction is not None
+            and self.regrasp_surface_indent_m is None
+        ):
+            raise ValueError("Relative regrasp depth requires a minimum surface indentation")
         if self.gripper_package_friction and self.cloth_friction <= 0:
             raise ValueError("Positive gripper_package_friction requires nonzero cloth_friction")
+        if self.release_lowering_m >= self.place_height_m:
+            raise ValueError("Release TCP must remain above the destination support")
         return self
 
 
@@ -227,7 +282,10 @@ class SortingPlanner(PickPlaceClothPlanner):
         if not self.config.strain_limited_grip:
             return nominal_rad
         return self.grip_limiters[side].command(
-            nominal_rad, self.instantaneous_stretch, self.robot.sim_world.config.physics_dt
+            nominal_rad,
+            self.instantaneous_stretch,
+            self.robot.sim_world.config.physics_dt,
+            minimum_rad=min(nominal_rad, self.config.closed_gripper_rad),
         )
 
     def _coms(self, vertices: np.ndarray) -> np.ndarray:
@@ -242,7 +300,8 @@ class SortingPlanner(PickPlaceClothPlanner):
     def _grasp_tcp_height(self, side: str, angle: float) -> float:
         if self.config.grasp_pad_bottom_m is None:
             return self.config.grasp_height_m
-        return self.runtime.pad_bottom_tcp_height(side, angle, self.config.grasp_pad_bottom_m)
+        bottom = getattr(self, "_episode_grasp_pad_bottom_m", self.config.grasp_pad_bottom_m)
+        return self.runtime.pad_bottom_tcp_height(side, angle, bottom)
 
     def _measure_held_shape(self, vertices: np.ndarray, side: str) -> None:
         """Retain strict measurements even when a diagnostic run continues past a failure."""
@@ -270,8 +329,13 @@ class SortingPlanner(PickPlaceClothPlanner):
             measurements=held["samples"][0],
             checks=held["checks"],
         )
-        if not all(held["checks"].values()) and self.config.early_stop_on_shape_failure:
-            self.failure_reason = f"{side} held parcel exceeded V7 shape or bag-gap limits"
+        required = (
+            held["checks"]
+            if self.config.require_bag_gap_quality
+            else without_bag_gap_checks(held["checks"], held)
+        )
+        if not all(required.values()) and self.config.early_stop_on_shape_failure:
+            self.failure_reason = f"{side} held parcel exceeded required shape-quality limits"
 
     def _enter(self, index: int, coms: np.ndarray) -> None:
         side, phase, _ = self.schedule[index]
@@ -281,24 +345,60 @@ class SortingPlanner(PickPlaceClothPlanner):
         if phase != "approach" and self.command_side == side and self.command_tcp is not None:
             self.start_tcp = self.command_tcp.copy()
         if phase == "approach":
+            offset = (
+                self.config.regrasp_offset_xy_m
+                if side == "right" and self.config.regrasp_offset_xy_m is not None
+                else self.config.grasp_offset_xy_m
+            )
             self.pick = coms[0].copy()
-            self.pick[:2] += self.config.grasp_offset_xy_m
+            self.pick[:2] += offset
             self.support_z = float(
                 self.scene.supports["infeed" if side == "left" else "platform"][1][2]
             )
+            self._episode_grasp_pad_bottom_m = self.config.grasp_pad_bottom_m
+            if side == "right" and self.config.regrasp_surface_indent_m is not None:
+                self._episode_grasp_pad_bottom_m = _regrasp_pad_bottom(
+                    self.runtime.vertices()[: self.scene.garment_count],
+                    self.pick[:2],
+                    self.support_z,
+                    self.config.grasp_pad_bottom_m,
+                    self.config.regrasp_surface_indent_m,
+                    self.config.regrasp_surface_indent_fraction,
+                )
+                if (
+                    self._grasp_tcp_height(side, self.config.closed_gripper_rad)
+                    + self.config.minimum_lift_m
+                    > self.config.lift_height_m
+                ):
+                    raise ValueError("Live regrasp surface leaves insufficient lift clearance")
+                self.legs[side]["grasp_pad_bottom_m"] = self._episode_grasp_pad_bottom_m
+                get_logger(__name__).info(
+                    "Sorting live regrasp height",
+                    side=side,
+                    pad_bottom_above_support_m=self._episode_grasp_pad_bottom_m,
+                    surface_indent_m=self.config.regrasp_surface_indent_m,
+                    surface_indent_fraction=self.config.regrasp_surface_indent_fraction,
+                )
             self.legs[side]["baseline"] = coms[:, 2].copy()
             low, high = self.scene.supports["platform" if side == "left" else "outfeed"]
             self.destination_bounds = low, high
             self.goal = (low + high) / 2
             if side == "right":
                 self.goal[:2] = self.scene.config.outfeed_target_xy
+            elif (point := getattr(self.scene.config, "platform_target_xy", None)) is not None:
+                if not np.all((np.asarray(point) > low[:2]) & (np.asarray(point) < high[:2])):
+                    raise ValueError("Platform target must be inside the measured support bounds")
+                self.goal[:2] = point
             self.goal[2] = high[2]
         previous_target = getattr(self, "target", self.start_tcp).copy()
         self.target = self.start_tcp.copy()
         if phase == "approach":
-            self.target = np.r_[self.pick[:2], self.support_z + 0.20]
+            approach_height = max(
+                0.20, self._grasp_tcp_height(side, self.config.open_gripper_rad) + 0.10
+            )
+            self.target = np.r_[self.pick[:2], self.support_z + approach_height]
             nominal_goal = self.goal.copy()
-            nominal_goal[:2] += self.config.grasp_offset_xy_m
+            nominal_goal[:2] += offset
             self.max_tcp_error = max(
                 self.max_tcp_error,
                 self.runtime.prepare_approach(
@@ -319,7 +419,24 @@ class SortingPlanner(PickPlaceClothPlanner):
                         np.r_[self.pick[:2], self.support_z + self.config.lift_height_m],
                         np.r_[nominal_goal[:2], self.support_z + self.config.lift_height_m],
                         nominal_goal + [0, 0, self.config.place_height_m],
-                        nominal_goal + [0, 0, self.config.place_height_m + 0.18],
+                        *(
+                            [
+                                nominal_goal
+                                + [
+                                    0,
+                                    0,
+                                    self.config.place_height_m - self.config.release_lowering_m,
+                                ]
+                            ]
+                            if self.config.release_lowering_m > 0
+                            else []
+                        ),
+                        nominal_goal
+                        + [
+                            0,
+                            0,
+                            self.config.place_height_m - self.config.release_lowering_m + 0.18,
+                        ],
                         self.runtime.parking_positions[side],
                     ],
                 ),
@@ -344,6 +461,7 @@ class SortingPlanner(PickPlaceClothPlanner):
             self.target[2] = self.goal[2] + self.config.place_height_m
         elif phase == "release":
             self.legs[side]["release_z"] = coms[:, 2].copy()
+            self.target[2] -= self.config.release_lowering_m
             self.release_start_angle = float(
                 self.runtime.target_q[self.robot.gripper_indices[side]]
             )
@@ -395,6 +513,9 @@ class SortingPlanner(PickPlaceClothPlanner):
             self.max_mimic_error = max(
                 self.max_mimic_error, max(abs(full_q[i] - ratio * master) for i, ratio in pairs)
             )
+        self.max_mimic_error = max(
+            self.max_mimic_error, getattr(self.runtime, "maximum_native_mimic_error", 0.0)
+        )
         if index >= len(self.schedule):
             self.runtime.belt_speed = 0.0
             self.state.update(done=True, phase="done")
@@ -407,6 +528,8 @@ class SortingPlanner(PickPlaceClothPlanner):
             self.failure_reason = "Parcel penetrated a support beyond the fixed tolerance"
         if self.max_finger_geometry_penetration > self.config.maximum_table_penetration_m:
             self.failure_reason = "Parcel penetrated native finger geometry beyond tolerance"
+        if self.max_contact_penetration > self.config.maximum_table_penetration_m:
+            self.failure_reason = "Sampled finger contact penetration exceeded tolerance"
         if index != self._index and self.schedule[index][1] == "transfer":
             previous_side = self.schedule[index][0]
             if not np.all(self.legs[previous_side]["peak_lifts"] >= self.config.minimum_lift_m):
@@ -452,10 +575,7 @@ class SortingPlanner(PickPlaceClothPlanner):
             ),
         )
         bilateral = all(counts.get(f"{side}_{i}", 0) > 0 for i in (0, 1))
-        active_bodies = getattr(self.runtime, "last_active_contact_bodies", np.empty(0, dtype=int))
-        robot_contacts = int(
-            np.count_nonzero((active_bodies >= 0) & (active_bodies < self.runtime.robot_body_count))
-        )
+        robot_contacts = _robot_contact_count(self.runtime)
         if (
             phase == "lift"
             and robot_contacts == 0
@@ -529,6 +649,11 @@ class SortingPlanner(PickPlaceClothPlanner):
             if phase == "close" and self.config.grasp_pad_bottom_m is not None:
                 target = self.start_tcp.copy()
                 target[2] = self.support_z + self._grasp_tcp_height(side, angle)
+                error = self.runtime.command_arm(side, target, angle)
+                self.command_tcp = target.copy()
+                self.command_side = side
+                self.max_tcp_error = max(self.max_tcp_error, error)
+            elif phase == "release" and self.config.release_lowering_m > 0:
                 error = self.runtime.command_arm(side, target, angle)
                 self.command_tcp = target.copy()
                 self.command_side = side
@@ -613,6 +738,13 @@ class SortingPlanner(PickPlaceClothPlanner):
         for index, jaw in enumerate(self.runtime.jaw_colliders):
             collision_data[f"jaw_vertices_{index}"] = jaw["vertices"]
             collision_data[f"jaw_triangles_{index}"] = jaw["triangles"]
+        fixed = getattr(self.runtime, "fixed_robot_colliders", [])
+        for index, collider in enumerate(fixed):
+            collision_data[f"fixed_robot_vertices_{index}"] = collider["vertices"]
+            collision_data[f"fixed_robot_triangles_{index}"] = collider["triangles"]
+        for name in ("particle_radius", "shape_margin"):
+            if hasattr(self.runtime.model, name):
+                collision_data[name] = getattr(self.runtime.model, name).numpy()
         np.savez_compressed(
             directory / "particles.npz",
             positions=np.asarray(self.samples),
@@ -638,11 +770,21 @@ class SortingPlanner(PickPlaceClothPlanner):
             shape_body=self.runtime.model.shape_body.numpy(),
             soft_contact_mu=self.runtime.model.soft_contact_mu,
             belt_body=self.runtime.belt_body,
+            platform_shape=getattr(self.runtime, "platform_shape", -1),
+            robot_shape_count=getattr(self.runtime, "robot_shape_count", 0),
+            fixed_robot_shape_ids=[collider["shape_id"] for collider in fixed],
             mimic_pairs=[
                 (index, self.robot.gripper_indices[side], ratio)
                 for side, pairs in self.robot.mimic.items()
                 for index, ratio in pairs
             ],
+            native_mimic_residuals=np.concatenate(
+                getattr(self.runtime, "native_mimic_residuals", [])
+                or [np.empty((0, sum(len(pairs) for pairs in self.robot.mimic.values())))],
+                axis=0,
+            ),
+            native_mimic_dt_s=self.robot.sim_world.config.physics_dt
+            / (self.runtime.config.newton_substeps * self.config.mujoco_substeps_per_vbd_step),
             **collision_data,
         )
 
@@ -662,6 +804,15 @@ class SortingPlanner(PickPlaceClothPlanner):
             garment_mass_matches_config=abs(
                 float(self.runtime._masses[: self.scene.garment_count].sum())
                 - self.scene.config.garment_mass_kg
+            )
+            < 1e-6,
+            bag_mass_matches_config=abs(
+                float(self.runtime._masses[self.scene.garment_count :].sum())
+                - (
+                    self.scene.config.bag_mass_kg
+                    if self.scene.config.bag_mass_kg is not None
+                    else self.scene.authored_bag_mass_kg
+                )
             )
             < 1e-6,
             no_pinned_vertices=self.runtime.pinned_vertex_count == 0,
@@ -749,12 +900,26 @@ class SortingPlanner(PickPlaceClothPlanner):
                 elif isinstance(value, float) and not np.isfinite(value):
                     legs[side][key] = None
         checks = {key: bool(value) for key, value in checks.items()}
+        strict_checks = checks.copy()
+        workflow_checks = without_bag_gap_checks(strict_checks, shape)
+        if not self.config.require_bag_gap_quality:
+            checks = workflow_checks
         return dict(
             success=all(checks.values()),
+            workflow_success=all(workflow_checks.values()),
+            strict_quality_success=all(strict_checks.values()),
+            acceptance_profile=(
+                "strict_v7" if self.config.require_bag_gap_quality else "workflow_gap_advisory"
+            ),
             checks=checks,
             failed_checks=[key for key, passed in checks.items() if not passed],
+            strict_checks=strict_checks,
+            strict_failed_checks=[key for key, passed in strict_checks.items() if not passed],
             legs=legs,
-            object="V7_two_mesh_package",
+            object=(
+                f"{getattr(self.scene, 'package_parameters', {}).get('version', 'V7')}"
+                "_two_mesh_package"
+            ),
             robot_backend=self.robot.config.backend,
             robot_asset_sha256=hashlib.sha256(
                 Path(self.robot.source_path).read_bytes()
@@ -766,6 +931,13 @@ class SortingPlanner(PickPlaceClothPlanner):
             target_garment_mass_kg=self.scene.config.garment_mass_kg,
             authored_garment_mass_kg=self.scene.authored_garment_mass_kg,
             garment_mass_scale=self.scene.garment_mass_scale,
+            authored_bag_mass_kg=self.scene.authored_bag_mass_kg,
+            target_bag_mass_kg=(
+                self.scene.config.bag_mass_kg
+                if self.scene.config.bag_mass_kg is not None
+                else self.scene.authored_bag_mass_kg
+            ),
+            bag_mass_scale=self.scene.bag_mass_scale,
             contact_friction=self.runtime.contact_friction,
             coupling="one_way_rigid_to_deformable",
             attachments_used=False,

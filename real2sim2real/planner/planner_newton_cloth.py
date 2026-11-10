@@ -171,6 +171,8 @@ class OfficialClothRuntime(NewtonClothRuntime):
         count = min(self.last_contacts, contacts.soft_contact_shape.shape[0])
         if not count:
             self.last_active_contact_bodies = np.empty(0, dtype=int)
+            self.last_active_contact_shapes = np.empty(0, dtype=int)
+            self.last_contact_counts["robot_root"] = 0
             self.last_contact_distances_m = dict.fromkeys(self.contact_body_ids)
             self.last_contact_particle_ids = {
                 name: np.empty(0, dtype=int) for name in ("left", "right")
@@ -196,7 +198,10 @@ class OfficialClothRuntime(NewtonClothRuntime):
             for name, body in self.contact_body_ids.items()
         }
         self.last_active_contact_bodies = bodies[active].copy()
-        self.last_contact_counts["table"] = int(np.count_nonzero(active & (bodies < 0)))
+        self.last_active_contact_shapes = shape_ids[valid][active].copy()
+        root = (bodies < 0) & (shape_ids[valid] < getattr(self, "robot_shape_count", 0))
+        self.last_contact_counts["robot_root"] = int(np.count_nonzero(active & root))
+        self.last_contact_counts["table"] = int(np.count_nonzero(active & (bodies < 0) & ~root))
         self.last_contact_particle_ids = {}
         for name in ("left", "right"):
             ids = indices[active & (bodies == self.contact_body_ids[name])]

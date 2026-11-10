@@ -41,6 +41,7 @@ class PackagePlannerConfig(OfficialClothPlannerConfig):
     place_offset_m: tuple[float, float, float] = (0.0, -0.12, 0.0)
     place_height_m: float = Field(default=0.17, gt=0)
     self_contact_buffer: int = Field(default=512, ge=32)
+    self_contact_gap_m: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     friction_epsilon_m_s: float = Field(default=0.001, gt=0)
     arm_velocity_gain: float = Field(default=3.0, gt=0)
     approach_s: float = Field(default=2.0, gt=0)
@@ -183,7 +184,11 @@ class PackageRuntime(OfficialClothRuntime):
             integrate_with_external_rigid_solver=True,
             particle_enable_self_contact=True,
             particle_self_contact_margin=0.0016,
-            particle_self_contact_gap=self.scene.package_parameters["self_gap"],
+            particle_self_contact_gap=(
+                self.scene.package_parameters["self_gap"]
+                if self.config.self_contact_gap_m is None
+                else self.config.self_contact_gap_m
+            ),
             particle_topological_contact_filter_threshold=2,
             particle_vertex_contact_buffer_size=self.config.self_contact_buffer,
             particle_edge_contact_buffer_size=self.config.self_contact_buffer,

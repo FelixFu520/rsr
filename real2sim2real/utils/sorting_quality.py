@@ -159,6 +159,25 @@ def audit_held_shape(
     )
 
 
+def without_bag_gap_checks(checks: dict, shape_audit: dict) -> dict[str, bool]:
+    """Keep grasp/physics/shape requirements while treating bag clearance as advisory."""
+    selected = {
+        key: bool(value)
+        for key, value in checks.items()
+        if key not in {"held_bag_gap_bounded", "held_original_sampling_bounded"}
+    }
+    if "held_original_sampling_bounded" in checks:
+        selected["held_original_shape_rms_bounded"] = bool(
+            checks["held_shape_rms_bounded"]
+            and shape_audit["samples"]
+            and all(
+                row["reference_aligned_garment_shape_rms_m"] < shape_audit["maximum_shape_rms_m"]
+                for row in shape_audit["samples"]
+            )
+        )
+    return selected
+
+
 def convex_planes(vertices: np.ndarray, triangles: np.ndarray) -> np.ndarray:
     """Build verified outward halfspaces for an actual convex collision mesh."""
     faces = vertices[triangles]
@@ -172,6 +191,36 @@ def convex_planes(vertices: np.ndarray, triangles: np.ndarray) -> np.ndarray:
     if not len(planes) or (vertices @ planes[:, :3].T + planes[:, 3]).max() > 1e-5:
         raise ValueError("Finger collision geometry is not a valid convex mesh")
     return np.unique(np.round(planes, 8), axis=0)
+
+
+def audit_fixed_robot_clearance(
+    vertices: np.ndarray,
+    triangles: np.ndarray,
+    colliders: list[dict],
+    particle_radius_m: float,
+    shape_margins: np.ndarray,
+) -> dict:
+    """Certify conservative convex clearance, including both contact envelopes."""
+    probes = np.concatenate([vertices, vertices[triangles].mean(1)])
+    rows = []
+    for collider in colliders:
+        planes = convex_planes(collider["vertices"], collider["triangles"])
+        distance = (probes @ planes[:, :3].T + planes[:, 3]).max(1)
+        envelope = particle_radius_m + float(shape_margins[collider["shape_id"]])
+        rows.append(
+            dict(
+                shape_id=int(collider["shape_id"]),
+                minimum_halfspace_clearance_m=float(distance.min()),
+                contact_envelope_m=envelope,
+                certified_clear=bool(np.all(distance > envelope)),
+            )
+        )
+    return dict(
+        passed=bool(rows and all(row["certified_clear"] for row in rows)),
+        colliders=rows,
+        probes=len(probes),
+        scope="Conservative convex halfspace lower bounds; all vertices and face centres.",
+    )
 
 
 def audit_jaw_penetration(

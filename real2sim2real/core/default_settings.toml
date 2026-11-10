@@ -22,8 +22,9 @@ backend = "stub"
 # target_xy=[0.10,0]、robot_base_xy=[-0.42,0]；保持两个网格及原始 UV/材质。
 # sorting_package：station_usd_path 指向旧分拣工位，cloth_usd_path 使用 v7_sorting 独立快照。
 # infeed_path/platform_path/outfeed_path 读取各自 USD 支撑面；support_depth_m=0.04。
-# garment_mass_kg=0.2：仅缩放衣物逐点质量，保留袋膜质量和网格几何。
+# garment_mass_kg=0.2；bag_mass_kg 默认不覆盖袋膜质量。可显式设置两者并保持各自质量分布。
 # initial_clearance_m=0.002、outfeed_target_xy=[-0.55,-0.876]。
+# platform_target_xy：可选的平台落点；须在实测支撑范围内，未设置时使用中心。
 # label_uv_bounds=[0.20,0.44,0.66,0.65]：V7 FrontPhotograph 中可见标签的 UV 矩形。
 
 [robot]
@@ -64,14 +65,22 @@ backend = "stub"
 # gripper_package_friction=None：可单独指定四个原生内指与包裹的有效接触摩擦系数。
 # Newton 按几何平均合成；此字段只换算内指材料系数，不改变布料自接触或支撑摩擦。
 # mujoco_control_per_frame=true：每个 60 Hz 帧同步一次恒定控制和零外力，子步仍完整求解。
+# mujoco_substeps_per_vbd_step=1：原生 CPU 批处理可单独提高刚体子步数；VBD 步长须实测验收。
+# self_contact_gap_m=None：包裹默认沿用资产的自接触额外搜索距离，接触厚度仍为 1.6 mm。
 # mimic_time_constant_s=0.0015（不小于两倍子步 dt）、mimic_impedance=0.999。
 # open_gripper_rad/closed_gripper_rad=0/0.64；hold_gripper_rad=0.675，控制原生夹爪主轴，非 Franka 指开度。
 # grasp_height_m=0.048：包含源 30×7.5×70 mm 指垫盒；其闭合时比 TCP 前伸约 36 mm。
 # return_s=2：松手撤离后，返回安全停靠位再进入另一臂的抓取；rest 阶段保持关节目标。
 # hold_s=0：可在提升后保持原关节目标静置，再开始转运；示例设为 1 s。
 # grasp_pad_bottom_m 默认不设置；设置时按原生夹爪 FK 补偿闭合过程的 TCP 高度。
+# regrasp_surface_indent_m=None：可按平台衣物实时中央表面的 90% 高度分位设置右臂下压深度。
+# regrasp_surface_indent_fraction：可按表面离台高度比例下压，米制 indent 此时作为下限。
 # grasp_offset_xy_m=[0,0]：世界 XY 中相对实时衣物质心的抓取点偏移，放置目标仍为质心。
+# regrasp_offset_xy_m：可选的右臂独立抓点偏移；未设置时沿用 grasp_offset_xy_m。
+# platform_friction：可单独覆盖中间平台的材料摩擦；未设置时沿用 table_friction。
 # early_stop_on_shape_failure=true；诊断时可关闭提前终止，最终形状验收门限保持不变。
+# require_bag_gap_quality=true；流程优先配置可设 false，间隙仅记录，仍检查形状、丢抓与穿透。
+# release_lowering_m=0：可在张爪期间同步降低 TCP，减少袋膜受牵拉；仅改变机器人控制目标。
 # transfer_profile="cubic"；"quintic" 使用起止速度及加速度均为零的五次转运曲线。
 # strain_limited_grip=false；开启后按真实网格拉伸微调夹爪目标，不改变粒子或验收门限。
 # grip_strain_target=1.18、grip_maximum_relief_rad=0.01、grip_relief_rate_rad_s=0.05。

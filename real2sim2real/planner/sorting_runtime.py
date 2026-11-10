@@ -62,12 +62,14 @@ class SortingRuntime(PackageRuntime):
         }
         self.jaw_colliders = []
         self.pad_colliders = []
+        self.fixed_robot_colliders = []
         finger_bodies = {
             self.contact_body_ids[f"{side}_{i}"] for side in ("left", "right") for i in (0, 1)
         }
         for shape, body in enumerate(self.model.shape_body.numpy()):
             source = self.model.shape_source[shape]
-            if int(body) not in finger_bodies:
+            fixed_robot = shape < self.robot_shape_count and int(body) < 0
+            if int(body) not in finger_bodies and not fixed_robot:
                 continue
             is_pad = int(self.model.shape_type.numpy()[shape]) == int(self.newton.GeoType.BOX)
             if is_pad:
@@ -80,6 +82,15 @@ class SortingRuntime(PackageRuntime):
             transform = self.model.shape_transform.numpy()[shape]
             rotation = _rotation_wxyz(transform[[6, 3, 4, 5]])
             vertices = (points * self.model.shape_scale.numpy()[shape]) @ rotation.T
+            if fixed_robot:
+                self.fixed_robot_colliders.append(
+                    dict(
+                        shape_id=shape,
+                        vertices=vertices + transform[:3] + self.physics_origin,
+                        triangles=triangles,
+                    )
+                )
+                continue
             self.jaw_colliders.append(
                 dict(
                     body_id=int(body),
@@ -94,7 +105,7 @@ class SortingRuntime(PackageRuntime):
             self._calibrate_pad_bottom()
 
     def _configure_contact_friction(self) -> None:
-        """Override only the native finger/package pair using Newton's geometric mixing."""
+        """Apply finger and support materials using Newton's geometric mixing."""
         shape_mu = self.model.shape_material_mu.numpy()
         bodies = self.model.shape_body.numpy()
         fingers = np.isin(
@@ -110,6 +121,8 @@ class SortingRuntime(PackageRuntime):
                 )
             shape_mu[fingers] = target**2 / particle_mu if target > 0 else 0.0
         shape_mu[self.belt_shape] = self.config.table_friction
+        if self.config.platform_friction is not None:
+            shape_mu[self.platform_shape] = self.config.platform_friction
         self.model.shape_material_mu.assign(shape_mu)
         supports = (bodies < 0) | (bodies == self.belt_body)
         self.contact_friction = dict(
@@ -122,6 +135,11 @@ class SortingRuntime(PackageRuntime):
                 np.sqrt(particle_mu * shape_mu[supports])
             ).tolist(),
             mixing="geometric_mean",
+            platform_shape=self.platform_shape,
+            platform_material_mu=float(shape_mu[self.platform_shape]),
+            effective_platform_package_mu=float(
+                np.sqrt(particle_mu * shape_mu[self.platform_shape])
+            ),
         )
 
     def _calibrate_pad_bottom(self) -> None:
@@ -195,7 +213,9 @@ class SortingRuntime(PackageRuntime):
         # attributes. Keep their compliance explicit in the saved configuration.
         time_constant = max(
             self.config.mimic_time_constant_s,
-            2 * self.robot.sim_world.config.physics_dt / self.config.newton_substeps,
+            2
+            * self.robot.sim_world.config.physics_dt
+            / (self.config.newton_substeps * self.config.mujoco_substeps_per_vbd_step),
         )
         solver.mj_model.eq_solref[:, 0] = time_constant
         solver.mj_model.eq_solimp[:, 0] = self.config.mimic_impedance
@@ -207,6 +227,24 @@ class SortingRuntime(PackageRuntime):
             # VBD does not feed joint state back into this one-way rigid model.
             # Keep MuJoCo's continuous double-precision state between substeps.
             solver.reset(self.state_0)
+            mapping = {
+                int(q): int(mj)
+                for q, mj, dim in zip(
+                    self.model.joint_q_start.numpy()[:-1],
+                    solver.mj_q_start.numpy(),
+                    self.model.joint_dof_dim.numpy(),
+                    strict=True,
+                )
+                if sum(dim) > 0
+            }
+            pairs = [
+                (mapping[index], mapping[self.robot.gripper_indices[side]], ratio)
+                for side, joints in self.robot.mimic.items()
+                for index, ratio in joints
+            ]
+            self._native_mimic_pairs = np.asarray(pairs)
+            self.native_mimic_residuals: list[np.ndarray] = []
+            self.maximum_native_mimic_error = 0.0
         return solver
 
     def _configure_builder(self, builder: Any) -> None:
@@ -253,6 +291,8 @@ class SortingRuntime(PackageRuntime):
                 self.belt_body = body
                 transform = wp.transform_identity()
             shape = builder.add_shape_box(body, xform=transform, hx=half[0], hy=half[1], hz=half[2])
+            if name == "platform":
+                self.platform_shape = shape
             if name == "outfeed":
                 self.belt_shape = shape
         super()._add_deformables(builder, xpbd=xpbd)
@@ -418,17 +458,29 @@ class SortingRuntime(PackageRuntime):
             self.state_0.clear_forces()
             solver = self.rigid_solver
             solver._apply_mjc_control(self.model, self.state_0, self.control, solver.mj_data)
-            solver.mj_model.opt.timestep = dt
+            rigid_substeps = self.config.mujoco_substeps_per_vbd_step
+            solver.mj_model.opt.timestep = dt / rigid_substeps
             # Advance the independent rigid system first and upload its complete
             # solved substep trajectory together. Repeated small CPU→CUDA copies
             # otherwise wait for the preceding soft solve on the same stream.
-            positions, velocities, forces = [], [], []
+            positions, velocities, forces, mimic_residuals = [], [], [], []
+            pairs = self._native_mimic_pairs
             for _ in range(self.config.newton_substeps):
-                solver._mujoco.mj_step(solver.mj_model, solver.mj_data)
+                for _ in range(rigid_substeps):
+                    solver._mujoco.mj_step(solver.mj_model, solver.mj_data)
+                    solver._step += 1
+                    q = solver.mj_data.qpos
+                    mimic_residuals.append(
+                        q[pairs[:, 0].astype(int)] - q[pairs[:, 1].astype(int)] * pairs[:, 2]
+                    )
                 positions.append(solver.mj_data.qpos.copy())
                 velocities.append(solver.mj_data.qvel.copy())
                 forces.append(solver.mj_data.qfrc_actuator.copy())
-                solver._step += 1
+            residuals = np.asarray(mimic_residuals)
+            self.native_mimic_residuals.append(residuals)
+            self.maximum_native_mimic_error = max(
+                self.maximum_native_mimic_error, float(np.max(np.abs(residuals)))
+            )
             arrays = [
                 np.asarray(values, dtype=np.float32) for values in (positions, velocities, forces)
             ]

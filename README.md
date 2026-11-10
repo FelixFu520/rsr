@@ -140,6 +140,22 @@ Featherstone 与 VBD 在这里采用单向刚体驱动柔体耦合，夹爪不�
 
 ### Pro-M6 双臂包裹分拣
 
+当前优先验证[完整流程配置](configs/PhysicSolver_mujoco_vbd_sorting_package_workflow.toml)：
+原装机器人与夹爪，MuJoCo＋VBD，衣物 50 g、袋膜约 5.14 g，有效指端摩擦 2.0。
+`require_bag_gap_quality=false` 将袋衣贴合间隙作为记录项；完整抓取、交接、放手、出带，
+以及丢抓、拉伸、形状和穿透检查仍须通过。结果区分 `workflow_success` 与
+`strict_quality_success`；流程成功不代表严格贴合质量已通过。
+放置时在台面附近张爪并同步缓慢下降 64 mm，再抬起空夹爪；放手以无机器人接触、完整受目标台面
+支撑判定，实际下落量仍记录，`minimum_release_drop_m=0` 允许受支撑的平稳放手。
+本项目同时运行的 Isaac Sim 实例不超过两个，包含暂停的实例；建议先单实例完成物理验证，
+再回放录制四视角 LeRobot v3。
+
+```bash
+./app/python.sh scripts/check_sorting_package.py --config configs/PhysicSolver_mujoco_vbd_sorting_package_workflow.toml --output outputs/PhysicSolver/sorting_native_workflow
+./app/python.sh scripts/render_sorting_package.py outputs/PhysicSolver/sorting_native_workflow --output outputs/PhysicSolver/sorting_native_workflow_collection
+./app/python.sh scripts/validate_sorting_package.py outputs/PhysicSolver/sorting_native_workflow_collection
+```
+
 [分拣配置](configs/PhysicSolver_mujoco_vbd_sorting_package.toml) 恢复旧任务的
 **入料带 → 左臂抓取 → 平台放手交接 → 右臂抓取 → 出料带放手 → 摩擦输送出带**。
 场景、机器人、Planner 和 Job 分别通过 `sorting_package` / `pro_m6_newton` 注册，
@@ -180,10 +196,10 @@ MuJoCo mimic 的时间常数和阻抗写在配置及采集快照中。
 `planner.grasp_offset_xy_m` 可在世界 XY 中相对实时衣物质心选择抓取点；抓取、转运、下放
 的名义 TCP 路径一起做关节限位预检，放置修正仍以实际质心和原目标平台中心为准。
 机器人与夹爪结构固定为原 USD：30 × 7.5 × 70 mm 原生指垫，不添加扩展件，保留原质量及惯量。
-`scene.garment_mass_kg` 默认 0.2，可显式减轻衣物；逐点质量按相同比例缩放，袋膜质量、
-几何、UV 和弹簧保持原样。
+`scene.garment_mass_kg` 默认 0.2，`scene.bag_mass_kg` 默认保留资产的袋膜质量；
+可分别声明两者质量，各自的逐点质量按相同比例缩放，几何、UV 和弹簧保持原样。
 `robot.initial_gripper_rad` 仅指定仿真开始前的夹爪姿态，同时按原 mimic 比例初始化从动关节；
-后续姿态完全由 MuJoCo 积分求解。轻载诊断从 0.28 rad 打开状态开始，以减少启动阶跃。实际质量、原始质量与缩放比例写入结果；独立验收还读取 USD，核对袋膜质量及衣物质量分布，
+后续姿态完全由 MuJoCo 积分求解。轻载诊断从 0.28 rad 打开状态开始，以减少启动阶跃。实际质量、原始质量与缩放比例写入结果；独立验收还读取 USD，核对两部分的声明质量及各自的质量分布，
 不将轻载实验称为原 200 g 案例。
 `planner.gripper_package_friction` 可单独设定原生内指与包裹的有效摩擦系数。
 本机 Newton 1.6.1 按两侧材料系数的几何平均合成；运行时反算内指材料值，保留其它
@@ -239,10 +255,14 @@ LeRobot 的状态和动作均为 16 维：左臂七关节、右臂七关节、�
 帧号和时间戳；诊断另外保存每个 60 Hz 物理帧的两个网格、完整关节状态及碰撞体位姿。
 独立校验会完整解码各路 H.264，逐帧核对视频/Parquet/物理状态，并生成 `qa/keyframes.jpg`
 、`qa/synchronized_four_view.mp4` 和 `qa/physical_audit.json`。
+腕部虚拟相机采用侧向外置观察位置，避开原生指节遮挡。回放旧缓存时可添加
+`--camera-poses configs/PhysicSolver_sorting_camera_poses.json`，仅覆盖已命名相机的光学位姿。
+回放保存原始配置 SHA256 和相机覆盖记录；独立校验拒绝其他配置变化，物理轨迹保持原样。
 
 验收分别检查两次提起、整个转运期的双侧接触及两个网格离台、平台/出带放手、完整包裹支撑
 范围、标签朝上及真实出带位移。物理检查还包括质量、有限状态、三角面塌陷、边长伸长、
 台面/指垫穿透、子步接触容量、袋内包含关系，以及转运期衣物形状 RMS 和袋衣间隙。
+独立视频复核覆盖转运期间每个视频帧的形状与间隙，并保留物理转运检查点。
 标签方向使用原 FrontPhotograph 中标签 UV 区域的真实网格法线。
 失败轨迹保留为 `diagnostic`，只有所有检查通过才标记为 `demonstration`；
 验收脚本遇到物理失败返回非零退出码。当前尚未产出通过全部验收的完整双臂示范，

@@ -7,6 +7,7 @@ actions come exclusively from the saved solver trajectory; physics is not rerun.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import shutil
@@ -19,6 +20,7 @@ import numpy as np
 from real2sim2real.core.config import apply_settings_file
 from real2sim2real.job.job_sorting import SortingJob, SortingJobConfig
 from real2sim2real.utils.asset_utils import resolve_usd_path
+from real2sim2real.utils.cameras import CameraPose
 from real2sim2real.utils.kit_process import run_kit_worker
 from real2sim2real.utils.lerobot_v3 import LeRobotV3Recorder
 
@@ -37,10 +39,30 @@ def replay_indices(times: np.ndarray, fps: int) -> np.ndarray:
     return indices
 
 
+def override_camera_poses(configuration: dict, overrides: dict) -> dict:
+    """Copy a physical snapshot, changing only explicitly named optical poses."""
+    if not isinstance(overrides, dict):
+        raise ValueError("Camera pose overrides must be an object keyed by camera name")
+    updated = copy.deepcopy(configuration)
+    cameras = {
+        camera["name"]: camera
+        for section in ("scene", "robot")
+        for camera in updated[section]["cameras"]
+    }
+    unknown = overrides.keys() - cameras.keys()
+    if unknown:
+        raise ValueError(f"Unknown replay cameras: {sorted(unknown)}")
+    for name, pose in overrides.items():
+        cameras[name]["pose"] = CameraPose.model_validate(pose).model_dump(mode="json")
+    return updated
+
+
 class SortingReplayJob(SortingJob):
     """Use the standard Job lifecycle and native visuals, keeping the world paused."""
 
-    def __init__(self, cache: Path, output: Path, fps: int) -> None:
+    def __init__(
+        self, cache: Path, output: Path, fps: int, camera_poses: Path | None = None
+    ) -> None:
         self.cache, self.output = cache, output
         self.configuration = json.loads((cache / "configuration.json").read_text())
         self.physical_result = json.loads((cache / "result.json").read_text())
@@ -62,7 +84,7 @@ class SortingReplayJob(SortingJob):
         config = SortingJobConfig(output_dir=str(output))
         config.recorder.fps = fps
         config.recorder.task = (
-            "Relay the V7 parcel from infeed through the platform to the outfeed belt "
+            "Relay the garment parcel from infeed through the platform to the outfeed belt "
             "using both Pro-M6 arms, releasing at each destination."
         )
         super().__init__(config=config)
@@ -74,6 +96,18 @@ class SortingReplayJob(SortingJob):
                 raise ValueError(
                     f"Replay {section} differs from its physical snapshot; check RSR overrides"
                 )
+        self.camera_pose_overrides = {}
+        if camera_poses is not None:
+            requested = json.loads(camera_poses.read_text())
+            self.configuration = override_camera_poses(self.configuration, requested)
+            for section in ("scene", "robot"):
+                component = getattr(self, section)
+                for camera, saved in zip(
+                    component.config.cameras, self.configuration[section]["cameras"], strict=True
+                ):
+                    camera.pose = CameraPose.model_validate(saved["pose"])
+                    if camera.name in requested:
+                        self.camera_pose_overrides[camera.name] = saved["pose"]
 
     def simulate(self) -> None:
         """Publish cached physical poses, capture RGB, and preserve the source outcome."""
@@ -95,6 +129,20 @@ class SortingReplayJob(SortingJob):
                 raise ValueError("Cached finger body mapping differs from the renderer")
             np.testing.assert_allclose(jaw["vertices"], saved[f"jaw_vertices_{i}"], atol=1e-8)
             np.testing.assert_array_equal(jaw["triangles"], saved[f"jaw_triangles_{i}"])
+        if "fixed_robot_shape_ids" in saved:
+            np.testing.assert_array_equal(
+                saved["fixed_robot_shape_ids"],
+                [collider["shape_id"] for collider in runtime.fixed_robot_colliders],
+            )
+            for i, collider in enumerate(runtime.fixed_robot_colliders):
+                np.testing.assert_allclose(
+                    collider["vertices"], saved[f"fixed_robot_vertices_{i}"], atol=1e-8
+                )
+                np.testing.assert_array_equal(
+                    collider["triangles"], saved[f"fixed_robot_triangles_{i}"]
+                )
+            for name in ("particle_radius", "shape_margin"):
+                np.testing.assert_array_equal(saved[name], getattr(runtime.model, name).numpy())
         run = self.output / "diagnostics" / datetime.now(UTC).strftime("%Y%m%dT%H%M%S_%fZ")
         run.mkdir(parents=True)
         recorder = LeRobotV3Recorder(
@@ -136,6 +184,10 @@ class SortingReplayJob(SortingJob):
                 source_trajectory_sha256=hashlib.sha256(
                     (self.cache / "particles.npz").read_bytes()
                 ).hexdigest(),
+                source_configuration_sha256=hashlib.sha256(
+                    (self.cache / "configuration.json").read_bytes()
+                ).hexdigest(),
+                observation_camera_pose_overrides=self.camera_pose_overrides,
             )
             shutil.copy2(self.cache / "particles.npz", run / "particles.npz")
             (run / "configuration.json").write_text(json.dumps(self.configuration, indent=2) + "\n")
@@ -159,6 +211,9 @@ if __name__ == "__main__":
     parser.add_argument("cache", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--fps", type=int, default=15)
+    parser.add_argument(
+        "--camera-poses", type=Path, help="JSON camera-name to optical-pose mapping"
+    )
     parser.add_argument("--allow-failure", action="store_true")
     parser.add_argument("--worker-id", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -176,6 +231,6 @@ if __name__ == "__main__":
         parser.error(
             "Physical trial failed or is incomplete; failed trials require --allow-failure"
         )
-    job = SortingReplayJob(args.cache.resolve(), args.output.resolve(), args.fps)
+    job = SortingReplayJob(args.cache.resolve(), args.output.resolve(), args.fps, args.camera_poses)
     job.worker_id = args.worker_id
     job.run()
