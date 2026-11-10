@@ -26,6 +26,11 @@ backend = "stub"
 # initial_clearance_m=0.002、outfeed_target_xy=[-0.55,-0.876]。
 # platform_target_xy：可选的平台落点；须在实测支撑范围内，未设置时使用中心。
 # label_uv_bounds=[0.20,0.44,0.66,0.65]：V7 FrontPhotograph 中可见标签的 UV 矩形。
+# clear_legacy_parcels=false：清理工位自带的 box01/box02/重复衣物视觉资产。
+# infeed_travel_m=0：从目标点上游指定距离入料（沿世界 +Y），整包必须在带面范围内。
+# floor_z_m=0：启用远端入料时增加真实落地碰撞面。
+# rigid_usd_path=""、rigid_scale=0.5、rigid_mass_kg=0.03125：可选 V10 纸箱及声明的缩放/质量。
+# belt_markers=false：用循环移动的细缝显示实际传送带表面偏移。
 
 [robot]
 backend = "stub"
@@ -73,6 +78,7 @@ backend = "stub"
 # return_s=2：松手撤离后，返回安全停靠位再进入另一臂的抓取；rest 阶段保持关节目标。
 # hold_s=0：可在提升后保持原关节目标静置，再开始转运；示例设为 1 s。
 # grasp_pad_bottom_m 默认不设置；设置时按原生夹爪 FK 补偿闭合过程的 TCP 高度。
+# infeed_grasp_pad_bottom_m=None：可单独覆盖左臂入料抓取深度，不改变平台重抓深度。
 # regrasp_surface_indent_m=None：可按平台衣物实时中央表面的 90% 高度分位设置右臂下压深度。
 # regrasp_surface_indent_fraction：可按表面离台高度比例下压，米制 indent 此时作为下限。
 # grasp_offset_xy_m=[0,0]：世界 XY 中相对实时衣物质心的抓取点偏移，放置目标仍为质心。
@@ -88,6 +94,18 @@ backend = "stub"
 # open_gripper_rad=0.28 对应约 81 mm 指垫开口；底边目标不消除实际关节跟踪误差。
 # physics_origin_m=[0,0,0]：可选的整体求解坐标平移；控制、USD 和缓存仍用世界坐标。
 # belt_speed_mps=0.35、belt_transport_s=6、minimum_belt_displacement_m=0.30。
+# infeed_speed_mps=0.06、infeed_settle_s=2：低速送达抓取位置后暂停入料，等待抓取。
+# continuous_outfeed=false：设为 true 后出料带从初帧持续运行，离带后仍保持速度。
+# outfeed_place_height_m=None：可单独提高右臂松手 TCP，不改变平台交接高度。
+# floor_contact_stiffness=None：可单独设置地面 VBD 法向接触刚度，不改变抓取或带面材料。
+# sorting_stream：同一连续 MuJoCo/VBD 世界先柔性后刚性；参见 sorting_stream 示例。
+# rigid_closed_gripper_rad=0.40、rigid_hold_gripper_rad=0.42、rigid_pad_bottom_m=0.015。
+# sleep_soft_when_settled=true：仅已落地静止且距纸箱超过 0.2 m 的柔性包裹可休眠；接近时唤醒。
+# rigid_contact_time_constant_s=0.0005：纸箱原生接触使用临界阻尼，不改 VBD 材料。
+# rigid_mujoco_iterations=100、rigid_mujoco_solver="pgs"：纸箱出生后的原生算法/迭代次数。
+# rigid_disable_warmstart=false：原生 PGS 保留 warmstart；可用于独立算法对照实验。
+# separate_ground_drop_lanes=false、ground_lane_margin_m=0.012：按已落地柔性网格选择纸箱出料侧位。
+# lower_drop_tcp_orientation_wxyz=None：可为靠外的出料侧位指定可达的单位 TCP 四元数。
 # maximum_edge_stretch=1.3、minimum_triangle_area_ratio=0.03；沿用 V7 的形变检查。
 # maximum_shape_rms_m=0.037413、maximum_bag_gap_m=0.01、maximum_tcp_error_m=0.03。
 # label_up_min_cos=0.9；每次放置后使用实际标签网格法线检查。

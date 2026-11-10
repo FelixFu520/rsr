@@ -46,6 +46,7 @@ pickplace_cloth = "real2sim2real.planner.planner_physic_solver:PickPlaceClothPla
 newton_cloth_franka = "real2sim2real.planner.planner_newton_cloth:OfficialClothPlanner"
 pickplace_package = "real2sim2real.planner.planner_package:PackagePlanner"
 sorting_package = "real2sim2real.planner.planner_sorting:SortingPlanner"
+sorting_stream = "real2sim2real.planner.planner_sorting_stream:SortingStreamPlanner"
 
 [project.entry-points."real2sim2real.robot.backends"]
 stub = "real2sim2real.robot.robot_stub:StubRobot"

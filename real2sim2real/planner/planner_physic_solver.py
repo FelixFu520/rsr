@@ -271,15 +271,7 @@ class NewtonClothRuntime:
                 )
             self.robot_body_count = 0
             self.robot_shape_count = 0
-        low, high = np.asarray(scene.table_bounds, dtype=float)
-        center, half = (low + high) * 0.5, (high - low) * 0.5
-        builder.add_shape_box(
-            -1,
-            xform=wp.transform(center * self.scale, wp.quat_identity()),
-            hx=half[0] * self.scale,
-            hy=half[1] * self.scale,
-            hz=half[2] * self.scale,
-        )
+        self._add_table(builder)
         self._add_deformables(builder, xpbd=xpbd)
         if xpbd and config.xpbd_mass_lumping == "uniform":
             # Preserve total mass while improving XPBD's unweighted spring solve.
@@ -395,6 +387,18 @@ class NewtonClothRuntime:
         from newton.solvers import SolverMuJoCo
 
         return SolverMuJoCo(self.model, solver="newton", integrator="implicitfast", iterations=30)
+
+    def _add_table(self, builder: Any) -> None:
+        """Add the measured support; conveyor runtimes may provide a moving surface."""
+        low, high = np.asarray(self.scene.table_bounds, dtype=float)
+        center, half = (low + high) * 0.5, (high - low) * 0.5
+        builder.add_shape_box(
+            -1,
+            xform=self.wp.transform(center * self.scale, self.wp.quat_identity()),
+            hx=half[0] * self.scale,
+            hy=half[1] * self.scale,
+            hz=half[2] * self.scale,
+        )
 
     def _add_deformables(self, builder: Any, *, xpbd: bool) -> None:
         """Add the physical cloth; specialized assets may contain multiple meshes."""

@@ -61,6 +61,52 @@ def test_fixed_robot_root_contacts_count_as_robot_and_supports_do_not():
     assert _robot_contact_count(runtime) == 3
 
 
+def test_air_drop_measures_touchdown_before_the_running_belt_moves_the_parcel():
+    from types import SimpleNamespace
+
+    from real2sim2real.planner.planner_sorting import SortingPlanner, SortingPlannerConfig
+
+    planner = object.__new__(SortingPlanner)
+    planner.config = SortingPlannerConfig(continuous_outfeed=True)
+    planner.scene = SimpleNamespace(label_up_cos=lambda points: 1.0)
+    planner.destination_bounds = np.array([[-2, -1, 0.9], [0, 1, 1.0]])
+    planner.goal = np.array([-0.5, 0, 1.0])
+    planner.legs = {"right": dict(released=False)}
+    planner.elapsed = 1.0
+    # A tilted falling parcel touches the belt while its COM is still high.
+    points = np.array([[-0.5, -0.1, 1.0], [-0.4, 0.1, 1.24]])
+    coms = np.array([[-0.47, 0, 1.12], [-0.47, 0, 1.12]])
+    planner._measure_moving_landing(points, coms, robot_contacts=1, outfeed_contacts=2)
+    assert "landing_time_s" not in planner.legs["right"]
+    planner._measure_moving_landing(points, coms, robot_contacts=0, outfeed_contacts=2)
+    assert planner.legs["right"]["place_error"] == pytest.approx(0.03)
+    assert not planner.legs["right"]["released"]
+    planner.elapsed = 1.3
+    # It settles after travelling farther than the original 80 mm landing tolerance.
+    points[:, 0] -= 0.2
+    points[:, 2] = 1.02
+    coms[:] = [-0.67, 0, 1.02]
+    planner._measure_moving_landing(points, coms, robot_contacts=0, outfeed_contacts=2)
+    assert planner.legs["right"]["released"]
+    assert planner.legs["right"]["landing_time_s"] == 1.0
+    assert planner.legs["right"]["release_verified_time_s"] == 1.3
+    assert planner.legs["right"]["place_error"] == pytest.approx(0.03)
+
+
+def test_sorting_metrics_preserve_nested_landing_coordinates_in_strict_json():
+    from real2sim2real.planner.planner_sorting import _finite_metrics
+
+    measured = dict(
+        landing_xy_m=[[0.1, -0.8], [0.2, -0.9]],
+        minimum_lift=np.array([np.inf, 0.2]),
+        unavailable=float("nan"),
+    )
+    encoded = json.loads(json.dumps(_finite_metrics(measured), allow_nan=False))
+    assert encoded["landing_xy_m"] == measured["landing_xy_m"]
+    assert encoded["minimum_lift"] == [None, 0.2]
+    assert encoded["unavailable"] is None
+
+
 def test_fixed_root_clearance_includes_particle_radius_and_shape_margin():
     from real2sim2real.utils.sorting_quality import audit_fixed_robot_clearance, unit_box_mesh
 
@@ -223,7 +269,8 @@ def test_right_grasp_offset_preserves_left_pick_and_screens_offset_destination(
 
 @pytest.mark.parametrize("target", [None, 0.0, 2.0])
 @pytest.mark.parametrize("platform", [None, 0.1])
-def test_pair_friction_changes_only_declared_roles_and_preserves_belts(target, platform):
+@pytest.mark.parametrize("floor_stiffness", [None, 400000.0])
+def test_contact_materials_change_only_declared_roles(target, platform, floor_stiffness):
     from types import SimpleNamespace
 
     from real2sim2real.planner.planner_sorting import SortingPlannerConfig
@@ -241,16 +288,21 @@ def test_pair_friction_changes_only_declared_roles_and_preserves_belts(target, p
 
     runtime = object.__new__(SortingRuntime)
     runtime.config = SortingPlannerConfig(
-        gripper_package_friction=target, platform_friction=platform
+        gripper_package_friction=target,
+        platform_friction=platform,
+        floor_contact_stiffness=floor_stiffness,
     )
     runtime.contact_body_ids = dict(left_0=1, left_1=2, right_0=3, right_1=4)
     runtime.belt_body, runtime.belt_shape = 5, 6
     runtime.platform_shape = 0
+    runtime.floor_shape = 7
     original = np.array([0.5, 1.4, 1.4, 1.4, 1.4, 1.4, 0.5, 0.5])
     runtime.model = SimpleNamespace(
         shape_body=Array([-1, 0, 1, 2, 3, 4, 5, -1]),
         shape_material_mu=Array(original),
+        shape_material_ke=Array(np.full(8, 40000.0)),
         soft_contact_mu=1.4,
+        soft_contact_ke=40000.0,
     )
     runtime._configure_contact_friction()
     actual = runtime.model.shape_material_mu.numpy()
@@ -259,6 +311,11 @@ def test_pair_friction_changes_only_declared_roles_and_preserves_belts(target, p
     expected = 1.4 if target is None else target
     np.testing.assert_allclose(np.sqrt(1.4 * actual[2:6]), expected)
     assert runtime.model.soft_contact_mu == 1.4
+    np.testing.assert_array_equal(runtime.model.shape_material_ke.numpy()[:7], 40000.0)
+    assert runtime.model.shape_material_ke.numpy()[7] == (
+        40000.0 if floor_stiffness is None else floor_stiffness
+    )
+    assert runtime.model.soft_contact_ke == 40000.0
     np.testing.assert_allclose(runtime.contact_friction["effective_gripper_package_mu"], [expected])
     np.testing.assert_allclose(
         runtime.contact_friction["effective_support_package_mu"],
@@ -921,7 +978,9 @@ def test_external_contacts_query_current_rigids_and_previous_particles():
     runtime._collision_views = {}
     runtime.newton = SimpleNamespace(State=SimpleNamespace)
     runtime.model = SimpleNamespace(device="cpu")
-    runtime.wp = SimpleNamespace(launch=lambda *a, **k: None, transform=lambda *a: a)
+    runtime.wp = SimpleNamespace(
+        launch=lambda *a, **k: None, transform=lambda *a: a, vec3=lambda *a: a
+    )
     runtime._belt_motion, runtime.belt_body = object(), 0
     runtime.belt_rest, runtime.belt_speed = np.zeros(7), 0
     runtime.contacts, runtime.control = object(), object()
@@ -1199,3 +1258,207 @@ np.testing.assert_allclose(world_states[0][3][:26],world_states[1][3][:26],atol=
         [sys.executable, "-c", code], env=environment, capture_output=True, text=True, check=False
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_stream_config_keeps_successful_soft_asset_and_native_head_mount():
+    from real2sim2real.job.job_sorting import SortingJob
+    from real2sim2real.planner.planner_sorting_stream import SortingStreamPlanner
+
+    try:
+        apply_settings_file("configs/PhysicSolver_mujoco_vbd_sorting_stream.toml")
+        job = SortingJob()
+        assert isinstance(job.planner, SortingStreamPlanner)
+        assert "v10_station" in job.scene.config.cloth_usd_path
+        assert job.scene.config.clear_legacy_parcels
+        assert job.scene.config.infeed_travel_m == 0.75
+        assert job.planner.config.continuous_outfeed
+        head = next(camera for camera in job.robot.config.cameras if camera.name == "head")
+        assert head.pose_relative_to.endswith("/tn__Headdepth_Link_oE/Camera_Head")
+        assert head.pose.position == (0.0, 0.0, 0.0)
+        assert len(job.recording_cameras) == 4
+    finally:
+        reset_settings()
+
+
+def test_cached_soft_success_cannot_hide_damage_during_the_later_rigid_relay():
+    from types import SimpleNamespace
+
+    from real2sim2real.planner.planner_sorting_stream import (
+        SortingStreamPlanner,
+        SortingStreamPlannerConfig,
+    )
+
+    planner = object.__new__(SortingStreamPlanner)
+    planner.config = SortingStreamPlannerConfig()
+    planner.soft_result = dict(success=True, strict_quality_success=True)
+    planner.rigid = SimpleNamespace(result=lambda: dict(success=True), failure_reason=None)
+    planner.belt_speeds = [[0.0, planner.config.belt_speed_mps]]
+    planner.stream_samples = [np.zeros((3, 3))]
+    planner.stream_bodies = [np.zeros((2, 7))]
+    planner.stream_states = [np.zeros(16)]
+    planner.stream_actions = [np.zeros(16)]
+    planner.global_max_stretch = 1.66
+    planner.global_min_area = 0.051
+    planner.global_min_floor_z = -0.00265
+    planner.global_failure_reason = "Later ground collision"
+    planner.scene = SimpleNamespace(config=SimpleNamespace(floor_z_m=0.0))
+    planner.runtime = SimpleNamespace(
+        cloth_solver=SimpleNamespace(maximum_contacts=SimpleNamespace(numpy=lambda: np.zeros(3)))
+    )
+    planner.carton_spawn_time_s, planner.elapsed = 67.25, 134.5
+    result = planner.result()
+    assert result["checks"]["soft_parcel"] and result["checks"]["rigid_parcel"]
+    assert not result["success"]
+    assert not result["strict_quality_success"]
+    assert not result["checks"]["soft_entire_stream_stretch_bounded"]
+    assert not result["checks"]["soft_entire_stream_floor_clear"]
+
+
+def test_recorded_float32_carton_pose_publishes_to_usd():
+    import os
+    import sys
+    from pathlib import Path
+
+    usd = next(Path("app/extscache").glob("omni.usd.libs-*/pxr/Gf")).parent.parent.resolve()
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(usd) + os.pathsep + environment.get("PYTHONPATH", "")
+    environment["LD_LIBRARY_PATH"] = (
+        str(usd / "bin") + os.pathsep + environment.get("LD_LIBRARY_PATH", "")
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import runpy;runpy.run_path('tests/test_sorting_package.py')"
+            "['_check_float32_carton_pose']()",
+        ],
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _check_float32_carton_pose():
+    from pxr import Gf, Usd, UsdGeom
+
+    from real2sim2real.scene.scene_sorting import SortingScene
+
+    stage = Usd.Stage.CreateInMemory()
+    root = UsdGeom.Xform.Define(stage, "/Carton")
+    scene = object.__new__(SortingScene)
+    scene.rigid_visual_op = root.AddTransformOp()
+    scene.rigid_visual = UsdGeom.Imageable(root)
+    pose = np.array([1, 2, 3, 0, 0, np.sqrt(0.5), np.sqrt(0.5)], dtype=np.float32)
+    scene.publish_rigid_pose(pose, visible=True)
+    np.testing.assert_allclose(root.GetLocalTransformation().ExtractTranslation(), [1, 2, 3])
+    np.testing.assert_allclose(
+        root.GetLocalTransformation().Transform(Gf.Vec3d(1, 0, 0)), [1, 3, 3], atol=1e-6
+    )
+    assert scene.rigid_visual.GetVisibilityAttr().Get() == UsdGeom.Tokens.inherited
+
+
+def test_native_rigid_belt_force_is_contact_limited_and_stops_in_free_fall():
+    import os
+    import sys
+    from pathlib import Path
+
+    newton = Path("app/exts/isaacsim.pip.newton/pip_prebundle").resolve()
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(newton) + os.pathsep + environment.get("PYTHONPATH", "")
+    code = '''
+import mujoco
+import numpy as np
+from types import SimpleNamespace
+from real2sim2real.planner.sorting_stream_runtime import SortingStreamRuntime
+model = mujoco.MjModel.from_xml_string("""
+<mujoco><option timestep="0.001" integrator="implicitfast"/>
+<worldbody><geom name="belt" type="box" size="1 .3 .02" pos="0 0 -.02"
+ friction="0 0 0"/>
+<body name="carton" pos="0 0 .036"><freejoint/>
+<geom name="box" type="box" size=".0315 .05 .035" mass=".03125" friction="0 0 0"/>
+</body></worldbody></mujoco>""")
+data = mujoco.MjData(model)
+runtime = object.__new__(SortingStreamRuntime)
+runtime.carton_spawned = True
+runtime.carton_mj_body = model.body('carton').id
+runtime.carton_geom = model.geom('box').id
+runtime.belt_geoms = {model.geom('belt').id: 'outfeed'}
+runtime._native_belt_mu = {model.geom('belt').id: .5}
+runtime.infeed_speed, runtime.belt_speed = 0., .18
+runtime.maximum_belt_force_n = 0.
+runtime.rigid_solver = SimpleNamespace(mj_model=model, mj_data=data, _mujoco=mujoco)
+for _ in range(1000):
+    runtime._before_native_substep(.001)
+    mujoco.mj_step(model, data)
+assert -.19 < data.qpos[0] < -.15, data.qpos
+assert abs(data.qvel[0] + .18) < .01, data.qvel
+assert np.linalg.norm(data.xfrc_applied[runtime.carton_mj_body, :3]) < .03125 * 9.81 * .6
+# Airborne parcels receive gravity and no conveyor force.
+data.qpos[2] = .5
+mujoco.mj_forward(model, data)
+assert data.ncon == 0
+runtime._before_native_substep(.001)
+np.testing.assert_array_equal(data.xfrc_applied[runtime.carton_mj_body], 0.)
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", code], env=environment, capture_output=True, text=True, check=False
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_native_fixed_belt_cannot_drift_during_batched_cpu_steps():
+    import os
+    import sys
+    from pathlib import Path
+
+    newton = Path("app/exts/isaacsim.pip.newton/pip_prebundle").resolve()
+    warp = next(Path("app/extscache").glob("omni.warp.core-*/warp")).parent.resolve()
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(newton), str(warp), environment.get("PYTHONPATH", "")]
+    )
+    code = """
+import newton, warp as wp, numpy as np
+from newton.solvers import SolverMuJoCo
+from real2sim2real.planner.sorting_runtime import SortingRuntime
+wp.init()
+b = newton.ModelBuilder()
+SolverMuJoCo.register_custom_attributes(b)
+r = object.__new__(SortingRuntime)
+r.wp = wp
+belt = r._add_fixed_belt(b, np.array([0., 0., .5]), 'belt')
+b.add_shape_box(belt, hx=.5, hy=1., hz=.5)
+box = b.add_body(xform=wp.transform((0, 0, 1.036), wp.quat_identity()))
+b.add_shape_box(box, hx=.0315, hy=.05, hz=.035,
+                cfg=newton.ModelBuilder.ShapeConfig(density=140.))
+b.add_ground_plane()
+b.color()
+m = b.finalize(device='cpu')
+s = SolverMuJoCo(m, use_mujoco_cpu=True, update_data_interval=0)
+s.reset(m.state())
+s.mj_model.opt.timestep = 1/7680
+body_map = s.mjc_body_to_newton.numpy()[0]
+belt_id = int(np.flatnonzero(body_map == belt)[0])
+box_id = int(np.flatnonzero(body_map == box)[0])
+assert s.mj_model.body_mocapid[belt_id] >= 0
+for _ in range(1500):
+    s._mujoco.mj_step(s.mj_model, s.mj_data)
+np.testing.assert_allclose(s.mj_data.xpos[belt_id], [0,0,.5], atol=1e-9)
+assert s.mj_data.xpos[box_id, 2] > 1.0335
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code], env=environment, capture_output=True, text=True, check=False
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_fallen_or_edge_overhanging_parcel_is_not_below_an_infinite_support_plane():
+    from real2sim2real.scene.scene_sorting import SortingScene
+
+    scene = object.__new__(SortingScene)
+    scene.supports = {"belt": (np.array([0.0, 0.0, 0.96]), np.array([1.0, 1.0, 1.0]))}
+    # Below the belt's underside is free space, and the nearest end face limits depth.
+    assert scene.support_penetration(np.array([[0.5, 0.5, 0.5]])) == 0.0
+    assert scene.support_penetration(np.array([[0.9999, 0.5, 0.98]])) == pytest.approx(0.0001)
+    assert scene.support_penetration(np.array([[0.5, 0.5, 0.999]])) == pytest.approx(0.001)

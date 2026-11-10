@@ -24,12 +24,12 @@ def _belt_kernel() -> Any:
         current: wp.array[wp.transform],
         body: int,
         rest: wp.transform,
-        speed: float,
+        velocity: wp.vec3,
         dt: float,
     ):
         p = wp.transform_get_translation(rest)
         q = wp.transform_get_rotation(rest)
-        previous[body] = wp.transform(p + wp.vec3(speed * dt, 0.0, 0.0), q)
+        previous[body] = wp.transform(p - velocity * dt, q)
         current[body] = rest
 
     return belt_motion
@@ -41,9 +41,14 @@ class SortingRuntime(PackageRuntime):
     def __init__(self, robot: Any, scene: Any, config: Any) -> None:
         self.active_side = "left"
         self.belt_speed = 0.0
+        self.infeed_speed = 0.0
         self.physics_origin = np.asarray(config.physics_origin_m, dtype=float)
         super().__init__(robot, scene, config)
         self.belt_rest = self.model.body_q.numpy()[self.belt_body].copy()
+        if hasattr(self, "infeed_body"):
+            self.infeed_rest = self.model.body_q.numpy()[self.infeed_body].copy()
+        if config.continuous_outfeed:
+            self.belt_speed = config.belt_speed_mps
         self._configure_contact_friction()
         self._belt_motion = _belt_kernel()
         self._masses = self.model.particle_mass.numpy()
@@ -121,9 +126,15 @@ class SortingRuntime(PackageRuntime):
                 )
             shape_mu[fingers] = target**2 / particle_mu if target > 0 else 0.0
         shape_mu[self.belt_shape] = self.config.table_friction
+        if hasattr(self, "infeed_shape"):
+            shape_mu[self.infeed_shape] = self.config.table_friction
         if self.config.platform_friction is not None:
             shape_mu[self.platform_shape] = self.config.platform_friction
         self.model.shape_material_mu.assign(shape_mu)
+        if hasattr(self, "floor_shape") and self.config.floor_contact_stiffness is not None:
+            stiffness = self.model.shape_material_ke.numpy()
+            stiffness[self.floor_shape] = self.config.floor_contact_stiffness
+            self.model.shape_material_ke.assign(stiffness)
         supports = (bodies < 0) | (bodies == self.belt_body)
         self.contact_friction = dict(
             particle_material_mu=particle_mu,
@@ -287,7 +298,11 @@ class SortingRuntime(PackageRuntime):
             body = -1
             transform = wp.transform(center, wp.quat_identity())
             if name == "outfeed":
-                body = builder.add_body(xform=transform, is_kinematic=True, label="outfeed_belt")
+                body = (
+                    self._add_fixed_belt(builder, center, "outfeed_belt")
+                    if self.config.continuous_outfeed
+                    else builder.add_body(xform=transform, is_kinematic=True, label="outfeed_belt")
+                )
                 self.belt_body = body
                 transform = wp.transform_identity()
             shape = builder.add_shape_box(body, xform=transform, hx=half[0], hy=half[1], hz=half[2])
@@ -296,6 +311,25 @@ class SortingRuntime(PackageRuntime):
             if name == "outfeed":
                 self.belt_shape = shape
         super()._add_deformables(builder, xpbd=xpbd)
+
+    def _add_table(self, builder: Any) -> None:
+        if self.scene.config.infeed_travel_m <= 0:
+            return super()._add_table(builder)
+        low, high = self.scene.supports["infeed"]
+        center, half = (low + high) / 2, (high - low) / 2
+        self.infeed_body = self._add_fixed_belt(builder, center, "infeed_belt")
+        self.infeed_shape = builder.add_shape_box(
+            self.infeed_body, hx=half[0], hy=half[1], hz=half[2]
+        )
+        self.floor_shape = builder.add_ground_plane(height=self.scene.config.floor_z_m)
+
+    def _add_fixed_belt(self, builder: Any, center: np.ndarray, label: str) -> int:
+        """Use fixed-root mocap geometry so native CPU batching cannot integrate a belt."""
+        transform = self.wp.transform(center, self.wp.quat_identity())
+        body = builder.add_link(xform=transform, is_kinematic=True, label=label)
+        joint = builder.add_joint_fixed(-1, body, parent_xform=transform, label=f"{label}_root")
+        builder.add_articulation([joint], label=f"{label}_articulation")
+        return body
 
     def _create_ik(self) -> None:
         self.iks = {side: SortingArmIK(self.robot, side) for side in ("left", "right")}
@@ -369,6 +403,15 @@ class SortingRuntime(PackageRuntime):
         """Publish cached observations without modifying either solver's state buffers."""
         self.scene.publish_cloth_vertices(vertices)
         self._publish_robot_visuals(body_poses)
+
+    def _publish(self) -> None:
+        super()._publish()
+        shapes = getattr(self, "last_active_contact_shapes", np.empty(0, int))
+        bodies = getattr(self, "last_active_contact_bodies", np.empty(0, int))
+        self.last_contact_counts["outfeed"] = int(np.count_nonzero(bodies == self.belt_body))
+        self.last_contact_counts["platform"] = int(np.count_nonzero(shapes == self.platform_shape))
+        if hasattr(self, "infeed_body"):
+            self.last_contact_counts["infeed"] = int(np.count_nonzero(bodies == self.infeed_body))
 
     def tcp_position(self, side: str | None = None) -> np.ndarray:
         """Read the actual solved TCP, including MuJoCo tracking error."""
@@ -448,7 +491,8 @@ class SortingRuntime(PackageRuntime):
 
     def _advance_direct(self, frame_dt: float) -> None:
         dt = frame_dt / self.config.newton_substeps
-        self.cloth_solver.rebuild_bvh(self.state_0)
+        if not getattr(self, "soft_asleep", False):
+            self.cloth_solver.rebuild_bvh(self.state_0)
         batch_control = self.config.mujoco_cpu and self.config.mujoco_control_per_frame
         if batch_control:
             # Every joint is a scalar hinge, targets are constant over this
@@ -467,6 +511,7 @@ class SortingRuntime(PackageRuntime):
             pairs = self._native_mimic_pairs
             for _ in range(self.config.newton_substeps):
                 for _ in range(rigid_substeps):
+                    self._before_native_substep(dt / rigid_substeps)
                     solver._mujoco.mj_step(solver.mj_model, solver.mj_data)
                     solver._step += 1
                     q = solver.mj_data.qpos
@@ -522,7 +567,12 @@ class SortingRuntime(PackageRuntime):
                 self.model.particle_count = count
             # A treadmill changes only the support's tangential contact displacement.
             # Actual parcel displacement is produced entirely by VBD friction.
-            key = (id(self.state_0), self.belt_speed)
+            key = (
+                id(self.state_0),
+                self.belt_speed,
+                getattr(self, "infeed_speed", 0.0),
+                getattr(self, "soft_asleep", False),
+            )
             if self.config.mujoco_cpu and self.config.newton_use_cuda_graph and self.direct_warmed:
                 if key not in self._soft_graphs:
                     with self.wp.ScopedCapture(device=self.model.device) as capture:
@@ -533,6 +583,9 @@ class SortingRuntime(PackageRuntime):
                 self._advance_soft(dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
+    def _before_native_substep(self, dt: float) -> None:
+        """Allow contact-driven conveyor forces for an optional dynamic rigid parcel."""
+
     def _advance_soft(self, dt: float) -> None:
         self.wp.launch(
             self._belt_motion,
@@ -542,11 +595,25 @@ class SortingRuntime(PackageRuntime):
                 self.state_1.body_q,
                 self.belt_body,
                 self.wp.transform(self.belt_rest[:3], self.belt_rest[3:]),
-                self.belt_speed,
+                self.wp.vec3(-self.belt_speed, 0.0, 0.0),
                 dt,
             ],
             device=self.model.device,
         )
+        if hasattr(self, "infeed_body"):
+            self.wp.launch(
+                self._belt_motion,
+                1,
+                inputs=[
+                    self.state_0.body_q,
+                    self.state_1.body_q,
+                    self.infeed_body,
+                    self.wp.transform(self.infeed_rest[:3], self.infeed_rest[3:]),
+                    self.wp.vec3(0.0, self.infeed_speed, 0.0),
+                    dt,
+                ],
+                device=self.model.device,
+            )
         key = id(self.state_0)
         if key not in self._collision_views:
             # External VBD evaluates particle contacts against state_out's

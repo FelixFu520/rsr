@@ -40,6 +40,19 @@ def _robot_contact_count(runtime: Any) -> int:
     return int(np.count_nonzero((bodies >= 0) & (bodies < runtime.robot_body_count)))
 
 
+def _finite_metrics(value: Any) -> Any:
+    """Preserve nested measured coordinates and encode unavailable metrics as null."""
+    if isinstance(value, np.ndarray):
+        return _finite_metrics(value.tolist())
+    if isinstance(value, dict):
+        return {key: _finite_metrics(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite_metrics(item) for item in value]
+    if isinstance(value, (float, np.floating)):
+        return float(value) if np.isfinite(value) else None
+    return value
+
+
 def _regrasp_pad_bottom(
     garment: np.ndarray,
     xy: np.ndarray,
@@ -104,6 +117,7 @@ class SortingPlannerConfig(PackagePlannerConfig):
     hold_gripper_rad: float = Field(default=0.675, gt=0, le=0.7)
     grasp_height_m: float = Field(default=0.048, ge=0, le=0.10)
     grasp_pad_bottom_m: float | None = Field(default=None, ge=0, le=0.08)
+    infeed_grasp_pad_bottom_m: FiniteFloat | None = Field(default=None, ge=0, le=0.08)
     regrasp_surface_indent_m: float | None = Field(default=None, gt=0, le=0.08, allow_inf_nan=False)
     regrasp_surface_indent_fraction: FiniteFloat | None = Field(default=None, gt=0, lt=1)
     grasp_offset_xy_m: tuple[FiniteFloat, FiniteFloat] = (0.0, 0.0)
@@ -113,6 +127,11 @@ class SortingPlannerConfig(PackagePlannerConfig):
     lift_height_m: float = Field(default=0.25, gt=0)
     belt_speed_mps: float = Field(default=0.35, gt=0)
     belt_transport_s: float = Field(default=6, gt=0)
+    infeed_speed_mps: FiniteFloat = Field(default=0.06, gt=0)
+    infeed_settle_s: FiniteFloat = Field(default=2.0, gt=0)
+    continuous_outfeed: bool = False
+    outfeed_place_height_m: FiniteFloat | None = Field(default=None, gt=0)
+    floor_contact_stiffness: FiniteFloat | None = Field(default=None, gt=0)
     minimum_belt_displacement_m: float = Field(default=0.30, gt=0)
     maximum_edge_stretch: float = Field(default=1.3, gt=1)
     minimum_triangle_area_ratio: float = Field(default=0.03, gt=0, lt=1)
@@ -141,6 +160,8 @@ class SortingPlannerConfig(PackagePlannerConfig):
             raise ValueError("MuJoCo subcycling requires batched native CPU control")
         if self.regrasp_surface_indent_m is not None and self.grasp_pad_bottom_m is None:
             raise ValueError("Live regrasp height requires native pad-bottom calibration")
+        if self.infeed_grasp_pad_bottom_m is not None and self.grasp_pad_bottom_m is None:
+            raise ValueError("Infeed grasp height requires native pad-bottom calibration")
         if (
             self.regrasp_surface_indent_fraction is not None
             and self.regrasp_surface_indent_m is None
@@ -181,6 +202,14 @@ class SortingPlanner(PickPlaceClothPlanner):
                 )
             )
             + self.config.belt_transport_s
+            + self._infeed_duration_s
+        )
+
+    @property
+    def _infeed_duration_s(self) -> float:
+        travel = getattr(getattr(self.scene, "config", None), "infeed_travel_m", 0.0)
+        return (
+            travel / self.config.infeed_speed_mps + self.config.infeed_settle_s if travel else 0.0
         )
 
     @property
@@ -196,6 +225,10 @@ class SortingPlanner(PickPlaceClothPlanner):
         ):
             raise ValueError("Sorting requires MuJoCo robot + VBD parcel/contact")
         super().begin_episode(register_stepper=register_stepper)
+        self._initialize_tracking()
+
+    def _initialize_tracking(self) -> None:
+        """Initialize measurements on the already constructed continuous runtime."""
         phases = (
             "approach",
             "descend",
@@ -216,6 +249,15 @@ class SortingPlanner(PickPlaceClothPlanner):
             if getattr(self.config, f"{phase}_s") > 0
         ]
         self.schedule.append(("right", "conveyor", self.config.belt_transport_s))
+        if self._infeed_duration_s > 0:
+            self.schedule.insert(
+                0,
+                (
+                    "left",
+                    "infeed",
+                    self._infeed_duration_s,
+                ),
+            )
         self.ends = np.cumsum([row[2] for row in self.schedule])
         self._index = -1
         self._frame = 0
@@ -337,14 +379,52 @@ class SortingPlanner(PickPlaceClothPlanner):
         if not all(required.values()) and self.config.early_stop_on_shape_failure:
             self.failure_reason = f"{side} held parcel exceeded required shape-quality limits"
 
+    def _measure_moving_landing(
+        self, vertices: np.ndarray, coms: np.ndarray, robot_contacts: int, outfeed_contacts: int
+    ) -> None:
+        """Record initial touchdown separately from settling on a continuously moving belt."""
+        low, high = self.destination_bounds
+        supported = bool(np.all((vertices[:, :2] >= low[:2]) & (vertices[:, :2] <= high[:2])))
+        if not supported or robot_contacts or not outfeed_contacts:
+            return
+        leg = self.legs["right"]
+        if "landing_time_s" not in leg:
+            leg.update(
+                landing_time_s=self.elapsed,
+                landing_xy_m=coms[:, :2].tolist(),
+                place_error=float(np.max(np.linalg.norm(coms[:, :2] - self.goal[:2], axis=1))),
+            )
+        height = float(np.max(coms[:, 2] - self.goal[2]))
+        label = self.scene.label_up_cos(vertices)
+        if (
+            "release_verified_time_s" not in leg
+            and leg["place_error"] <= self.config.maximum_place_error_m
+            and height < 0.07
+            and np.min(coms[:, 2] - self.goal[2]) >= -self.config.maximum_table_penetration_m
+            and label >= self.config.label_up_min_cos
+        ):
+            leg.update(
+                release_verified_time_s=self.elapsed,
+                minimum_height=height,
+                released=True,
+                footprint_supported=True,
+                label_up_cos=label,
+            )
+
     def _enter(self, index: int, coms: np.ndarray) -> None:
         side, phase, _ = self.schedule[index]
         self._index = index
         self.checkpoint_times.append(self.elapsed)
         self.start_tcp = self.runtime.tcp_position(side)
+        if phase == "infeed":
+            self.runtime.infeed_speed = self.config.infeed_speed_mps
+            self.infeed_start_y = float(coms[0, 1])
+            return
         if phase != "approach" and self.command_side == side and self.command_tcp is not None:
             self.start_tcp = self.command_tcp.copy()
         if phase == "approach":
+            if side == "left":
+                self.runtime.infeed_speed = 0.0
             offset = (
                 self.config.regrasp_offset_xy_m
                 if side == "right" and self.config.regrasp_offset_xy_m is not None
@@ -356,6 +436,8 @@ class SortingPlanner(PickPlaceClothPlanner):
                 self.scene.supports["infeed" if side == "left" else "platform"][1][2]
             )
             self._episode_grasp_pad_bottom_m = self.config.grasp_pad_bottom_m
+            if side == "left" and self.config.infeed_grasp_pad_bottom_m is not None:
+                self._episode_grasp_pad_bottom_m = self.config.infeed_grasp_pad_bottom_m
             if side == "right" and self.config.regrasp_surface_indent_m is not None:
                 self._episode_grasp_pad_bottom_m = _regrasp_pad_bottom(
                     self.runtime.vertices()[: self.scene.garment_count],
@@ -393,6 +475,11 @@ class SortingPlanner(PickPlaceClothPlanner):
         previous_target = getattr(self, "target", self.start_tcp).copy()
         self.target = self.start_tcp.copy()
         if phase == "approach":
+            self._place_height_m = (
+                self.config.outfeed_place_height_m
+                if side == "right" and self.config.outfeed_place_height_m is not None
+                else self.config.place_height_m
+            )
             approach_height = max(
                 0.20, self._grasp_tcp_height(side, self.config.open_gripper_rad) + 0.10
             )
@@ -418,14 +505,14 @@ class SortingPlanner(PickPlaceClothPlanner):
                         ],
                         np.r_[self.pick[:2], self.support_z + self.config.lift_height_m],
                         np.r_[nominal_goal[:2], self.support_z + self.config.lift_height_m],
-                        nominal_goal + [0, 0, self.config.place_height_m],
+                        nominal_goal + [0, 0, self._place_height_m],
                         *(
                             [
                                 nominal_goal
                                 + [
                                     0,
                                     0,
-                                    self.config.place_height_m - self.config.release_lowering_m,
+                                    self._place_height_m - self.config.release_lowering_m,
                                 ]
                             ]
                             if self.config.release_lowering_m > 0
@@ -435,7 +522,7 @@ class SortingPlanner(PickPlaceClothPlanner):
                         + [
                             0,
                             0,
-                            self.config.place_height_m - self.config.release_lowering_m + 0.18,
+                            self._place_height_m - self.config.release_lowering_m + 0.18,
                         ],
                         self.runtime.parking_positions[side],
                     ],
@@ -458,7 +545,7 @@ class SortingPlanner(PickPlaceClothPlanner):
             self.target[:2] += self.goal[:2] - coms[0, :2]
         elif phase == "lower":
             self.target[:2] += self.goal[:2] - coms[0, :2]
-            self.target[2] = self.goal[2] + self.config.place_height_m
+            self.target[2] = self.goal[2] + self._place_height_m
         elif phase == "release":
             self.legs[side]["release_z"] = coms[:, 2].copy()
             self.target[2] -= self.config.release_lowering_m
@@ -470,7 +557,9 @@ class SortingPlanner(PickPlaceClothPlanner):
         elif phase == "return":
             self.target = self.runtime.parking_positions[side].copy()
         elif phase == "conveyor":
-            self._belt_start = coms[:, :2].copy()
+            self._belt_start = np.asarray(
+                self.legs[side].get("landing_xy_m", coms[:, :2]), float
+            ).copy()
             self.runtime.belt_speed = self.config.belt_speed_mps
 
     def on_physics_step(self, robot: Any) -> bool:
@@ -517,7 +606,8 @@ class SortingPlanner(PickPlaceClothPlanner):
             self.max_mimic_error, getattr(self.runtime, "maximum_native_mimic_error", 0.0)
         )
         if index >= len(self.schedule):
-            self.runtime.belt_speed = 0.0
+            if not self.config.continuous_outfeed:
+                self.runtime.belt_speed = 0.0
             self.state.update(done=True, phase="done")
             return True
         if self.max_mimic_error >= 0.03:
@@ -537,6 +627,7 @@ class SortingPlanner(PickPlaceClothPlanner):
         if (
             index != self._index
             and self.schedule[index][1] in {"approach", "conveyor"}
+            and (self.schedule[index][0] == "right")
             and index > 0
         ):
             previous_side = "left" if self.schedule[index][1] == "approach" else "right"
@@ -553,12 +644,38 @@ class SortingPlanner(PickPlaceClothPlanner):
                     f"{previous_side} arm did not release onto the destination support"
                 )
         if self.failure_reason is not None:
-            self.runtime.belt_speed = 0.0
+            self.runtime.infeed_speed = 0.0
             self.state.update(done=False, phase="failed")
             return True
         if index != self._index:
             self._enter(index, coms)
         side, phase, duration = self.schedule[index]
+        if phase == "infeed":
+            arrived = coms[0, 1] >= self.scene.config.target_xy[1]
+            if arrived:
+                self.runtime.infeed_speed = 0.0
+            self.rows.append(
+                dict(
+                    time_s=self.elapsed,
+                    phase="left_infeed",
+                    garment_com_m=coms[0].tolist(),
+                    bag_com_m=coms[1].tolist(),
+                    infeed_speed_mps=self.runtime.infeed_speed,
+                    state=q.tolist(),
+                    action=action.tolist(),
+                )
+            )
+            self.state.update(
+                phase="left_infeed",
+                progress={
+                    "arrived": bool(arrived),
+                    "parcel_y_m": float(coms[0, 1]),
+                    "infeed_speed_mps": self.runtime.infeed_speed,
+                },
+            )
+            self._frame += 1
+            self.elapsed = self._frame * self.robot.sim_world.config.physics_dt
+            return False
         leg = self.legs[side]
         leg["peak_lifts"] = np.maximum(leg["peak_lifts"], coms[:, 2] - leg["baseline"])
         counts = self.runtime.last_contact_counts
@@ -618,7 +735,10 @@ class SortingPlanner(PickPlaceClothPlanner):
             leg["release_drop"] = max(
                 leg["release_drop"], float(np.min(leg["release_z"] - coms[:, 2]))
             )
-        if phase == "rest":
+        moving_destination = side == "right" and self.config.continuous_outfeed
+        if moving_destination and phase in {"release", "retract", "return", "rest"}:
+            self._measure_moving_landing(vertices, coms, robot_contacts, counts.get("outfeed", 0))
+        if phase == "rest" and not moving_destination:
             leg["place_error"] = float(np.max(np.linalg.norm(coms[:, :2] - self.goal[:2], axis=1)))
             leg["minimum_height"] = float(np.max(coms[:, 2] - self.goal[2]))
             leg["released"] = robot_contacts == 0
@@ -681,14 +801,15 @@ class SortingPlanner(PickPlaceClothPlanner):
         elif phase == "conveyor":
             self.belt_displacement = float(np.min(self._belt_start[:, 0] - coms[:, 0]))
             low, high = self.scene.supports["outfeed"]
-            self.belt_exited = bool(
+            self.belt_exited = self.belt_exited or bool(
                 vertices[:, 0].max() < low[0]
                 and np.all((coms[:, 1] >= low[1]) & (coms[:, 1] <= high[1]))
             )
             if self.belt_exited:
-                self.runtime.belt_speed = 0.0
-                self.state.update(done=True, phase="done")
-                return True
+                if not self.config.continuous_outfeed:
+                    self.runtime.belt_speed = 0.0
+                    self.state.update(done=True, phase="done")
+                    return True
         state, action = self.runtime.recording_coordinates()
         self.actions[-1] = action
         self.rows.append(
@@ -889,16 +1010,8 @@ class SortingPlanner(PickPlaceClothPlanner):
                     and leg["label_up_cos"] >= self.config.label_up_min_cos,
                 }
             )
-            legs[side] = {
-                key: (value.tolist() if isinstance(value, np.ndarray) else value)
-                for key, value in leg.items()
-            }
+            legs[side] = _finite_metrics(leg)
             legs[side]["bilateral_transfer_fraction"] = fraction
-            for key, value in legs[side].items():
-                if isinstance(value, list):
-                    legs[side][key] = [v if np.isfinite(v) else None for v in value]
-                elif isinstance(value, float) and not np.isfinite(value):
-                    legs[side][key] = None
         checks = {key: bool(value) for key, value in checks.items()}
         strict_checks = checks.copy()
         workflow_checks = without_bag_gap_checks(strict_checks, shape)

@@ -70,9 +70,9 @@ pad_width_m = 0.03  # 原生指垫；机器人结构固定，不允许加宽。
 
 [[robot.cameras]]
 name = "head"
-prim_path = "/World/robots/ProM6/Geometry/base_link/sorting_head_camera"
-pose_relative_to = "/World/robots/ProM6/Geometry/base_link"
-pose = { position = [0.0, -0.70, 1.7], orientation_wxyz = [0.989361, 0.145478, 0.0, 0.0] }
+prim_path = "/World/robots/ProM6/Geometry/base_link/tn__Headdepth_Link_oE/Camera_Head/sorting_head_camera"
+pose_relative_to = "/World/robots/ProM6/Geometry/base_link/tn__Headdepth_Link_oE/Camera_Head"
+pose = { position = [0.0, 0.0, 0.0], orientation_wxyz = [1.0, 0.0, 0.0, 0.0] }
 resolution = [640, 480]
 clipping_range = [0.01, 80.0]
 focal_length = 10.0
