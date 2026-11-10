@@ -65,6 +65,12 @@ class IsaacsimWorldConfig(BaseConfig):
     height: int = Field(default=720, gt=0)
     rt_subframes: int = Field(default=1, ge=1)
     samples_per_pixel_per_frame: int = Field(default=64, ge=1)
+    pathtracing_max_bounces: int = Field(default=4, ge=1)
+    pathtracing_denoiser: bool = True
+    pathtracing_temporal_denoising: bool = False
+    pathtracing_cached: bool = True
+    pathtracing_many_light_sampling: bool = True
+    synchronous_capture: bool = False
     warmup_frames: int = Field(default=2, ge=0, description="初始化时只刷新 UI/渲染的帧数")
     dlss: bool = False
     auto_exposure: bool = False
@@ -294,12 +300,7 @@ class IsaacsimWorld(BaseSimWorld):
         self.update()
         self._load_environment()
         self._renderer.set_dt(self.config.rendering_dt)
-        self._settings.set("/rtx/rendermode", self.config.renderer)
-        self._settings.set_bool("/rtx/post/dlss/enabled", self.config.dlss)
-        # SimulationApp defaults to AA mode 3 (DLSS). Select spatial FXAA when
-        # DLSS is disabled, avoiding incompatible temporal history across cameras.
-        self._settings.set_int("/rtx/post/aa/op", 3 if self.config.dlss else 2)
-        self._settings.set_bool("/rtx/post/tonemap/autoExposure/enabled", self.config.auto_exposure)
+        self._configure_rendering()
         if self.config.headless:
             # Dataset RGB must not include viewport grids, axes, or selection guides.
             self._settings.set_int("/persistent/app/viewport/displayOptions", 0)
@@ -311,6 +312,52 @@ class IsaacsimWorld(BaseSimWorld):
         self.log.info(
             "世界初始化完成", engine=self.physics_engine, execution=self.config.newton_execution
         )
+
+    def _configure_rendering(self) -> None:
+        """Apply spatial rendering and optional synchronous multi-camera capture settings."""
+        self._settings.set("/rtx/rendermode", self.config.renderer)
+        self._settings.set_bool("/rtx/post/dlss/enabled", self.config.dlss)
+        # SimulationApp defaults to AA mode 3 (DLSS). Select spatial FXAA when
+        # DLSS is disabled, avoiding incompatible temporal history across cameras.
+        self._settings.set_int("/rtx/post/aa/op", 3 if self.config.dlss else 2)
+        self._settings.set_bool("/rtx/post/tonemap/autoExposure/enabled", self.config.auto_exposure)
+        if self.config.renderer == "PathTracing":
+            samples = self.config.samples_per_pixel_per_frame
+            self._settings.set_int("/rtx/pathtracing/spp", min(32, samples))
+            self._settings.set_int("/rtx/pathtracing/totalSpp", samples)
+            self._settings.set_int("/rtx/pathtracing/clampSpp", samples)
+            for key in ("maxBounces", "maxSpecularAndTransmissionBounces"):
+                self._settings.set_int(
+                    f"/rtx/pathtracing/{key}", self.config.pathtracing_max_bounces
+                )
+            self._settings.set_bool(
+                "/rtx/pathtracing/optixDenoiser/enabled", self.config.pathtracing_denoiser
+            )
+            self._settings.set_bool(
+                "/rtx/pathtracing/optixDenoiser/temporalMode/enabled",
+                self.config.pathtracing_temporal_denoising,
+            )
+            self._settings.set_bool(
+                "/rtx/pathtracing/cached/enabled", self.config.pathtracing_cached
+            )
+            self._settings.set_bool(
+                "/rtx/pathtracing/lightcache/cached/enabled",
+                self.config.pathtracing_many_light_sampling,
+            )
+        if self.config.synchronous_capture:
+            from omni.kit.renderer_capture import acquire_renderer_capture_interface
+
+            self._settings.set_bool("/app/asyncRendering", False)
+            self._settings.set_bool("/app/asyncRenderingLowLatency", False)
+            self._settings.set_bool("/rtx/materialDb/syncLoads", True)
+            self._settings.set_bool("/rtx/hydra/materialSyncLoads", True)
+            self._settings.set_bool("/rtx/resetPtAccumOnAnimTimeChange", False)
+            # Keep material loading free to invalidate accumulation during warmup.
+            # The capture helper controls history only after the view has settled.
+            self._settings.set_bool(
+                "/rtx-transient/resetPtAccumOnlyWhenExternalFrameCounterChanges", False
+            )
+            acquire_renderer_capture_interface().set_capture_sync(True)
 
     @staticmethod
     def _resolve_asset(path: str) -> str:

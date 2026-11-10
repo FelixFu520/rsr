@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Annotated
 
 import typer
 
@@ -75,6 +76,66 @@ def run(
 
     job = AutoJob.from_config()  # 按 [job].backend 选型
     job.run()  # 五段生命周期,finally close
+
+
+@app.command("render-sorting")
+def render_sorting(
+    source: Annotated[
+        Path,
+        typer.Option(
+            "--source",
+            exists=True,
+            file_okay=False,
+            resolve_path=True,
+            help="已验收分拣物理轨迹目录，含 configuration.json、particles.npz 和 result.json",
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            file_okay=False,
+            resolve_path=True,
+            help="新视频与 LeRobot v3 的输出目录",
+        ),
+    ],
+    render_profile: Annotated[
+        Path,
+        typer.Option(
+            "--render-profile",
+            exists=True,
+            dir_okay=False,
+            resolve_path=True,
+            help="高清路径追踪参数 JSON",
+        ),
+    ] = Path("configs/sorting_stream_showcase_render.json"),
+    fps: Annotated[int, typer.Option("--fps", min=1, help="四路共享的采样率")] = 15,
+) -> None:
+    """复用已保存的分拣物理轨迹，按 overview、head、左右腕依次渲染整段。"""
+    import subprocess
+    import sys
+
+    script = Path(__file__).resolve().parents[2] / "scripts" / "render_sorting_package.py"
+    if not script.is_file():
+        raise typer.BadParameter("此命令需要在包含 scripts/render_sorting_package.py 的项目中运行")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            str(source),
+            "--output",
+            str(output),
+            "--render-profile",
+            str(render_profile),
+            "--fps",
+            str(fps),
+            "--capture-order",
+            "camera",
+        ],
+        check=False,
+    )
+    if completed.returncode:
+        raise typer.Exit(completed.returncode if completed.returncode > 0 else 1)
 
 
 def register(main_app: typer.Typer) -> None:

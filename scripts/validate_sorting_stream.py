@@ -19,7 +19,11 @@ from real2sim2real.utils.sorting_quality import (
     without_bag_gap_checks,
 )
 from scripts.collect_physic_solver_cases import validate_dataset
-from scripts.render_sorting_package import replay_indices
+from scripts.render_sorting_package import (
+    ReplayRenderProfile,
+    override_render_profile,
+    replay_indices,
+)
 
 
 def soft_geometry_quality(positions: np.ndarray, rest: np.ndarray, triangles: np.ndarray) -> dict:
@@ -88,8 +92,12 @@ def audit(output: Path) -> dict:
             if camera["name"] in overrides:
                 camera["pose"] = overrides[camera["name"]]
                 observed.add(camera["name"])
+    if result.get("observation_render_profile") is not None:
+        expected = override_render_profile(
+            expected, ReplayRenderProfile.model_validate(result["observation_render_profile"])
+        )
     if expected != config or observed != set(overrides):
-        raise ValueError("Replay configuration differs beyond declared optical poses")
+        raise ValueError("Replay configuration differs beyond declared optical/render settings")
     outcome = json.loads((output / "lerobot_v3/meta/task_outcome.json").read_text())
     if outcome["physical_result"] != result or outcome["configuration"] != config:
         raise ValueError("LeRobot outcome metadata differs from the rendered source")

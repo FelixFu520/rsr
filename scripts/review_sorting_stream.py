@@ -120,7 +120,9 @@ def prepare_review(output: Path) -> None:
     command.extend(
         [
             "-filter_complex",
-            "[0:v][1:v]hstack=inputs=2[top];[2:v][3:v]hstack=inputs=2[bottom];"
+            "[0:v]scale=640:480[v0];[1:v]scale=640:480[v1];"
+            "[2:v]scale=640:480[v2];[3:v]scale=640:480[v3];"
+            "[v0][v1]hstack=inputs=2[top];[v2][v3]hstack=inputs=2[bottom];"
             "[top][bottom]vstack=inputs=2[out]",
             "-map",
             "[out]",

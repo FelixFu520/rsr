@@ -1,0 +1,10 @@
+{
+  "renderer": "PathTracing",
+  "resolution": [1920, 1440],
+  "samples_per_pixel_per_frame": 32,
+  "rt_subframes": 2,
+  "max_bounces": 4,
+  "denoiser": true,
+  "cached_path_tracing": false,
+  "many_light_sampling": false
+}

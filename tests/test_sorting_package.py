@@ -933,6 +933,44 @@ def test_replay_optical_overrides_reject_nonoptical_fields_and_preserve_source()
         override_camera_poses(source, {"left_wrist": {"position": [float("nan"), 0, 0]}})
 
 
+def test_presentation_profile_cannot_modify_physics_or_camera_mounts():
+    import copy
+
+    from scripts.render_sorting_package import ReplayRenderProfile, override_render_profile
+
+    source = {
+        "sim_world": {"physics_dt": 1 / 60, "renderer": "RayTracedLighting"},
+        "scene": {
+            "garment_mass_kg": 0.025,
+            "cloth_usd_path": "original.usd",
+            "cameras": [{"name": "overview", "resolution": [640, 480], "pose": {"x": 1}}],
+        },
+        "robot": {
+            "usd_path": "native.usda",
+            "cameras": [{"name": "head", "resolution": [640, 480], "pose": {"x": 2}}],
+        },
+        "planner": {"gripper_package_friction": 2.0},
+    }
+    original = copy.deepcopy(source)
+    rendered = override_render_profile(source, ReplayRenderProfile())
+    assert source == original
+    assert rendered["sim_world"]["physics_dt"] == source["sim_world"]["physics_dt"]
+    assert rendered["planner"] == source["planner"]
+    for section in ("scene", "robot"):
+        camera = rendered[section]["cameras"][0]
+        assert camera["resolution"] == [1920, 1440]
+        camera["resolution"] = source[section]["cameras"][0]["resolution"]
+        assert rendered[section] == source[section]
+    for invalid in (
+        {"physics_dt": 0.1},
+        {"garment_mass_kg": 1},
+        {"resolution": [1921, 1440]},
+        {"samples_per_pixel_per_frame": 0},
+    ):
+        with pytest.raises(ValueError):
+            ReplayRenderProfile(**invalid)
+
+
 def test_sorting_ik_honors_the_configured_closing_direction():
     from real2sim2real.planner.planner_sorting import SortingPlannerConfig
     from real2sim2real.planner.sorting_runtime import SortingRuntime
@@ -1260,13 +1298,15 @@ np.testing.assert_allclose(world_states[0][3][:26],world_states[1][3][:26],atol=
     assert completed.returncode == 0, completed.stderr
 
 
-def test_stream_config_keeps_successful_soft_asset_and_native_head_mount():
-    from real2sim2real.job.job_sorting import SortingJob
+def test_stream_config_keeps_successful_soft_asset_and_native_head_mount(tmp_path):
+    from real2sim2real.job.job_sorting import SortingJob, SortingJobConfig
     from real2sim2real.planner.planner_sorting_stream import SortingStreamPlanner
 
     try:
         apply_settings_file("configs/PhysicSolver_mujoco_vbd_sorting_stream.toml")
-        job = SortingJob()
+        config = SortingJobConfig.from_settings("job")
+        config.output_dir = str(tmp_path)
+        job = SortingJob(config=config)
         assert isinstance(job.planner, SortingStreamPlanner)
         assert "v10_station" in job.scene.config.cloth_usd_path
         assert job.scene.config.clear_legacy_parcels
@@ -1278,6 +1318,339 @@ def test_stream_config_keeps_successful_soft_asset_and_native_head_mount():
         assert len(job.recording_cameras) == 4
     finally:
         reset_settings()
+
+
+def test_showcase_config_uses_four_hd_views_without_starting_simulation(tmp_path):
+    from real2sim2real.job.job_sorting import SortingJobConfig
+
+    try:
+        apply_settings_file("configs/PhysicSolver_mujoco_vbd_sorting_stream.toml")
+        base_config = SortingJobConfig.from_settings("job")
+        base_config.output_dir = str(tmp_path / "base")
+        original = SortingJob(config=base_config)
+        apply_settings_file("configs/PhysicSolver_mujoco_vbd_sorting_stream_showcase.toml")
+        config = SortingJobConfig.from_settings("job")
+        assert config.output_dir == "outputs/sorting_stream_showcase_sync"
+        config.output_dir = str(tmp_path / "showcase")
+        showcase = SortingJob(config=config)
+        assert showcase.sim_world.app is None
+        assert showcase.sim_world.config.renderer == "PathTracing"
+        assert showcase.sim_world.config.synchronous_capture
+        assert not showcase.sim_world.config.pathtracing_cached
+        assert not showcase.sim_world.config.pathtracing_many_light_sampling
+        assert not showcase.sim_world.config.pathtracing_temporal_denoising
+        assert not showcase.sim_world.config.auto_exposure
+        assert showcase.config.recorder.fps == 15
+        assert showcase.record_stride == 4
+        assert [camera.name for camera in showcase.recording_cameras] == [
+            "overview",
+            "head",
+            "left_wrist",
+            "right_wrist",
+        ]
+        for camera, source in zip(
+            showcase.recording_cameras, original.recording_cameras, strict=True
+        ):
+            assert camera.resolution == (1920, 1440)
+            assert camera.model_dump(exclude={"resolution"}) == source.model_dump(
+                exclude={"resolution"}
+            )
+        for section in ("scene", "robot"):
+            assert getattr(showcase, section).config.model_dump(exclude={"cameras"}) == getattr(
+                original, section
+            ).config.model_dump(exclude={"cameras"})
+        assert showcase.planner.config == original.planner.config
+    finally:
+        reset_settings()
+
+
+@pytest.mark.parametrize("advance_physics", [False, True])
+def test_all_four_views_share_one_physics_step(monkeypatch, tmp_path, advance_physics):
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    import real2sim2real.job.job_physic_solver as module
+
+    viewport = SimpleNamespace(camera_path="/World/GUI", resolution=(800, 600))
+    utility = ModuleType("omni.kit.viewport.utility")
+    utility.get_active_viewport = lambda: viewport
+    monkeypatch.setitem(sys.modules, utility.__name__, utility)
+    job = object.__new__(SortingJob)
+    job.sim_world = SimpleNamespace(physics_steps=0)
+    names = ["overview", "head", "left_wrist", "right_wrist"]
+    job.recording_cameras = [
+        SimpleNamespace(name=name, prim_path=f"/World/{name}", resolution=(1920, 1440))
+        for name in names
+    ]
+    recorder = SimpleNamespace(frame_path=lambda name: tmp_path / f"{name}.png")
+    captured = []
+
+    def capture(world, path, **kwargs):
+        captured.append((world.physics_steps, path.stem))
+        viewport.camera_path = kwargs["camera_prim"]
+        viewport.resolution = (kwargs["width"], kwargs["height"])
+        if advance_physics:
+            world.physics_steps += 1
+
+    monkeypatch.setattr(module, "capture_viewport_frame", capture)
+    if advance_physics:
+        with pytest.raises(RuntimeError, match="advanced physics between views"):
+            job._capture_cameras(recorder)
+        assert captured == [(0, "overview")]
+    else:
+        job._capture_cameras(recorder)
+        job.sim_world.physics_steps = 4
+        job._capture_cameras(recorder)
+        assert captured == [(step, name) for step in (0, 4) for name in names]
+    assert (viewport.camera_path, viewport.resolution) == ("/World/GUI", (800, 600))
+
+
+@pytest.mark.parametrize("fail_capture", [False, True])
+@pytest.mark.parametrize("camera_sequence", [False, True])
+def test_synchronous_pt_flushes_view_before_locking_history(
+    monkeypatch, tmp_path, fail_capture, camera_sequence
+):
+    import asyncio
+    import sys
+    from pathlib import Path
+    from types import ModuleType, SimpleNamespace
+    from unittest.mock import Mock
+
+    from real2sim2real.simworld.isaacsim import IsaacsimWorld, IsaacsimWorldConfig
+    from real2sim2real.utils.lerobot_v3 import capture_viewport_frame
+
+    loop = asyncio.new_event_loop()
+    monkeypatch.setattr(asyncio, "ensure_future", lambda coroutine: loop.create_task(coroutine))
+    control = "/rtx-transient/resetPtAccumOnlyWhenExternalFrameCounterChanges"
+    values = {}
+    settings = SimpleNamespace(
+        get=values.get,
+        set=lambda key, value: values.__setitem__(key, value),
+        set_bool=lambda key, value: values.__setitem__(key, value),
+        set_int=lambda key, value: values.__setitem__(key, value),
+    )
+    rendered, captured = [], []
+    viewport = SimpleNamespace(camera_path="/World/GUI", resolution=(640, 480))
+
+    async def wait_for_rendered_frames(count):
+        rendered.append((count, values[control]))
+        await asyncio.sleep(0)
+
+    viewport.wait_for_rendered_frames = wait_for_rendered_frames
+
+    def capture_to_file(viewport, filename):
+        captured.append(values["/rtx/externalFrameCounter"])
+
+        async def wait_for_result(**kwargs):
+            if fail_capture:
+                raise RuntimeError("capture unavailable")
+            Path(filename).write_bytes(b"mock image")
+            await asyncio.sleep(0)
+
+        return SimpleNamespace(
+            wait_for_result=wait_for_result, view=np.eye(4), resolution=viewport.resolution
+        )
+
+    modules = {
+        name: ModuleType(name)
+        for name in (
+            "omni",
+            "omni.usd",
+            "omni.kit",
+            "omni.kit.viewport",
+            "omni.kit.viewport.utility",
+            "omni.kit.renderer_capture",
+            "pxr",
+        )
+    }
+    reset = Mock()
+    modules["omni"].usd = modules["omni.usd"]
+    modules["omni.usd"].get_context = lambda: SimpleNamespace(reset_renderer_accumulation=reset)
+    utility = modules["omni.kit.viewport.utility"]
+    utility.get_active_viewport = lambda: viewport
+    utility.capture_viewport_to_file = capture_to_file
+    renderer = Mock()
+    modules["omni.kit.renderer_capture"].acquire_renderer_capture_interface = lambda: renderer
+    modules["pxr"].UsdGeom = SimpleNamespace(
+        Camera=object,
+        XformCache=lambda: SimpleNamespace(
+            GetLocalToWorldTransform=lambda prim: SimpleNamespace(GetInverse=lambda: np.eye(4))
+        ),
+    )
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    world = IsaacsimWorld(
+        IsaacsimWorldConfig(
+            renderer="PathTracing",
+            samples_per_pixel_per_frame=64,
+            rt_subframes=2,
+            synchronous_capture=True,
+            pathtracing_cached=False,
+            pathtracing_many_light_sampling=False,
+        )
+    )
+    world._settings = settings
+    world.stage = SimpleNamespace(GetPrimAtPath=lambda path: SimpleNamespace(IsA=lambda cls: True))
+    world.update = lambda: loop.run_until_complete(asyncio.sleep(0))
+    try:
+        world._configure_rendering()
+        assert values["/app/asyncRendering"] is False
+        assert values["/rtx/materialDb/syncLoads"] is True
+        assert values["/rtx/pathtracing/cached/enabled"] is False
+        assert values["/rtx/pathtracing/lightcache/cached/enabled"] is False
+        assert values["/rtx/pathtracing/optixDenoiser/temporalMode/enabled"] is False
+        renderer.set_capture_sync.assert_called_once_with(True)
+        if camera_sequence:
+            # The camera-batched caller already warmed this view and keeps
+            # accumulation externally controlled across the full sequence.
+            viewport.camera_path, viewport.resolution = "/World/overview", (1920, 1440)
+            values[control] = True
+        if fail_capture:
+            with pytest.raises(RuntimeError, match="capture unavailable"):
+                capture_viewport_frame(
+                    world,
+                    tmp_path / "failed.png",
+                    width=1920,
+                    height=1440,
+                    camera_sequence=camera_sequence,
+                )
+        else:
+            for name in ("overview", "head", "left_wrist", "right_wrist"):
+                capture_viewport_frame(
+                    world,
+                    tmp_path / f"{name}.png",
+                    width=1920,
+                    height=1440,
+                    camera_prim="/World/overview" if camera_sequence else f"/World/{name}",
+                    camera_sequence=camera_sequence,
+                )
+            assert captured == [1, 2, 3, 4]
+        assert rendered == ([(3, True)] if camera_sequence else [(8, False), (3, True)]) * len(
+            captured
+        )
+        assert values[control] is camera_sequence
+        assert reset.call_count == (0 if camera_sequence else len(captured))
+        assert world.physics_steps == 0
+    finally:
+        loop.close()
+
+
+@pytest.mark.parametrize("advance_physics", [False, True])
+def test_camera_batches_keep_exact_source_samples_and_commit_only_complete_groups(
+    monkeypatch, tmp_path, advance_physics
+):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import scripts.render_sorting_package as module
+    from real2sim2real.utils.cameras import CameraConfig
+
+    names = ["overview", "head", "left_wrist", "right_wrist"]
+    job = object.__new__(module.SortingReplayJob)
+    job.output = tmp_path
+    job.indices = np.array([0, 4])
+    job.saved = dict(
+        times=np.arange(5) / 60,
+        state=np.arange(10).reshape(5, 2),
+        action=np.arange(10, 20).reshape(5, 2),
+    )
+    values = {}
+    control = "/rtx-transient/resetPtAccumOnlyWhenExternalFrameCounterChanges"
+    job.sim_world = SimpleNamespace(
+        physics_steps=0,
+        config=SimpleNamespace(synchronous_capture=True, renderer="PathTracing"),
+        _settings=SimpleNamespace(
+            get=values.get, set_bool=lambda key, value: values.__setitem__(key, value)
+        ),
+    )
+    job.recording_cameras = [
+        CameraConfig(
+            name=name, prim_path=f"/World/{name}", pose_relative_to="/World", resolution=(64, 48)
+        )
+        for name in names
+    ]
+    warmed, captured, current = [], [], {}
+    job._prepare_offline_render = lambda index, camera: warmed.append((index, camera.name))
+    job._publish_sample = lambda index: current.update(index=index)
+    recorder = LeRobotV3Recorder(
+        tmp_path / "lerobot_v3",
+        fps=15,
+        width=64,
+        height=48,
+        task="mock source replay",
+        cameras={name: (64, 48) for name in names},
+        joint_names=["a", "b"],
+    )
+
+    def capture(world, path, **kwargs):
+        assert kwargs["camera_sequence"]
+        captured.append((path.parent.name, current["index"]))
+        Image.new("RGB", (64, 48), (current["index"], 10, 20)).save(path)
+        if advance_physics:
+            world.physics_steps += 1
+
+    monkeypatch.setattr(module, "capture_viewport_frame", capture)
+    # Leave the normal logger lazy; no Isaac Sim resources are created.
+    if advance_physics:
+        with pytest.raises(RuntimeError, match="advanced physics"):
+            job._capture_camera_sequences(recorder, 0)
+        assert recorder.rows == []
+    else:
+        original_add = recorder.add_frame
+
+        def add_frame(state, action):
+            assert len(captured) == 8
+            original_add(state, action)
+
+        recorder.add_frame = Mock(side_effect=add_frame)
+        job._capture_camera_sequences(recorder, 0)
+        assert warmed == [(0, name) for name in names]
+        assert captured == [(name, index) for name in names for index in (0, 4)]
+        assert [row["timestamp"] for row in recorder.rows] == [0, 1 / 15]
+        assert [row["observation.state"] for row in recorder.rows] == [[0, 1], [8, 9]]
+        assert [row["action"] for row in recorder.rows] == [[10, 11], [18, 19]]
+        progress = json.loads((tmp_path / "render_progress.json").read_text())
+        assert progress["camera"] == "right_wrist"
+        assert progress["source_index"] == 4
+        assert progress["physics_steps_advanced"] == 0
+    assert values[control] is False
+
+
+@pytest.mark.parametrize("exit_code", [0, 3])
+def test_manual_camera_render_cli_only_launches_when_invoked(monkeypatch, tmp_path, exit_code):
+    import sys
+    from pathlib import Path
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from typer.testing import CliRunner
+
+    from real2sim2real.job.cli import app
+
+    source = tmp_path / "source"
+    source.mkdir()
+    profile = tmp_path / "profile.json"
+    profile.write_text("{}")
+    launch = Mock(return_value=SimpleNamespace(returncode=exit_code))
+    monkeypatch.setattr(subprocess, "run", launch)
+    result = CliRunner().invoke(
+        app,
+        [
+            "render-sorting",
+            "--source",
+            str(source),
+            "--output",
+            str(tmp_path / "render"),
+            "--render-profile",
+            str(profile),
+        ],
+    )
+    assert result.exit_code == exit_code, result.output
+    arguments = launch.call_args.args[0]
+    assert arguments[0] == sys.executable
+    assert Path(arguments[1]).name == "render_sorting_package.py"
+    assert arguments[2] == str(source)
+    assert arguments[-2:] == ["--capture-order", "camera"]
 
 
 def test_cached_soft_success_cannot_hide_damage_during_the_later_rigid_relay():

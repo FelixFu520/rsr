@@ -1,0 +1,37 @@
+# 手动启动：每个采样时刻拍完四台相机，再推进物理；不分相机整段采集。
+# ./scripts/rsr collect run -c configs/PhysicSolver_mujoco_vbd_sorting_stream_showcase.toml
+inherit = "PhysicSolver_mujoco_vbd_sorting_stream.toml"
+
+[sim_world]
+renderer = "PathTracing"
+width = 1920
+height = 1440
+samples_per_pixel_per_frame = 32
+rt_subframes = 2
+pathtracing_max_bounces = 4
+pathtracing_denoiser = true
+pathtracing_temporal_denoising = false
+pathtracing_cached = false
+pathtracing_many_light_sampling = false
+synchronous_capture = true
+dlss = false
+auto_exposure = false
+
+[scene]
+cameras = '''@reset [{ name = "overview", prim_path = "/World/Cameras/overview", pose_relative_to = "/World", pose = { position = [3.2, -4.6, 4.4], orientation_wxyz = [0.820381835618835, 0.4335524724233305, 0.1742040276597923, 0.3296344250672163] }, resolution = [1920, 1440], clipping_range = [0.1, 80.0], focal_length = 18.0, horizontal_aperture = 20.955 }]'''
+
+[robot]
+cameras = '''@reset [
+{ name = "head", prim_path = "/World/robots/ProM6/Geometry/base_link/tn__Headdepth_Link_oE/Camera_Head/sorting_head_camera", pose_relative_to = "/World/robots/ProM6/Geometry/base_link/tn__Headdepth_Link_oE/Camera_Head", pose = { position = [0.0, 0.0, 0.0], orientation_wxyz = [1.0, 0.0, 0.0, 0.0] }, resolution = [1920, 1440], clipping_range = [0.01, 80.0], focal_length = 10.0, horizontal_aperture = 20.955 },
+{ name = "left_wrist", prim_path = "/World/robots/ProM6/robotiq_left/sorting_wrist_camera", pose_relative_to = "/World/robots/ProM6/robotiq_left", pose = { position = [0.22, 0.0, 0.10], orientation_wxyz = [-0.29427033899711486, 0.6429657592644596, -0.6429657592644596, 0.29427033899711486] }, resolution = [1920, 1440], clipping_range = [0.005, 20.0], focal_length = 8.0, horizontal_aperture = 20.955 },
+{ name = "right_wrist", prim_path = "/World/robots/ProM6/robotiq_right/sorting_wrist_camera", pose_relative_to = "/World/robots/ProM6/robotiq_right", pose = { position = [0.22, 0.0, 0.10], orientation_wxyz = [-0.29427033899711486, 0.6429657592644596, -0.6429657592644596, 0.29427033899711486] }, resolution = [1920, 1440], clipping_range = [0.005, 20.0], focal_length = 8.0, horizontal_aperture = 20.955 }
+]'''
+
+[job]
+output_dir = "outputs/sorting_stream_showcase_sync"
+timeout_s = 86400.0
+
+[job.recorder]
+fps = 15
+width = 1920
+height = 1440

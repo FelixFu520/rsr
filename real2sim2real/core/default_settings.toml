@@ -7,6 +7,9 @@ console = true  # 文本控制台输出
 backend = "stub"  # 不启动 Kit
 # Featherstone 双相机采集示例：renderer="RayTracedLighting"、rt_subframes=4。
 # samples_per_pixel_per_frame=64 仅 PathTracing 生效；采集核对真实渲染帧及相机矩阵。
+# IsaacsimWorld：pathtracing_max_bounces=4、pathtracing_denoiser=true。
+# pathtracing_temporal_denoising=false；pathtracing_cached/pathtracing_many_light_sampling=true。
+# synchronous_capture=false；高清同步采集示例将其设为 true，并关闭两项光照缓存。
 # background_light_scale=1.0；引用背景子树的灯光强度倍率，官方衣服示例设为 0.25。
 
 [scene]

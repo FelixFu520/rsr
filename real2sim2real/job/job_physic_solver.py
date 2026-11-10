@@ -294,6 +294,7 @@ class PhysicSolverJob(BaseJob):
         if viewport is None:
             raise RuntimeError("No active viewport for RGB capture")
         previous_camera, previous_resolution = viewport.camera_path, viewport.resolution
+        physics_step = self.sim_world.physics_steps
         try:
             if not self.recording_cameras:
                 capture_viewport_frame(
@@ -310,5 +311,9 @@ class PhysicSolverJob(BaseJob):
                     height=camera.resolution[1],
                     camera_prim=camera.prim_path,
                 )
+                if self.sim_world.physics_steps != physics_step:
+                    raise RuntimeError("Multi-camera capture advanced physics between views")
+            if self.sim_world.physics_steps != physics_step:
+                raise RuntimeError("Multi-camera capture advanced physics")
         finally:
             viewport.camera_path, viewport.resolution = previous_camera, previous_resolution

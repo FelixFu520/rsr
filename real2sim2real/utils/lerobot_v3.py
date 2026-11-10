@@ -311,61 +311,107 @@ class LeRobotV3Recorder:
 
 
 def capture_viewport_frame(
-    world: Any, path: Path, *, width: int, height: int, camera_prim: str | None = None
+    world: Any,
+    path: Path,
+    *,
+    width: int,
+    height: int,
+    camera_prim: str | None = None,
+    camera_sequence: bool = False,
 ) -> None:
-    """Capture the current USD pose without advancing physics; synchronous file completion."""
+    """Capture without physics steps; camera_sequence reuses an already warmed fixed view."""
     import asyncio
 
+    import omni.usd
     from omni.kit.renderer_capture import acquire_renderer_capture_interface
     from omni.kit.viewport.utility import capture_viewport_to_file, get_active_viewport
 
     viewport = get_active_viewport()
     if viewport is None:
         raise RuntimeError("No active viewport for RGB capture")
+    changed_view = tuple(viewport.resolution) != (width, height) or (
+        camera_prim is not None and str(viewport.camera_path) != camera_prim
+    )
     if camera_prim is not None:
         from pxr import UsdGeom
 
         prim = world.stage.GetPrimAtPath(camera_prim)
         if not prim or not prim.IsA(UsdGeom.Camera):
             raise ValueError(f"Recording camera does not exist: {camera_prim}")
-        viewport.camera_path = camera_prim
+        if str(viewport.camera_path) != camera_prim:
+            viewport.camera_path = camera_prim
         expected_view = np.asarray(
             UsdGeom.XformCache().GetLocalToWorldTransform(prim).GetInverse(), dtype=float
         )
     else:
         expected_view = None
-    viewport.resolution = (width, height)
+    if tuple(viewport.resolution) != (width, height):
+        viewport.resolution = (width, height)
     before = world.physics_steps
-    for _attempt in range(3):
-        # Kit update ticks can outpace Hydra/GPU completion. Count actual render
-        # events, then validate the capture's camera matrix before committing it.
-        rendered = asyncio.ensure_future(
-            viewport.wait_for_rendered_frames(max(2, world.config.rt_subframes))
-        )
+    path_tracing = getattr(world.config, "renderer", "") == "PathTracing"
+    controlled = path_tracing and getattr(world.config, "synchronous_capture", False)
+    history_control = "/rtx-transient/resetPtAccumOnlyWhenExternalFrameCounterChanges"
+    settings = world._settings if controlled else None
+    previous_control = bool(settings.get(history_control)) if controlled else False
+
+    def wait_rendered_frames(count: int) -> None:
+        # Kit updates can outpace Hydra/GPU completion. Count actual render events.
+        rendered = asyncio.ensure_future(viewport.wait_for_rendered_frames(count))
         for _ in range(240):
             world.update()
             if rendered.done():
                 rendered.result()
-                break
-        else:
-            rendered.cancel()
-            raise TimeoutError(f"Viewport render did not complete: {viewport.camera_path}")
-        future = capture_viewport_to_file(viewport, str(path))
-        task = asyncio.ensure_future(future.wait_for_result(completion_frames=0))
-        for _ in range(120):
-            world.update()
-            if task.done():
-                task.result()
-                acquire_renderer_capture_interface().wait_async_capture()
-                break
-        else:
-            task.cancel()
-            raise TimeoutError(f"RGB capture timed out: {path}")
-        if not path.is_file() or world.physics_steps != before:
-            raise RuntimeError("Capture failed or advanced physics")
-        actual_view = np.asarray(future.view, dtype=float).reshape(4, 4)
-        if tuple(future.resolution) == (width, height) and (
-            expected_view is None or np.allclose(actual_view, expected_view, rtol=0, atol=1e-5)
-        ):
-            return
-    raise RuntimeError(f"RGB capture did not match camera/resolution: {camera_prim}")
+                return
+        rendered.cancel()
+        raise TimeoutError(f"Viewport render did not complete: {viewport.camera_path}")
+
+    try:
+        for _attempt in range(3):
+            continuing_sequence = (
+                controlled
+                and camera_sequence
+                and previous_control
+                and not changed_view
+                and not _attempt
+            )
+            # Flush USD camera/material updates before locking accumulation. Doing
+            # this after locking can retain an empty or previous-camera frame.
+            if controlled and not continuing_sequence:
+                settings.set_bool(history_control, False)
+            if changed_view or _attempt or (controlled and not continuing_sequence):
+                omni.usd.get_context().reset_renderer_accumulation()
+            subframes = max(2, world.config.rt_subframes)
+            if controlled:
+                if not continuing_sequence:
+                    wait_rendered_frames(max(8, subframes))
+                settings.set_bool(history_control, True)
+                counter = int(settings.get("/rtx/externalFrameCounter") or 0) + 1
+                settings.set_int("/rtx/externalFrameCounter", counter)
+                samples = world.config.samples_per_pixel_per_frame
+                iterations = (samples + min(32, samples) - 1) // min(32, samples)
+                subframes = max(subframes, iterations + 1)
+            elif changed_view and path_tracing:
+                subframes = max(8, subframes)
+            wait_rendered_frames(subframes)
+            future = capture_viewport_to_file(viewport, str(path))
+            task = asyncio.ensure_future(future.wait_for_result(completion_frames=0))
+            for _ in range(120):
+                world.update()
+                if task.done():
+                    task.result()
+                    acquire_renderer_capture_interface().wait_async_capture()
+                    break
+            else:
+                task.cancel()
+                raise TimeoutError(f"RGB capture timed out: {path}")
+            if not path.is_file() or world.physics_steps != before:
+                raise RuntimeError("Capture failed or advanced physics")
+            actual_view = np.asarray(future.view, dtype=float).reshape(4, 4)
+            if tuple(future.resolution) == (width, height) and (
+                expected_view is None or np.allclose(actual_view, expected_view, rtol=0, atol=1e-5)
+            ):
+                return
+        raise RuntimeError(f"RGB capture did not match camera/resolution: {camera_prim}")
+    finally:
+        if controlled:
+            settings.set_bool(history_control, previous_control)
