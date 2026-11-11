@@ -214,7 +214,7 @@ def test_auto_standoff_and_occlusion():
     assert _run(blind, robot) == "not_found"
 
 
-def test_alarm_after_hold_then_photo():
+def test_alarm_only_at_the_end():
     grid = _grid([])
     planner, robot = _planner(
         grid, [(-3.0, 1.0), (-3.0, 11.0)], lambda eye: None, standoff_xy=(0.0, 8.0)
@@ -222,17 +222,22 @@ def test_alarm_after_hold_then_photo():
     assert _run(planner, robot) == "done"
     rows = planner.rows
     phases = [row["phase"] for row in rows]
-    order = ["patrol", "stop", "turn_to_fire", "hold", "alarm", "approach", "face", "settle"]
+    order = ["patrol", "approach", "face", "settle", "photo", "hold", "alarm", "done"]
     assert [p for i, p in enumerate(phases) if i == 0 or phases[i - 1] != p][: len(order)] == order
     dt = 1 / 120
     hold = [row for row in rows if row["phase"] == "hold"]
     alarm = [row for row in rows if row["alarm"]]
     assert len(hold) * dt == pytest.approx(4.0, abs=2 * dt)
-    assert len(alarm) * dt == pytest.approx(3.0, abs=2 * dt)
-    assert all(row["cmd"] == [0.0, 0.0] for row in hold[5:] + alarm)  # still while waiting
+    assert len(alarm) * dt == pytest.approx(7.0, abs=2 * dt)  # strobes through the 4 s stay
+    assert all(row["alarm"] for row in hold)
+    assert hold[0]["beacon_on"]  # flashing from the first instant of the stay
+    assert all(row["cmd"] == [0.0, 0.0] for row in alarm)  # motionless for the whole stay
     switches = sum(a["beacon_on"] != b["beacon_on"] for a, b in zip(rows, rows[1:], strict=False))
-    assert switches == 12  # 2 Hz for 3 s, on and off
+    assert switches == 28  # 2 Hz for 7 s, on and off
     facing = math.atan2(FIRE[1] - alarm[0]["xy"][1], FIRE[0] - alarm[0]["xy"][0])
     assert abs((alarm[0]["yaw"] - facing + math.pi) % (2 * math.pi) - math.pi) < 0.05
     assert planner.alarm["held_s"] >= 4.0 - 1e-6
     assert planner.state["last_action"].shape == (len(planner.action_names),)
+    first_photo = phases.index("photo")
+    assert not any(row["alarm"] or row["beacon_on"] for row in rows[:first_photo])  # none en route
+    assert rows[-1]["phase"] == "done" and rows[-2]["alarm"]  # the alarm ends the episode

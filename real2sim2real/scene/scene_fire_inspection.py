@@ -9,7 +9,9 @@ Flow clock: Flow simulates on Kit render updates using the timeline's time delta
 ``IsaacsimWorld.step`` advances PhysX without touching the timeline. ``start_fire_clock`` stops
 the timeline from auto-advancing, and ``sync_fire_time`` sets it to the physics time after every
 step. The fire therefore evolves with simulation time and stays frozen while several cameras
-render the same physics instant.
+render the same physics instant. Committing a timeline time change would also run the PhysX
+stage-update node (one extra, uncounted physics step), so that node stays disabled while the
+clock is held; ``IsaacsimWorld.step`` drives PhysX directly and does not need it.
 """
 
 from __future__ import annotations
@@ -47,6 +49,12 @@ class FireWarehouseSceneConfig(BaseConfig):
     flow_extension: str = "omni.flowusd"
     fire_sight_margin_m: float = Field(
         default=0.15, ge=0, description="Ray hits this close to the fire point do not occlude it."
+    )
+    light_scale: float = Field(
+        default=1.0,
+        gt=0,
+        description="Multiplier on the intensity of every light in the warehouse stage "
+        "(lamps, fire glow, fill light); applied on the live stage only, assets unchanged.",
     )
     flow_max_steps_per_update: int = Field(
         default=8,
@@ -97,6 +105,7 @@ class FireWarehouseScene(BaseScene):
         settings = carb.settings.get_settings()
         for key, value in _FLOW_SETTINGS.items():
             settings.set(key, value)
+        self.state["lights_scaled"] = self._scale_lights(stage)
         simulate = stage.GetPrimAtPath(f"{self.config.fire_fx_prim}/flowSimulate")
         self.flow_steps_per_second = float(simulate.GetAttribute("stepsPerSecond").Get())
         simulate.GetAttribute("maxStepsPerSimulate").Set(self.config.flow_max_steps_per_update)
@@ -108,6 +117,20 @@ class FireWarehouseScene(BaseScene):
             "flow_extension": self.config.flow_extension,
         }
         self.log.info("Fire scene ready", **self.state["fire"])
+
+    def _scale_lights(self, stage: Any) -> int:
+        """Brighten the warehouse; runs before the robot (and its beacon) is added."""
+        from pxr import Usd, UsdLux
+
+        if self.config.light_scale == 1.0:
+            return 0
+        count = 0
+        for prim in Usd.PrimRange(stage.GetPseudoRoot()):
+            if prim.HasAPI(UsdLux.LightAPI):
+                intensity = UsdLux.LightAPI(prim).GetIntensityAttr()
+                intensity.Set(float(intensity.Get()) * self.config.light_scale)
+                count += 1
+        return count
 
     def _fire_point(self, stage: Any, manifest: dict) -> np.ndarray:
         """Use the authored /FireFX origin; require it on the target box's upper rim."""
@@ -180,7 +203,10 @@ class FireWarehouseScene(BaseScene):
             if node["name"] == "Physics"
         ]
         if len(self._physics_nodes) != 1:
-            raise RuntimeError("Expected one 'Physics' stage update node to guard Flow clock moves")
+            raise RuntimeError("Expected one 'Physics' stage update node to hold during Flow")
+        # Toggling the node per step makes omni.physx log "Stage already attached!" each time,
+        # so it is switched off once here and back on in stop_fire_clock.
+        self._stage_update.set_stage_update_node_enabled(self._physics_nodes[0], False)
         self._timeline = omni.timeline.get_timeline_interface()
         self._timeline.set_end_time(1e7)  # the stage ends at 15 s; looping would reset Flow
         self._timeline.set_looping(False)
@@ -189,18 +215,17 @@ class FireWarehouseScene(BaseScene):
         self.sync_fire_time(0.0)
 
     def sync_fire_time(self, simulation_s: float) -> None:
-        """Set Flow's clock to the physics time; Flow steps on the next render update.
+        """Set Flow's clock to the physics time; Flow steps on the next render update."""
+        self._timeline.set_current_time(self._fire_time_offset + simulation_s)
+        self._timeline.commit()
 
-        Committing a timeline time change runs the PhysX stage-update node once, which would
-        add a physics step the world does not count. The node is disabled for the commit.
-        """
-        index = self._physics_nodes[0]
-        self._stage_update.set_stage_update_node_enabled(index, False)
-        try:
-            self._timeline.set_current_time(self._fire_time_offset + simulation_s)
-            self._timeline.commit()
-        finally:
-            self._stage_update.set_stage_update_node_enabled(index, True)
+    def stop_fire_clock(self) -> None:
+        """Give the timeline and the PhysX stage-update node back (GUI inspection after a run)."""
+        if self._timeline is None:
+            return
+        self._stage_update.set_stage_update_node_enabled(self._physics_nodes[0], True)
+        self._timeline.set_auto_update(True)
+        self._timeline.commit()
 
     @property
     def fire_time_s(self) -> float:

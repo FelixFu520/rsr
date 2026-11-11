@@ -107,6 +107,11 @@ class FireInspectionJobConfig(BaseConfig):
     fire_check_camera: str = Field(
         default="", description="Scene camera checked for flames after warm-up; empty skips."
     )
+    fire_check_min_pixels: int = Field(
+        default=20,
+        ge=1,
+        description="Flame-coloured pixels near the fire in fire_check_camera; Flow off gives ~0.",
+    )
     keep_open: bool = False
     photo: FirePhotoConfig = Field(default_factory=FirePhotoConfig)
     recorder: FireInspectionRecorderConfig = Field(default_factory=FireInspectionRecorderConfig)
@@ -404,6 +409,7 @@ class FireInspectionJob(BaseJob):
             )
         self.log.info("巡检结果", success=result["success"], failed=result["failed_checks"])
         if self.config.keep_open and not self.sim_world.config.headless:
+            self.scene.stop_fire_clock()
             self.sim_world.wait_for_gui_edit(reason="inspection finished")
 
     def _warm_up_fire(self, run: Path) -> None:
@@ -437,6 +443,11 @@ class FireInspectionJob(BaseJob):
         with Image.open(path) as image:
             rgb = np.asarray(image.convert("RGB"))
         score = self._score(rgb, camera, matrix, camera.resolution)
+        # This check only proves Flow is running; the photo keeps the stricter fraction test.
+        score["pass"] = bool(
+            score["fire_in_view"] and score["window_pixels"] >= self.config.fire_check_min_pixels
+        )
+        score["min_pixels"] = self.config.fire_check_min_pixels
         self.state["warmup_fire_check"] = {
             "image": str(path), "fire_time_s": round(self.scene.fire_time_s, 3), **score
         }  # fmt: skip
@@ -579,10 +590,10 @@ class FireInspectionJob(BaseJob):
             "route_clear": bool(route.get("ok"))
             and all(leg.get("violations", 1) == 0 for leg in route.get("legs", [])),
             "fire_found": bool(result.get("fire_found")),
-            "held_before_alarm": alarm.get("held_s", 0.0) >= cfg.detect_hold_s - dt,
+            "hold_completed": alarm.get("held_s", 0.0) >= cfg.detect_hold_s - dt,
             "alarm_raised": alarm.get("end_step") is not None
             and self.robot.state["beacon_switches"]
-            >= 2 * math.floor(cfg.alarm_s * cfg.alarm_flash_hz),
+            >= 2 * math.floor((cfg.detect_hold_s + cfg.alarm_s) * cfg.alarm_flash_hz),
             "beacon_off_for_photo": photo.get("beacon_on") is False,
             "approach_clear": approach.get("min_clearance_m", 0.0) >= radius - 1e-6,
             "reached_photo_phase": result.get("phase") == "done",

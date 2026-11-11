@@ -3,7 +3,8 @@
 inherit = "fire_inspection_x30_physx_warehouse.toml"
 
 [sim_world]
-rt_subframes = 2
+samples_per_pixel_per_frame = 64   # 调试用较低采样，加快一轮调试
+rt_subframes = 6
 
 [job]
 output_dir = "outputs/xunjian-debug"

@@ -1,14 +1,13 @@
 """Patrol planner: follow a patrol route, spot the fire, raise the alarm, photograph the fire.
 
-Phases: ``patrol`` → ``stop`` → ``turn_to_fire`` → ``hold`` → ``alarm`` → ``approach`` →
-``face`` → ``settle`` → ``photo`` → ``done``. If the route ends without a confirmed sighting the
-phase becomes ``not_found``. If braking carried the robot behind an obstacle, ``reacquire``
-creeps on along the route until the fire would be in sight again, then stops and turns again.
+Phases: ``patrol`` → ``approach`` → ``face`` → ``settle`` → ``photo`` → ``hold`` → ``alarm`` →
+``done``. If the route ends without a confirmed sighting the phase becomes ``not_found``.
 
-On a confirmed sighting the robot brakes, turns toward the fire, stays still for
-``detect_hold_s`` and then raises the alarm for ``alarm_s``: the action ``alarm`` is 1 and the
-red beacon strobes at ``alarm_flash_hz``. The beacon is off again before the photo, so its red
-light cannot pass for flames in the photo check.
+On a confirmed sighting the robot heads straight for the photo position without stopping.
+There it faces the fire and takes the photo with the beacon off, so the beacon's red light
+cannot pass for flames in the photo check. Only then it stays still for ``detect_hold_s`` and
+keeps signalling for another ``alarm_s``; during both, the action ``alarm`` is 1 and the red
+beacon strobes at ``alarm_flash_hz`` on one continuous clock. The episode ends after that.
 
 The patrol route is a list of waypoints. Consecutive waypoints are joined with A* on the
 occupancy grid the Job scans from PhysX collision geometry, so every leg keeps
@@ -63,9 +62,9 @@ class FirePatrolPlannerConfig(BaseConfig):
     detect_max_distance_m: float = Field(default=10.0, gt=0)
     detect_fov_margin: float = Field(default=0.8, gt=0, le=1)
     detect_confirm_steps: int = Field(default=12, ge=1)
-    # Alarm after a sighting.
-    detect_hold_s: float = Field(default=4.0, ge=0, description="Stay still facing the fire")
-    alarm_s: float = Field(default=3.0, gt=0, description="Beacon strobing, robot still")
+    # Alarm at the end, after the photo.
+    detect_hold_s: float = Field(default=4.0, ge=0, description="Stay facing the fire, strobing")
+    alarm_s: float = Field(default=3.0, gt=0, description="Further strobing before the end")
     alarm_flash_hz: float = Field(default=2.0, gt=0, description="Strobe rate, 50 % duty")
     # Photo.
     standoff_xy: tuple[float, float] | None = Field(
@@ -74,7 +73,6 @@ class FirePatrolPlannerConfig(BaseConfig):
     standoff_m: float = Field(default=2.1, gt=0.5)
     face_tolerance_rad: float = Field(default=0.03, gt=0)
     settle_s: float = Field(default=1.0, ge=0)
-    post_photo_s: float = Field(default=1.0, ge=0)
 
     @field_validator("route_xy")
     @classmethod
@@ -120,6 +118,7 @@ class FirePatrolPlanner(BasePlanner):
         self.rows: list[dict] = []
         self.detection: dict | None = None
         self.alarm: dict | None = None
+        self.strobe_s = 0.0
         self.approach_path: np.ndarray | None = None
         self.photo: dict | None = None
         self.step_index = 0
@@ -288,67 +287,51 @@ class FirePatrolPlanner(BasePlanner):
         self.state["photo_request"] = False
         sight = self.sight()
         self.sight_state = sight
-        fire_heading = math.atan2(self.fire[1] - xy[1], self.fire[0] - xy[0])
         if phase == "patrol":
             self.visible_steps = self.visible_steps + 1 if sight["visible"] else 0
             if self.visible_steps >= self.config.detect_confirm_steps:
+                # No stop on the way: plan to the photo position from where the robot is.
                 self.detection = {"xy": xy.round(3).tolist(), "sight": _rounded(sight)}
-                self._set_phase("stop", **self.detection)
-                self._follow(xy, yaw, 0.0)
+                self._plan_approach(xy)
             elif self._follow(xy, yaw, self.config.cruise_speed_mps):
                 self._set_phase("not_found", xy=xy.round(3).tolist())
-        elif phase == "stop":  # brake along the patrol path
-            self._follow(xy, yaw, 0.0)
-            if abs(self.velocity) < 1e-3:
-                self._set_phase("turn_to_fire", xy=xy.round(3).tolist())
-        elif phase == "turn_to_fire":
-            if self._turn_to(fire_heading, yaw):
-                if sight["visible"]:
-                    self._set_phase("hold", yaw=round(yaw, 4), sight=_rounded(sight))
-                else:
-                    self.visible_steps = 0
-                    self._set_phase("reacquire", blocked_by=sight["blocked_by"])
-        elif phase == "reacquire":
-            clear = self._fire_clear_if_facing(xy)
-            self.visible_steps = self.visible_steps + 1 if clear else 0
-            if self.visible_steps >= self.config.detect_confirm_steps:
-                self._set_phase("stop", xy=xy.round(3).tolist(), reason="fire back in sight")
-                self._follow(xy, yaw, 0.0)
-            elif self._follow(xy, yaw, self.config.approach_speed_mps):
-                self._set_phase("failed", reason="route ended before the fire was back in sight")
-        elif phase == "hold":  # stay still, facing the fire
-            self._ramp(0.0, 0.0)
-            if self.timer >= self.config.detect_hold_s - 1e-9:
-                self._start_alarm(xy, yaw, sight)
-        elif phase == "alarm":
-            self._ramp(0.0, 0.0)
-            if self.timer >= self.config.alarm_s - 1e-9:
-                self.state["alarm"] = False
-                self.alarm["end_step"] = self.step_index
-                self._plan_approach(xy)
         elif phase == "approach":
             if self._follow(xy, yaw, self.config.approach_speed_mps):
                 self._set_phase("face", standoff_xy=xy.round(3).tolist())
         elif phase == "face":
             heading = math.atan2(self.fire[1] - xy[1], self.fire[0] - xy[0])
-            if self._turn_to(heading, yaw):
+            # Fully settled (not just slow) so the photo and the strobing stay are motionless.
+            if self._turn_to(heading, yaw) and abs(self.yaw_rate) < 1e-6:
                 self._set_phase("settle", yaw=round(yaw, 4))
         elif phase == "settle":
             self._ramp(0.0, 0.0)
             if self.timer >= self.config.settle_s:
                 self.state["photo_request"] = True
                 self._set_phase("photo", sight=_rounded(sight))
-        elif phase == "photo":
+        elif phase == "photo":  # beacon still off: its red light must not reach the photo
             self._ramp(0.0, 0.0)
-            if self.photo is not None and self.timer >= self.config.post_photo_s:
+            if self.photo is not None:
+                self._start_alarm(xy, yaw, sight)
+        elif phase == "hold":  # stay facing the fire, beacon strobing
+            self._ramp(0.0, 0.0)
+            if self.timer >= self.config.detect_hold_s - 1e-9:
+                self.alarm["held_s"] = round(self.timer, 4)
+                self._set_phase("alarm", held_s=self.alarm["held_s"])
+        elif phase == "alarm":
+            self._ramp(0.0, 0.0)
+            if self.timer >= self.config.alarm_s - 1e-9:
+                self.state["alarm"] = False
+                self.alarm["end_step"] = self.step_index
                 self._set_phase("done")
         else:
             self._ramp(0.0, 0.0)
 
-        # Strobe: on for the first half of every 1/alarm_flash_hz period of the alarm.
+        # Strobe: on for the first half of every 1/alarm_flash_hz period since the alarm began.
         self.state["beacon_on"] = bool(
-            self.state["alarm"] and (self.timer * self.config.alarm_flash_hz) % 1.0 < 0.5
+            self.state["alarm"] and (self.strobe_s * self.config.alarm_flash_hz) % 1.0 < 0.5
         )
+        if self.state["alarm"]:
+            self.strobe_s += self.dt
         # Write the current pose plus the command; PhysX integrates it over the step exactly
         # like the reference below (constant world velocity, constant yaw rate).
         robot.set_base(xy, yaw, np.array([self.velocity, 0.0, self.yaw_rate]), self.dt)
@@ -388,26 +371,10 @@ class FirePatrolPlanner(BasePlanner):
         }
         return self.state["phase"] in {"done", "not_found", "failed"}
 
-    def _fire_clear_if_facing(self, xy: np.ndarray) -> bool:
-        """Would the detection camera see the fire after turning toward it at ``xy``?"""
-        name = self.robot.config.camera_for_detection
-        position, _ = self.robot.base_pose()
-        _, yaw = self.robot.base_xy_yaw()
-        eye = self.robot.camera_matrix(name)[3, :3]
-        local = np.array(
-            [
-                math.cos(yaw) * (eye[0] - position[0]) + math.sin(yaw) * (eye[1] - position[1]),
-                -math.sin(yaw) * (eye[0] - position[0]) + math.cos(yaw) * (eye[1] - position[1]),
-            ]
-        )
-        facing = math.atan2(self.fire[1] - xy[1], self.fire[0] - xy[0])
-        c, s = math.cos(facing), math.sin(facing)
-        turned = xy + np.array([c * local[0] - s * local[1], s * local[0] + c * local[1]])
-        within = np.linalg.norm(self.fire[:2] - turned) <= self.config.detect_max_distance_m
-        return bool(within and self.occluder(np.array([*turned, eye[2]])) is None)
-
     def _start_alarm(self, xy: np.ndarray, yaw: float, sight: dict) -> None:
+        """Beacon on from the first instant of the stay; the hold phase starts with it."""
         self.state["alarm"] = True
+        self.strobe_s = 0.0
         self.alarm = {
             "start_step": self.step_index,
             "xy": xy.round(3).tolist(),
@@ -416,10 +383,11 @@ class FirePatrolPlanner(BasePlanner):
             "fire_in_view": bool(sight["in_view"]),
             "signal": "red_beacon_strobe",
             "flash_hz": self.config.alarm_flash_hz,
-            "duration_s": self.config.alarm_s,
-            "held_s": round(self.timer, 4),
+            "hold_s": self.config.detect_hold_s,
+            "after_hold_s": self.config.alarm_s,
+            "fire_visible": bool(sight["visible"]),
         }
-        self._set_phase("alarm", **self.alarm)
+        self._set_phase("hold", **self.alarm)
 
     def _plan_approach(self, xy: np.ndarray) -> None:
         """Pick a reachable photo position with a clear view of the fire and plan to it."""

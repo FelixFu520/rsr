@@ -18,7 +18,7 @@ import numpy as np
 import pyarrow.parquet as pq
 from PIL import Image
 
-from real2sim2real.utils.patrol_geometry import fire_pixel_score
+from real2sim2real.utils.patrol_geometry import fire_pixel_score, pose_matrix, project_point
 
 
 def _ffprobe(video: Path) -> dict:
@@ -58,14 +58,8 @@ def _frames(video: Path, first: int, count: int, size: tuple[int, int]) -> np.nd
     return np.frombuffer(raw, np.uint8).reshape(-1, height, width, 3)
 
 
-def _red_fraction(frames: np.ndarray) -> np.ndarray:
-    rgb = frames.astype(np.int32)
-    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    return ((r > 60) & (r > 2 * g) & (r > 2 * b)).mean(axis=(1, 2))
-
-
 def _check_alarm(dataset, result, planner, names, action, xy, yaw, fps, checks, details) -> None:
-    """Stop facing the fire for detect_hold_s, strobe for alarm_s, all before the photo."""
+    """After the photo the robot stays facing the fire and the beacon strobes until the end."""
     alarm = action[:, names.index("alarm")] > 0.5
     frames = np.flatnonzero(alarm)
     checks["alarm_recorded"] = frames.size > 0
@@ -74,17 +68,14 @@ def _check_alarm(dataset, result, planner, names, action, xy, yaw, fps, checks, 
     start, end = int(frames[0]), int(frames[-1])
     details["alarm_frames"] = [start, end]
     checks["alarm_contiguous"] = frames.size == end - start + 1
-    expected = planner["alarm_s"] * fps
-    checks["alarm_duration"] = abs(frames.size - expected) <= 1
+    signal_s = planner["detect_hold_s"] + planner["alarm_s"]
+    checks["alarm_duration"] = abs(frames.size - signal_s * fps) <= 1
     moving = (np.abs(action[:, names.index("cmd_vx")]) > 1e-3) | (
         np.abs(action[:, names.index("cmd_wz")]) > 1e-3
     )
+    # The whole stay strobes: no motion command from the first to the last alarm frame.
     checks["alarm_robot_still"] = not moving[start : end + 1].any()
-    still_before = 0
-    while start - still_before - 1 >= 0 and not moving[start - still_before - 1]:
-        still_before += 1
-    details["still_before_alarm_s"] = still_before / fps
-    checks["held_before_alarm"] = still_before >= round(planner["detect_hold_s"] * fps) - 1
+    details["alarm_stay_s"] = frames.size / fps
     fire = np.asarray(result["photo"]["fire_world_xyz"][:2]) if result.get("photo") else None
     if fire is not None:
         bearing = np.arctan2(fire[1] - xy[start, 1], fire[0] - xy[start, 0])
@@ -92,36 +83,107 @@ def _check_alarm(dataset, result, planner, names, action, xy, yaw, fps, checks, 
         details["alarm_heading_error_rad"] = error
         checks["alarm_facing_fire"] = error <= planner["face_tolerance_rad"] + 0.01
     photo = details.get("photo_frame")
-    checks["alarm_before_photo"] = photo is not None and end < photo
-    # The strobe must be visible: red pixels in the follow view rise when the beacon is on.
+    # The alarm starts on the step after the photo; both can fall in the same recorded frame.
+    checks["alarm_after_photo"] = photo is not None and start >= photo
+    checks["alarm_ends_episode"] = end >= len(action) - 2
+    checks["no_alarm_on_the_way"] = not alarm[: photo or 0].any()
+    # The strobe must be visible. The follow camera rides on TORSO like the beacon, so the
+    # lens stays at one pixel; measure that patch instead of red light spilled on the scene.
     key = "observation.images.follow"
-    height, width = json.loads((dataset / "meta/info.json").read_text())["features"][key]["shape"][
-        :2
-    ]
+    feature = json.loads((dataset / "meta/info.json").read_text())["features"][key]
+    height, width = feature["shape"][:2]
+    robot = outcome_robot(dataset)
+    lens_u, lens_v = _beacon_pixel(robot, "follow")
     video = dataset / "videos" / key / "chunk-000/file-000.mp4"
-    lead = round(planner["detect_hold_s"] * fps / 2)
+    lead = min(start, fps)  # up to 1 s before the stay, beacon still off
     clip = _frames(video, start - lead, lead + frames.size + 1, (width, height))
-    red = _red_fraction(clip)
-    hold_red = float(red[:lead].mean())
+    half = 12
+    patch = clip[
+        :,
+        max(0, round(lens_v) - half) : round(lens_v) + half,
+        max(0, round(lens_u) - half) : round(lens_u) + half,
+        0,
+    ].astype(float)
+    red = patch.mean(axis=(1, 2))  # mean red channel of the lens patch, 8 bit
+    off = float(red[:lead].mean())
     strobe = red[lead:]  # alarm frames plus one (the beacon shows one frame after the command)
+    peak, low = float(strobe.max()), float(strobe.min())
     # The beacon toggles on physics steps, not frame boundaries, so count flashes from the
     # measured signal instead of assuming an on/off pattern per frame.
-    peak, low = float(strobe.max()), float(strobe.min())
-    threshold = low + 0.25 * (peak - low)  # lit frames vary ±50 % with render noise
-    lit = strobe >= threshold
+    lit = strobe >= low + 0.5 * (peak - low)
     flashes = int(lit[0]) + int(np.sum(lit[1:] & ~lit[:-1]))
-    expected_flashes = round(planner["alarm_s"] * planner["alarm_flash_hz"])
-    details["follow_red_fraction"] = {
-        "hold": hold_red,
-        "alarm_peak": peak,
-        "alarm_min": low,
+    expected_flashes = round(signal_s * planner["alarm_flash_hz"])
+    details["beacon_lens"] = {
+        "pixel": [round(lens_u, 1), round(lens_v, 1)],
+        "red_before_alarm": round(off, 1),
+        "red_peak": round(peak, 1),
+        "red_min": round(low, 1),
         "flashes": flashes,
         "expected_flashes": expected_flashes,
     }
-    checks["beacon_visible_in_video"] = bool(
-        peak > 0.005 and peak > 10 * hold_red and low < 0.75 * peak
+    checks["beacon_visible_in_video"] = bool(peak - max(off, low) >= 40)
+    checks["beacon_flash_count"] = flashes == expected_flashes
+
+
+def outcome_robot(dataset: Path) -> dict:
+    return json.loads((dataset / "meta/task_outcome.json").read_text())["configuration"]["robot"]
+
+
+def _beacon_pixel(robot: dict, camera_name: str) -> tuple[float, float]:
+    """Image position of the beacon lens in a TORSO-mounted camera (both fixed to TORSO)."""
+    beacon = robot["beacon"]
+    camera = next(c for c in robot["cameras"] if c["name"] == camera_name)
+    lens = np.asarray(beacon["base_position_m"], float) + [
+        0.0,
+        0.0,
+        beacon["height_m"] * 0.4 + beacon["radius_m"] * 0.6,
+    ]
+    matrix = pose_matrix(camera["pose"]["position"], camera["pose"]["orientation_wxyz"])
+    projection = project_point(
+        lens,
+        matrix,
+        focal_length=camera["focal_length"],
+        horizontal_aperture=camera["horizontal_aperture"],
+        resolution=tuple(camera["resolution"]),
+        near=camera["clipping_range"][0],
+        far=camera["clipping_range"][1],
     )
-    checks["beacon_flash_count"] = abs(flashes - expected_flashes) <= 1
+    return projection.u, projection.v
+
+
+def _check_robot_in_overview(outcome, xy, yaw, frame, checks, details) -> None:
+    """Every corner of the X30 bounding box projects inside the fixed overview camera."""
+    cameras = {c["name"]: c for c in outcome["configuration"]["scene"]["cameras"]}
+    camera = cameras.get("fire_overview")
+    if camera is None or camera["pose_relative_to"] != "/World":
+        return
+    matrix = pose_matrix(camera["pose"]["position"], camera["pose"]["orientation_wxyz"])
+    c, s = np.cos(yaw[frame]), np.sin(yaw[frame])
+    corners = [
+        [xy[frame, 0] + c * x - s * y, xy[frame, 1] + s * x + c * y, z]
+        for x in (-0.55, 0.50)  # X30 with the inspection module, TORSO frame (m)
+        for y in (-0.25, 0.25)
+        for z in (0.0, 1.10)
+    ]
+    projections = [
+        project_point(
+            point,
+            matrix,
+            focal_length=camera["focal_length"],
+            horizontal_aperture=camera["horizontal_aperture"],
+            resolution=tuple(camera["resolution"]),
+            near=camera["clipping_range"][0],
+            far=camera["clipping_range"][1],
+        )
+        for point in corners
+    ]
+    details["overview_robot_box_px"] = [
+        round(min(p.u for p in projections)),
+        round(min(p.v for p in projections)),
+        round(max(p.u for p in projections)),
+        round(max(p.v for p in projections)),
+    ]
+    checks["robot_fully_in_overview"] = all(p.in_view for p in projections)
 
 
 def validate(output: Path) -> dict:
@@ -199,6 +261,8 @@ def validate(output: Path) -> dict:
         checks[f"{name}_exists"] = (output / name).is_file()
 
     _check_alarm(dataset, result, planner, names, action, xy, yaw, fps, checks, details)
+    if details.get("alarm_frames"):
+        _check_robot_in_overview(outcome, xy, yaw, details["alarm_frames"][0], checks, details)
 
     episodes = pq.read_table(dataset / "meta/episodes/chunk-000/file-000.parquet").to_pylist()[0]
     details["episode_success"] = episodes.get("success")

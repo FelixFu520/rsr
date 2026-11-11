@@ -34,6 +34,7 @@ backend = "stub"
 # floor_z_m=0：启用远端入料时增加真实落地碰撞面。
 # fire_warehouse：fire_manifest_path、fire_fx_prim="/FireFX"、fire_sight_margin_m=0.15。
 # flow_max_steps_per_update=8：运行时覆盖 Flow maxStepsPerSimulate，须覆盖一帧录制间隔。
+# light_scale=1.0：仓库全部灯光强度倍率，只改运行时 stage。
 # rigid_usd_path=""、rigid_scale=0.5、rigid_mass_kg=0.03125：可选 V10 纸箱及声明的缩放/质量。
 # belt_markers=false：用循环移动的细缝显示实际传送带表面偏移。
 
@@ -123,12 +124,12 @@ backend = "stub"
 # robot_radius_m=0.6、clearance_margin_m=0.3；route_xy 相邻航点由 A* 连通，首点等于 robot.base_xy。
 # cruise_speed_mps=0.8、approach_speed_mps=0.5、detect_max_distance_m=10、detect_confirm_steps=12。
 # standoff_xy=None 时在火点周围 standoff_m=2.1 的圆上选可达且视线通畅的拍照点。
-# 发现火点后 detect_hold_s=4 静止对准火点，再报警 alarm_s=3（警示灯 alarm_flash_hz=2 爆闪）。
+# 拍照后 detect_hold_s=4 原地停留，再报警 alarm_s=3；全程警示灯 alarm_flash_hz=2 爆闪，途中不停留。
 
 [job]
 backend = "stub"  # StubJob 只串工厂,不采集
 # pickplace_cloth 的 timeout_s=1800：包含采集与渲染的墙钟时限；运行中约每 30 秒记录进度。
 # sorting_package：timeout_s=14400，output_dir 使用独立的分拣目录，LeRobot v3 记录 16 维关节角。
 # fire_inspection：command 为空时终端输入，否则用 default_command="巡检仓库"；关键词解析，不调用 LLM。
-# output_dir="outputs/xunjian"、overwrite_dataset=false、fire_warmup_s=4、fire_check_camera。
+# output_dir="outputs/xunjian"、overwrite_dataset=false、fire_warmup_s=4、fire_check_camera、fire_check_min_pixels=20。
 # photo.resolution=[1280,960]、photo.min_window_fraction=0.01；recorder.fps=15。

@@ -1,8 +1,9 @@
 # X30 仓库消防巡检
 
 操作员输入一句话（例如“巡检仓库”），X30 机器狗沿巡航路线巡检仓库北区货架。
-着火纸箱进入视野后，机器狗停下并转向火点，静止 4 s，然后打开红色警示灯爆闪报警 3 s。
-报警结束后，机器狗走到观察点、对准火点，用云台可见光相机拍照。
+着火纸箱进入视野后，机器狗不停留，直接走到观察点、对准火点，用云台可见光相机拍照。
+拍完照后，它在原地停留 4 s 并继续报警 3 s，这 7 s 内红色警示灯一直爆闪，之后任务结束。
+途中不停留、不亮灯。
 整个过程同步录制为 LeRobot v3 数据集。
 
 更新日期：2026-11-11。
@@ -13,14 +14,17 @@
 |---|---|
 | 正式输出 | [outputs/xunjian](../outputs/xunjian/)，`success=true`，`dataset_use=demonstration` |
 | 调试输出 | [outputs/xunjian-debug](../outputs/xunjian-debug/)，同一配置继承而来，轨迹与正式输出逐步一致 |
-| 数据集 | 1 个 episode，1070 帧，15 fps，71.3 s；3 路 640×480 H.264 视频 |
+| 数据集 | 1 个 episode，1015 帧，15 fps，67.7 s；3 路 640×480 H.264 视频 |
+| 渲染 | RTX 全路径追踪（PathTracing），256 spp、`rt_subframes=12`；仓库灯光 ×1.5 |
 | 指令 | `巡检仓库`（作为 LeRobot `task` 原样保存） |
 | 巡航 | 规划路线 37.6 m，最小净空 0.65 m（要求 ≥ 0.6 m） |
 | 发现火点 | 巡航开始后 42.0 s，位置 (-3.14, 46.09)，相机距火点 6.44 m |
-| 停留与报警 | 刹停于 (-3.14, 45.70)，转向火点后静止 4.0 s；警示灯爆闪 3.0 s 共 6 次，跟随视角红色像素峰值 9.5%（静止时 0.007%） |
-| 拍照 | 位置 (-5.406, 39.448)，距火点 2.13 m，警示灯已熄灭；火点窗口内火焰色像素 5.7%（1456 个，门限 1%） |
-| 物理 | PhysX CPU，120 Hz，共 9036 步；墙钟约 9 min（渲染采集占 65%） |
-| 验收 | Job 内 12 项全部通过；`validate_fire_inspection.py` 35 项全部通过 |
+| 途中 | 发现后不停车，直接走 7.2 m 到拍照点（最小净空 0.67 m）；途中警示灯一直是灭的 |
+| 拍照 | 位置 (-5.405, 39.448)，距火点 2.13 m，警示灯已熄灭；火点窗口内火焰色像素 5.6%（1436 个，门限 1%） |
+| 停留与报警 | 拍照后原地停留 4.0 s + 报警 3.0 s，警示灯爆闪 14 次，直到最后一帧；灯罩区域红色通道 42 → 156（8 bit） |
+| 全景视角 | `fire_overview` 中机器狗整机可见（包围盒投影 363–468 × 286–426 px），火点同在画面内 |
+| 物理 | PhysX CPU，120 Hz，共 8595 步；墙钟约 20 min，其中渲染采集占 86% |
+| 验收 | Job 内 12 项全部通过；`validate_fire_inspection.py` 37 项全部通过 |
 
 直接查看：[巡检照片](../outputs/xunjian/photos/)、
 [巡航路线与实际轨迹](../outputs/xunjian/map/patrol_map_result.png)、
@@ -39,9 +43,9 @@ arrange_scene   build_occ：PhysX 场景查询扫描北区占用图（机器人�
 place_robot     引用 X30，TORSO 落到出发位姿，挂载相机，校验腿部运动学
 start_simulation
   before hook   重建物理视图（含机器人）→ play → 站立
-  simulate      火焰预热 4 s 并预检 → 巡航 → 确认发现火点 → 刹停 → 转向火点
-                → 静止 4 s → 警示灯爆闪报警 3 s → A* 走到观察点 → 转向火点
-                → 静止 1 s → 拍照验收 → 静止 1 s → 导出 LeRobot v3
+  simulate      火焰预热 4 s 并预检 → 巡航 → 确认发现火点 → 直接 A* 走到观察点（不停）
+                → 转向火点 → 静止 1 s → 拍照验收（灯灭）
+                → 警示灯爆闪：原地停留 4 s + 继续报警 3 s → 结束 → 导出 LeRobot v3
 finally: close
 ```
 
@@ -60,7 +64,7 @@ finally: close
 - 建图和视线判断直接使用 PhysX 场景查询（`overlap_box`、`raycast_all`），查询对象就是仿真用的碰撞几何。
 - 本仓库在整场景级别使用 Newton 时仍有发散问题（见分拣任务记录）。
 - Flow 火焰属于渲染与时间轴功能，和物理引擎无关。
-- 速度足够：每个物理步约 5.2 ms，整段物理只占墙钟的 9%，瓶颈是 RTX 渲染。
+- 速度足够：每个物理步约 4 ms（整段物理 33 s），墙钟时间几乎全部花在路径追踪渲染上。
 
 ### 3.2 X30 行走：运动学机身 + 脚本化 trot
 
@@ -97,18 +101,39 @@ X30 的步态或通过能力。以后有 X30 行走策略时，只需替换 Robo
 
 - 真实消防巡检机器人通常用声光报警，警示灯是其中能被相机录下来的部分。
 - LeRobot 视频没有音轨，犬吠不会进入数据。机身是运动学移动，跳跃只能做成动画，不是物理跳跃。
-- 仓库很暗，红灯爆闪在跟随视角里非常明显，前视画面中周围货架也会被照红。
+- 仓库较暗，红灯爆闪在跟随视角和固定全景视角里都很明显，前视画面中周围货架也会被照红。
 
 警示灯装在护笼顶部两根纵向管之间（TORSO 系 (0.14, 0, 0.462) m），由支架板、黑色灯座、
 直径 8 cm 的红色灯罩和一个 normalized SphereLight（强度 6000）组成。它只是视觉部件，
-没有碰撞体和质量，也不遮挡前视相机。报警期间以 2 Hz、50% 占空比爆闪，共 6 次。
+没有碰撞体和质量，也不遮挡前视相机。以 2 Hz、50% 占空比爆闪，7 s 共 14 次。
 
-时序：确认发现火点后沿巡航路径刹停 → 原地转向火点 → 静止 `detect_hold_s=4` s →
-报警 `alarm_s=3` s（`action.alarm=1`）→ 关灯后再规划接近路径。拍照前灯已经熄灭，
-避免红光被照片验收误判为火焰。如果刹停后火点被挡住，规划器会沿路线继续缓行，
-直到转身后能看到火点再重新停下（`reacquire` 阶段）。本次刹停点 (-3.14, 45.70) 可以直接看到火点，没有触发这一步。
+时序：确认发现火点后不停车，直接规划并走到拍照点 → 对准火点、完全停稳 → 拍照（灯灭，
+避免红光被照片验收误判为火焰）→ 警示灯开始爆闪，原地停留 `detect_hold_s=4` s，
+再继续报警 `alarm_s=3` s（这 7 s 内 `action.alarm=1`，机身不动）→ 任务结束。
+巡航和接近途中警示灯一直是灭的。
 
-### 3.5 指令解析：关键词，不接 LLM
+### 3.5 渲染：路径追踪（PathTracing）
+
+采集使用 RTX 全路径追踪，代替之前的 RTX 实时模式（`RayTracedLighting`）。
+路径追踪有完整的全局光照，暗仓库里的货架、地面和警示灯照亮的区域更接近真实曝光。
+
+| 配置 | `samples_per_pixel_per_frame` | `rt_subframes` | 说明 |
+|---|---|---|---|
+| 正式 | 256 | 12 | 每帧 32 spp，8 帧累积满 256 spp，再多等 4 帧让画面稳定 |
+| 调试 | 64 | 6 | 2 帧累积满，加快调试 |
+
+同时打开 `synchronous_capture`，等待实际渲染完成事件后再累积，避免机器人位姿与画面错帧。
+关闭两项光照缓存（`pathtracing_cached`、`pathtracing_many_light_sampling`），减少多相机交替采集时的帧间闪烁。
+OptiX 降噪开启，时域降噪关闭（相机每帧切换，没有可用的时域历史）。
+相对 1024 spp 参考图，32/64/128/256 spp 的平均像素误差约为 2.6–3.9 / 2.0–2.9 / 1.5–2.1 / 1.1–1.5（8 bit）。
+
+场景亮度：`scene.light_scale = 1.5`，把仓库全部 107 盏灯（灯具点光源、火光、补光）的强度
+乘以 1.5，只改运行时 stage，不改资产文件。三路画面平均亮度约提高 32–37%（8 bit 均值 25–32 → 34–44）。
+
+`fire_overview` 固定相机：朝向与原场景 `Fire_Context` 相同，沿视线方向后移 2 m 到 (-2.57, 36.73, 2.18)。
+机器狗在拍照点和最后报警时整机在画面中（约 363–468 px × 286–426 px），火点仍在画面中心附近。
+
+### 3.6 指令解析：关键词，不接 LLM
 
 当前只有一种任务，关键词足够。包含巡检、巡逻、巡查、巡航、巡视、检查、查看、排查、搜索、寻找、找、
 inspect、patrol、search、find、check 之一，或提到火、烟、fire、smoke、flame，就判定为巡检任务。
@@ -183,7 +208,7 @@ assets/FireInspection/
 |---|---|
 | `sim_world.stage_usd_path` | 火焰仓库 stage；`extensions = ["omni.flowusd"]` 启用 Flow 运行扩展 |
 | `scene.flow_max_steps_per_update` | 运行时覆盖 Flow `maxStepsPerSimulate`（资产为 2）。Flow 以 60 Hz 步进，录制间隔 1/15 s 需要 4 步，取 8 |
-| `[[scene.cameras]] fire_overview` | 着火点附近的固定视角，也用于预热后的火焰预检 |
+| `[[scene.cameras]] fire_overview` | 着火点附近的固定视角，能看到拍照点的机器狗全身；也用于预热后的火焰预检 |
 | `robot.base_xy` / `base_yaw_deg` | TORSO 出发位姿；必须等于 `planner.route_xy[0]` |
 | `robot.gait.*` | trot 周期、抬脚高度、最大步幅、卡腿门限（0.35 rad） |
 | `[[robot.cameras]] front_rgb` | 挂在原生云台 `RGB_Camera` 下的零偏移相机，18 mm / 36 mm，水平视场约 90°，用于发现火点和拍照 |
@@ -192,7 +217,9 @@ assets/FireInspection/
 | `planner.route_xy` | 巡航航点（世界 XY，米） |
 | `planner.robot_radius_m` / `clearance_margin_m` | 硬净空 0.6 m，软净空再加 0.3 m |
 | `planner.detect_*` | 发现火点的距离、视场比例、连续确认步数 |
-| `planner.detect_hold_s` / `alarm_s` / `alarm_flash_hz` | 发现火点后静止时长、报警时长、爆闪频率 |
+| `planner.detect_hold_s` / `alarm_s` / `alarm_flash_hz` | 拍照后原地停留时长、继续报警时长、爆闪频率 |
+| `scene.light_scale` | 仓库灯光强度倍率（1.5） |
+| `job.fire_check_min_pixels` | 预热预检的火焰色像素下限（20） |
 | `robot.beacon.*` | 警示灯位置、尺寸、颜色、灯光强度 |
 | `planner.standoff_xy` | 拍照位置；不填时自动选点 |
 | `job.command` / `default_command` | 巡检指令；为空且有终端时交互输入，否则用默认值 |
@@ -209,11 +236,11 @@ assets/FireInspection/
 ./scripts/rsr list-backends                           # 应看到 fire_inspection、fire_patrol、x30_kinematic、fire_warehouse
 ./app/python.sh -m pytest -q tests/test_fire_inspection.py   # 无 Kit 单元测试：解析、腿部运动学、trot、A*、巡检与报警状态机
 
-# 1. 调试（约 8 min）
+# 1. 调试（约 13 min，64 spp）
 ./scripts/rsr collect run -c configs/fire_inspection_x30_physx_warehouse_debug.toml
 ./app/python.sh scripts/validate_fire_inspection.py outputs/xunjian-debug
 
-# 2. 正式采集（约 9 min；outputs/xunjian 中已有 lerobot_v3 时拒绝覆盖）
+# 2. 正式采集（约 20 min，256 spp；outputs/xunjian 中已有 lerobot_v3 时拒绝覆盖）
 ./scripts/rsr collect run -c configs/fire_inspection_x30_physx_warehouse.toml
 ./app/python.sh scripts/validate_fire_inspection.py outputs/xunjian
 ```
@@ -229,16 +256,13 @@ assets/FireInspection/
 
 | 阶段 | 行为 | 结束条件 |
 |---|---|---|
-| `patrol` | 沿 A* 连通后的巡航路径行进 | 确认看到火 → `stop`；走完仍没看到 → `not_found` |
-| `stop` | 沿路径减速 | 停稳 |
-| `turn_to_fire` | 原地转向火点 | 对准后火点可见 → `hold`；被挡 → `reacquire` |
-| `reacquire` | 沿路线缓行，直到转身后能看到火点 | 回到 `stop` |
-| `hold` | 静止，前视相机对准火点 | 4 s |
-| `alarm` | 静止，`alarm=1`，警示灯 2 Hz 爆闪 | 3 s 后关灯 |
+| `patrol` | 沿 A* 连通后的巡航路径行进 | 确认看到火 → `approach`（不停车）；走完仍没看到 → `not_found` |
 | `approach` | 选拍照点并 A* 规划，沿路径前往 | 到达并停稳 |
-| `face` | 原地转向火点 | 航向误差 < 0.03 rad |
+| `face` | 原地转向火点 | 航向误差 < 0.03 rad 且完全停转 |
 | `settle` | 静止 1 s | 发出拍照请求 |
-| `photo` | Job 拍照并验收，再静止 1 s | `done` |
+| `photo` | Job 拍照并验收，警示灯灭 | 照片写出 |
+| `hold` | 原地停留，前视相机对准火点；`alarm=1`，警示灯 2 Hz 爆闪 | 4 s |
+| `alarm` | 继续停留、继续爆闪 | 3 s 后关灯 → `done` |
 
 每个物理步（120 Hz）的顺序：
 
@@ -287,30 +311,33 @@ Job 中以下 12 项全部通过，数据才标记为 `demonstration` 并发布�
 
 | 检查 | 含义 | 本次 |
 |---|---|---|
-| `episode_completed` | 在 `max_steps` 内走完全部阶段 | 8556 步 |
+| `episode_completed` | 在 `max_steps` 内走完全部阶段 | 8115 步（另有 480 步火焰预热） |
 | `route_clear` | 巡航路径每个采样点净空 ≥ 0.6 m | 最小 0.65 m |
 | `fire_found` | 巡航中按真值规则确认看到火 | 6.44 m 处 |
-| `held_before_alarm` | 对准火点后静止至少 `detect_hold_s` | 4.0 s |
-| `alarm_raised` | 报警阶段走完，警示灯开关次数 ≥ 2 × 爆闪次数 | 12 次 |
+| `hold_completed` | 拍照后对准火点原地停留至少 `detect_hold_s` | 4.0 s |
+| `alarm_raised` | 报警阶段走完，警示灯开关次数 ≥ 2 × 爆闪次数（7 s × 2 Hz） | 28 次 |
 | `beacon_off_for_photo` | 拍照时警示灯已熄灭 | 熄灭 |
-| `approach_clear` | 接近路径净空 ≥ 0.6 m | 最小 0.66 m |
+| `approach_clear` | 接近路径净空 ≥ 0.6 m | 最小 0.67 m |
 | `reached_photo_phase` | 到达观察点、对准火点并完成拍照 | — |
 | `photo_taken` | 照片文件已写出 | — |
-| `photo_shows_fire` | 火点窗口内火焰色像素 ≥ 1% 且 ≥ 50 个 | 5.7%，1456 个 |
+| `photo_shows_fire` | 火点窗口内火焰色像素 ≥ 1% 且 ≥ 50 个 | 5.6%，1436 个 |
 | `base_follows_command` | PhysX 机身位姿与指令积分的单步偏差 < 1 mm | 最大 0.53 mm |
 | `legs_track_gait` | 腿关节与 trot 目标的最大偏差 < 0.35 rad（不卡腿） | 最大 0.19 rad（踩线缆槽） |
 
 另有两道前置检查：航点之间 A* 规划失败时，在 `arrange_scene` 阶段直接报错并输出地图；
 火焰预热后用 `fire_overview` 检查火焰像素，Flow 没有生效时直接失败。
 
-[validate_fire_inspection.py](../scripts/validate_fire_inspection.py) 不启动 Kit，独立复核 35 项：
+[validate_fire_inspection.py](../scripts/validate_fire_inspection.py) 不启动 Kit，独立复核 37 项：
 v3 元数据与帧数、时间戳等间隔、数值有限、单 episode、`task` 等于指令原句、只有一帧拍照触发、
 机身速度不超过上限、按录制指令积分能复现录制的位移（误差 2 mm）和航向（0.004 rad）、
 拍照帧机器人静止且对准火点（0.024 rad）、各路视频能完整解码且分辨率正确、地图文件存在，
 并从照片重新计算火焰像素。
 
-报警部分单独核对：`alarm` 连续 45 帧（3.0 s）、报警期间机身静止、之前静止 4.0 s、报警时对准火点、
-报警在拍照之前；并从跟随视角视频解码报警前后各帧，按红色像素比例数出爆闪 6 次，与 2 Hz × 3 s 一致。
+报警部分单独核对：`alarm` 连续 105 帧（停留 4 s + 报警 3 s）、这期间机身静止、开始时对准火点、
+拍照前没有任何报警帧、报警在拍照之后并持续到最后一帧；按机器人包围盒投影确认整机都在 `fire_overview`
+画面内；并从跟随视角视频解码报警前后各帧，取警示灯灯罩所在的 24×24 px 区域
+（跟随相机和灯都固定在 TORSO 上，灯罩始终投影到同一像素），按红色通道亮灭数出爆闪 14 次，
+与 2 Hz × 7 s 一致。调亮场景后货架本身就偏红，不能再用整幅画面的红色像素比例判断爆闪。
 
 ## 11. 调试中发现并修复的问题
 
@@ -325,6 +352,11 @@ v3 元数据与帧数、时间戳等间隔、数值有限、单 episode、`task`
 | 加载机器人后关节状态读取失败 | 建图时的无机器人物理视图被缓存，新的 tensor view 绑定到它 | 建图后调用 `invalidate_physics()` |
 | X30 落到地面以下 | 资产根 prim 带有 0.5226 m 站立高度，TORSO 本身无偏移 | 按 TORSO 相对根的变换反算根位姿 |
 | 腿部正运动学校验失败 | `reset()` 后 PhysX 把直腿姿态写回 USD | 在建立物理视图之前校验运动学 |
+| 切换到 PathTracing 后火焰消失 | `IsaacsimWorld` 在打开 stage 后再次写入相同的 `/rtx/rendermode`，Flow 体积随之不再出现在路径追踪中 | 只在模式不同时才写入（[simworld/isaacsim.py](../real2sim2real/simworld/isaacsim.py)），其他任务行为不变 |
+| 视频里只在停留结束后闪烁 | 原先停留 4 s 不闪，之后 3 s 才闪 | 停留和报警共 7 s 全程爆闪 |
+| 途中停留打断巡检 | 发现火点后就地停车报警 | 停留和爆闪移到拍照之后、任务最后 |
+| 每个物理步都报 `Stage already attached!` | 每次提交时间轴前后开关 PhysX stage-update 节点，重新开启时 omni.physx 会重新挂载 stage | 持有 Flow 时钟期间一直关闭该节点（`IsaacsimWorld.step` 直接驱动 PhysX，不依赖它），结束时恢复 |
+| `fire_overview` 后移后预热预检失败 | 相机离火点从 3.8 m 变为 5.8 m，火焰在固定窗口里只剩 39 个像素（0.6%） | 预检只判断 Flow 是否生效，改用像素数下限 `fire_check_min_pixels=20`；照片仍用 1% 占比门限 |
 
 ## 12. 局限
 
