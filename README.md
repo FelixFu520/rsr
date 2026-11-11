@@ -9,6 +9,9 @@
 当前整理状态：历史任务实现保留在 `bak/rsr-bak/`。主包包含基础框架、stub 通路、统一的 `IsaacsimWorld`、衣服/包裹抓放及 Pro-M6 双臂分拣案例。
 下文旧 Franka / sorting 任务作为历史参考保留；新衣服案例使用下述独立配置。
 
+Pro-M6 双臂包裹分拣的当前实现、复现命令、错位排查和最新交付见
+[包裹分拣完整文档](docs/sorting_package.md)。
+
 ## 求解器组合与 LeRobot v3 采集
 
 求解器案例统一命名为 `PhysicSolver_<机器人求解器>_<接触求解器>_<任务>.toml`。
