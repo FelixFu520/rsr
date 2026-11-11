@@ -1,0 +1,147 @@
+# X30 消防巡检：一句话指令 → 沿巡航路线巡检仓库北区货架 → 发现着火纸箱 → 停下对准火点 4 s
+# → 红色警示灯爆闪报警 3 s → 走到观察点拍照。
+# 物理：PhysX（CPU）。X30 没有官方步态策略：机身按规划速度运动学移动，腿部 PD 跟踪脚本化 trot。
+# 资产：先运行 ./app/python.sh scripts/prepare_fire_inspection_assets.py（生成 assets/FireInspection）
+# 运行：./scripts/rsr collect run -c configs/fire_inspection_x30_physx_warehouse.toml
+# 指令：终端交互输入；无终端时用 job.default_command，或 RSR_JOB__COMMAND="巡检仓库"
+# 结果：outputs/xunjian/（lerobot_v3/、photos/、map/、diagnostics/、result.json）
+
+[logging]
+level = "INFO"
+console = true
+
+[sim_world]
+backend = "isaacsim"
+physics_engine = "physx"
+physics_dt = 0.008333333333333333   # 120 Hz；录制 15 fps = 每 8 个物理步一帧
+rendering_dt = 0.016666666666666666
+device = "cpu"
+headless = true
+renderer = "RayTracedLighting"
+rt_subframes = 4
+width = 1280
+height = 960
+dlss = false
+auto_exposure = false
+extensions = ["omni.flowusd"]   # Flow 运行扩展；omni.usd.schema.flow 只有类型定义
+stage_usd_path = "assets/FireInspection/warehouse/warehouse_cardbox_fire.usda"
+
+[scene]
+backend = "fire_warehouse"
+fire_manifest_path = "assets/FireInspection/warehouse/fire_manifest.json"
+fire_fx_prim = "/FireFX"
+fire_sight_margin_m = 0.15
+flow_max_steps_per_update = 8   # Flow 60 Hz；每帧间隔 1/15 s = 4 步，需 ≥ 4
+
+# 着火纸箱附近的固定全景相机（与原场景 Fire_Context 同机位，视角加宽），也用于预热后火焰预检。
+[[scene.cameras]]
+name = "fire_overview"
+prim_path = "/World/Cameras/fire_overview"
+pose_relative_to = "/World"
+pose = { position = [-4.3, 37.7, 1.95], orientation_wxyz = [0.64394, 0.57386, 0.33668, 0.37784] }
+resolution = [640, 480]
+clipping_range = [0.05, 120.0]
+focal_length = 20.0
+horizontal_aperture = 36.0
+
+[robot]
+backend = "x30_kinematic"
+usd_path = "assets/FireInspection/robot/x30/x30_fire_inspection.usdc"
+prim_path = "/World/robots/X30"
+base_xy = [-6.95, 46.5]         # 西侧货架过道南端；必须等于 planner.route_xy[0]
+base_yaw_deg = 90.0             # 朝北，着火点在身后
+stance_height_m = 0.5226        # 资产 TORSO 高度；脚底离地约 1 mm
+floor_z = 0.0
+disable_gravity = true
+camera_for_detection = "front_rgb"
+
+[robot.gait]
+mode = "trot"                   # trot / stand
+period_s = 0.5
+lift_m = 0.07
+max_stride_m = 0.13
+max_tracking_error_rad = 0.35   # 卡腿上限；踩过地面线缆时约 0.2 rad
+
+# 报警用红色警示灯：装在护笼顶部两根纵向管之间（TORSO 系），只有视觉，无碰撞、无质量。
+[robot.beacon]
+enabled = true
+base_position_m = [0.14, 0.0, 0.462]
+radius_m = 0.04
+height_m = 0.07
+color = [1.0, 0.04, 0.02]
+light_intensity = 6000.0        # normalized SphereLight；暗仓库中可照红周围货架
+emissive_strength = 20.0
+
+# 云台可见光相机：挂在原生 RGB_Camera 下、零偏移，18 mm / 36 mm，水平视场约 90°。
+[[robot.cameras]]
+name = "front_rgb"
+prim_path = "/World/robots/X30/TORSO/FireInspection/InspectionModule/PTZ_Yaw/PTZ_Pitch/RGB_Camera/RGB_Camera/rsr_front_rgb"
+pose_relative_to = "/World/robots/X30/TORSO/FireInspection/InspectionModule/PTZ_Yaw/PTZ_Pitch/RGB_Camera/RGB_Camera"
+pose = { position = [0.0, 0.0, 0.0], orientation_wxyz = [1.0, 0.0, 0.0, 0.0] }
+resolution = [640, 480]
+clipping_range = [0.05, 80.0]
+focal_length = 18.0
+horizontal_aperture = 36.0
+
+# 机身后上方跟随相机：TORSO 后 1.6 m、高 1.0 m，朝前下俯约 20°。
+[[robot.cameras]]
+name = "follow"
+prim_path = "/World/robots/X30/TORSO/rsr_follow"
+pose_relative_to = "/World/robots/X30/TORSO"
+pose = { position = [-1.6, 0.0, 1.0], orientation_wxyz = [0.57923, 0.40558, -0.40558, -0.57923] }
+resolution = [640, 480]
+clipping_range = [0.05, 80.0]
+focal_length = 14.0
+horizontal_aperture = 20.955
+
+[planner]
+backend = "fire_patrol"
+# 占用图：PhysX overlap 扫描真实碰撞几何（仓库北区），机身高度带 0.10–1.15 m。
+map_bounds_xy = [[-11.0, 29.0], [9.0, 66.0]]
+map_resolution_m = 0.05
+map_z_band_m = [0.10, 1.15]
+robot_radius_m = 0.6            # 覆盖 X30 足迹（1.03 m × 0.47 m）的外接圆
+clearance_margin_m = 0.3
+# 巡航航点（世界 XY，米）：西过道向北 → 北端横移 → 中间过道向南 → 出口转向西南空地。
+# 相邻航点之间由 A* 在占用图上连通。
+route_xy = [[-6.95, 46.5], [-6.95, 60.5], [-3.15, 60.5], [-3.15, 45.0], [-5.5, 42.5]]
+cruise_speed_mps = 0.8
+approach_speed_mps = 0.5
+max_accel_mps2 = 0.8
+max_yaw_rate_rad_s = 0.9
+max_yaw_accel_rad_s2 = 2.0
+waypoint_tolerance_m = 0.15
+detect_max_distance_m = 10.0
+detect_fov_margin = 0.8
+detect_confirm_steps = 12
+# 发现火点后：刹停 → 原地转向火点 → 静止 detect_hold_s → 报警 alarm_s（action.alarm=1，警示灯爆闪）
+detect_hold_s = 4.0
+alarm_s = 3.0
+alarm_flash_hz = 2.0            # 50% 占空比；拍照前已熄灭，避免红光干扰火焰像素验收
+standoff_xy = [-5.4, 39.45]     # 着火纸箱正前方约 2.1 m，与原场景 Fire_Front 机位一致
+face_tolerance_rad = 0.03
+settle_s = 1.0
+post_photo_s = 1.0
+
+[job]
+backend = "fire_inspection"
+command = ""
+default_command = "巡检仓库"
+prompt_command = true
+output_dir = "outputs/xunjian"
+overwrite_dataset = false
+max_steps = 30000
+timeout_s = 7200.0
+fire_warmup_s = 4.0
+fire_check_camera = "fire_overview"
+
+[job.photo]
+resolution = [1280, 960]
+window_px = 160
+min_window_fraction = 0.01
+min_window_pixels = 50
+
+[job.recorder]
+format = "lerobot_v3"
+fps = 15
+save_failed_episodes = false

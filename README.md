@@ -12,6 +12,9 @@
 Pro-M6 双臂包裹分拣的当前实现、复现命令、错位排查和最新交付见
 [包裹分拣完整文档](docs/sorting_package.md)。
 
+X30 机器狗仓库消防巡检（一句话指令 → 巡航 → 发现火点 → 停留报警 → 拍照 → LeRobot v3）见
+[消防巡检文档](docs/fire_inspection.md)。
+
 ## 求解器组合与 LeRobot v3 采集
 
 求解器案例统一命名为 `PhysicSolver_<机器人求解器>_<接触求解器>_<任务>.toml`。

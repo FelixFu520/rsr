@@ -39,6 +39,7 @@ select = ["E", "F", "I", "UP", "B"]
 stub = "real2sim2real.job.job_stub:StubJob"
 pickplace_cloth = "real2sim2real.job.job_physic_solver:PhysicSolverJob"
 sorting_package = "real2sim2real.job.job_sorting:SortingJob"
+fire_inspection = "real2sim2real.job.job_fire_inspection:FireInspectionJob"
 
 [project.entry-points."real2sim2real.planner.backends"]
 stub = "real2sim2real.planner.planner_stub:StubPlanner"
@@ -47,6 +48,7 @@ newton_cloth_franka = "real2sim2real.planner.planner_newton_cloth:OfficialClothP
 pickplace_package = "real2sim2real.planner.planner_package:PackagePlanner"
 sorting_package = "real2sim2real.planner.planner_sorting:SortingPlanner"
 sorting_stream = "real2sim2real.planner.planner_sorting_stream:SortingStreamPlanner"
+fire_patrol = "real2sim2real.planner.planner_fire_patrol:FirePatrolPlanner"
 
 [project.entry-points."real2sim2real.robot.backends"]
 stub = "real2sim2real.robot.robot_stub:StubRobot"
@@ -54,6 +56,7 @@ franka_newton = "real2sim2real.robot.robot_physic_solver:FrankaNewtonRobot"
 franka_package_pads = "real2sim2real.robot.robot_package:PackagePadRobot"
 franka_physx = "real2sim2real.robot.robot_physic_solver:FrankaPhysxRobot"
 pro_m6_newton = "real2sim2real.robot.robot_sorting:SortingRobot"
+x30_kinematic = "real2sim2real.robot.robot_x30:X30Robot"
 
 [project.entry-points."real2sim2real.scene.backends"]
 stub = "real2sim2real.scene.scene_stub:StubScene"
@@ -62,6 +65,7 @@ pickplace_rigid = "real2sim2real.scene.scene_physic_solver:PickPlaceRigidScene"
 newton_cloth_franka = "real2sim2real.scene.scene_newton_cloth:OfficialClothScene"
 pickplace_package = "real2sim2real.scene.scene_package:PackageScene"
 sorting_package = "real2sim2real.scene.scene_sorting:SortingScene"
+fire_warehouse = "real2sim2real.scene.scene_fire_inspection:FireWarehouseScene"
 
 [project.entry-points."real2sim2real.simworld.backends"]
 stub = "real2sim2real.simworld.stub:StubSimWorld"

@@ -5,6 +5,7 @@ outputs/
 bak/
 tests/*
 !tests/test_sorting_package.py
+!tests/test_fire_inspection.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
