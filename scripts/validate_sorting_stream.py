@@ -203,6 +203,17 @@ def audit(output: Path) -> dict:
         native_stream_backend=config["planner"]["backend"] == "sorting_stream"
         and info["robot_type"] == "pro_m6_696_newton",
     )
+    alignment = result.get("gripper_visual_geometry_audit", {})
+    checks["authored_gripper_matches_physics"] = bool(
+        alignment.get("passed")
+        and alignment.get("frames") == len(indices)
+        and alignment.get("pads") == 4
+        and 0 <= alignment.get("maximum_corner_error_m", float("inf")) <= 2e-6
+        and 0 < alignment.get("tolerance_m", float("inf")) <= 2e-6
+    )
+    checks["scene_flushed_before_accumulation"] = (
+        result.get("observation_capture_sync") == "flush_scene_before_pt_counter_v1"
+    )
     for kind, field in (("soft", "cloth_usd_path"), ("rigid", "rigid_usd_path")):
         checks[f"{kind}_asset_hash_matches_source"] = (
             hashlib.sha256(Path(resolve_usd_path(config["scene"][field])).read_bytes()).hexdigest()
@@ -215,6 +226,38 @@ def audit(output: Path) -> dict:
         and head["pose"]["orientation_wxyz"] == [1.0, 0.0, 0.0, 0.0]
     )
     rows = json.loads((source / "stream_trajectory.json").read_text())
+    sync_frames = {340}
+    for kind in ("soft", "rigid"):
+        for phase in ("left_transfer", "right_transfer"):
+            own = [row for row in rows if row["parcel"] == kind and row["phase"] == phase]
+            sync_frames.add(round(own[len(own) // 2]["time_s"] * info["fps"]))
+    rgb_sync = result.get("gripper_render_sync_audit", {})
+    sync_valid = (
+        rgb_sync.get("passed")
+        and rgb_sync.get("frames") == sorted(sync_frames)
+        and set(rgb_sync.get("cameras", [])) == set(cameras)
+        and rgb_sync.get("comparisons") == len(sync_frames) * len(cameras)
+    )
+    for camera in cameras:
+        for frame in sync_frames:
+            path = output / "qa/render_sync" / camera / f"frame_{frame:06d}.json"
+            captured = output / ".render_cache/frames" / camera / f"frame_{frame:06d}.png"
+            try:
+                comparison = json.loads(path.read_text())
+                sync_valid = sync_valid and (
+                    comparison["identical"]
+                    and comparison["camera"] == camera
+                    and comparison["frame"] == frame
+                    and comparison["source_index"] == int(indices[frame])
+                    and comparison["maximum_pixel_error"] == 0
+                    and comparison["captured_sha256"]
+                    == hashlib.sha256(captured.read_bytes()).hexdigest()
+                    and comparison["reference_sha256"]
+                    == hashlib.sha256(path.with_suffix(".png").read_bytes()).hexdigest()
+                )
+            except (OSError, ValueError, KeyError):
+                sync_valid = False
+    checks["exported_rgb_matches_refreshed_static_pose"] = bool(sync_valid)
     infeed = {}
     for kind in ("soft", "rigid"):
         incoming = [row for row in rows if row["parcel"] == kind and row["phase"] == "left_infeed"]
@@ -329,6 +372,8 @@ def audit(output: Path) -> dict:
         maximum_floor_penetration_m=floor_penetration,
         final_parcel_aabb_separation_m=float(np.linalg.norm(separation)),
         rigid_finger_audit=rigid_jaws,
+        gripper_visual_geometry_audit=alignment,
+        gripper_render_sync_audit=rgb_sync,
         soft_finger_audit=soft_jaws,
         soft_held_shape=held,
         soft_entire_stream_geometry=soft_geometry,

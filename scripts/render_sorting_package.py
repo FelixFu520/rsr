@@ -132,7 +132,9 @@ def prepare_frame_cache(
             with path.open("rb") as source:
                 sources[name] = hashlib.file_digest(source, "sha256").hexdigest()
     manifest = dict(
-        version=1,
+        version=3,
+        visual_geometry_contract="native_visible_rubber_pads_v1",
+        capture_sync_contract="flush_scene_before_pt_counter_v1",
         sources=sources,
         configuration=configuration,
         fps=fps,
@@ -193,6 +195,16 @@ class SortingReplayJob(SortingJob):
             with np.load(cache / "stream.npz") as archive:
                 self.saved.update({key: archive[key] for key in archive.files})
         self.indices = replay_indices(self.saved["times"], fps)
+        self.sync_audit_frames: set[int] = set()
+        if self.is_stream:
+            rows = json.loads((cache / "stream_trajectory.json").read_text())
+            if len(self.indices) > 340:
+                self.sync_audit_frames.add(340)
+            for parcel in ("soft", "rigid"):
+                for phase in ("left_transfer", "right_transfer"):
+                    own = [row for row in rows if row["parcel"] == parcel and row["phase"] == phase]
+                    if own:
+                        self.sync_audit_frames.add(round(own[len(own) // 2]["time_s"] * fps))
         # JSON is a supported Dynaconf settings format. Preserve the normal
         # default/project/secrets/environment priority when selecting components.
         apply_settings_file(cache / "configuration.json")
@@ -261,6 +273,54 @@ class SortingReplayJob(SortingJob):
         for _ in range(16):
             self.sim_world.update()
 
+    def _sync_audit_path(self, camera: str, frame: int) -> Path:
+        return self.output / "qa/render_sync" / camera / f"frame_{frame:06d}.json"
+
+    def _valid_frame_audit(self, camera: str, frame: int, image: Path) -> bool:
+        if frame not in getattr(self, "sync_audit_frames", ()):
+            return True
+        try:
+            report = json.loads(self._sync_audit_path(camera, frame).read_text())
+            return bool(
+                report["identical"]
+                and report["captured_sha256"] == hashlib.sha256(image.read_bytes()).hexdigest()
+            )
+        except (OSError, ValueError, KeyError):
+            return False
+
+    def _audit_captured_frame(self, camera: CameraConfig, frame: int, image: Path) -> None:
+        """Compare the actual exported frame with a fresh accumulation in the same renderer."""
+        destination = self._sync_audit_path(camera.name, frame)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        reference = destination.with_suffix(".png")
+        capture_viewport_frame(
+            self.sim_world,
+            reference,
+            width=camera.resolution[0],
+            height=camera.resolution[1],
+            camera_prim=camera.prim_path,
+            camera_sequence=False,
+        )
+        with Image.open(image) as captured, Image.open(reference) as static:
+            delta = np.abs(
+                np.asarray(captured.convert("RGB"), dtype=np.int16)
+                - np.asarray(static.convert("RGB"), dtype=np.int16)
+            )
+        report = dict(
+            camera=camera.name,
+            frame=frame,
+            source_index=int(self.indices[frame]),
+            identical=bool(not delta.any()),
+            mean_absolute_pixel_error=float(delta.mean()),
+            maximum_pixel_error=int(delta.max()),
+            captured_sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+            reference_sha256=hashlib.sha256(reference.read_bytes()).hexdigest(),
+        )
+        destination.write_text(json.dumps(report, indent=2) + "\n")
+        if not report["identical"]:
+            raise ValueError(f"Rendered sequence/static pose check failed: {destination}")
+        self.log.info("Exported RGB matches refreshed static frame", **report)
+
     def simulate(self) -> None:
         """Publish cached physical poses, capture RGB, and preserve the source outcome."""
         runtime, saved = self.planner.runtime, self.saved
@@ -320,12 +380,29 @@ class SortingReplayJob(SortingJob):
                         completed_frames=completed_frames,
                         complete=completed_frames == len(self.indices),
                         physics_steps_advanced=self.sim_world.physics_steps - before,
+                        maximum_pad_visual_error_m=runtime.visual_alignment_maximum_m,
                     ),
                     indent=2,
                 )
                 + "\n"
             )
             return
+        # Revalidate every recorded view timestamp even when PNGs were resumed
+        # from worker caches. The test uses the actual USD hierarchy and physics
+        # poses, not just their shared root or a TCP position.
+        for index in self.indices:
+            runtime._publish_robot_visuals(saved["body_poses"][index])
+        visual_geometry_audit = dict(
+            passed=True,
+            frames=len(self.indices),
+            pads=len(runtime._pad_visual_checks),
+            maximum_corner_error_m=runtime.visual_alignment_maximum_m,
+            tolerance_m=2e-6,
+            method=(
+                "All eight visible USD pad corners versus solved collider corners "
+                "at every video timestamp"
+            ),
+        )
         run = self.output / "diagnostics" / datetime.now(UTC).strftime("%Y%m%dT%H%M%S_%fZ")
         run.mkdir(parents=True)
         recorder = LeRobotV3Recorder(
@@ -376,6 +453,15 @@ class SortingReplayJob(SortingJob):
                 ),
                 rendering_physics_steps_advanced=self.sim_world.physics_steps - before,
                 observation_capture_order="camera",
+                observation_capture_sync="flush_scene_before_pt_counter_v1",
+                gripper_visual_geometry_audit=visual_geometry_audit,
+                gripper_render_sync_audit=dict(
+                    passed=True,
+                    frames=sorted(self.sync_audit_frames),
+                    cameras=[camera.name for camera in self.recording_cameras],
+                    comparisons=len(self.sync_audit_frames) * len(self.recording_cameras),
+                    method="Exported PNG versus fresh accumulation in the same renderer",
+                ),
             )
             shutil.copy2(self.cache / "particles.npz", run / "particles.npz")
             if self.is_stream:
@@ -424,8 +510,10 @@ class SortingReplayJob(SortingJob):
                     for frame in range(len(self.indices))
                 ]
                 cached = [
-                    frame_cache is not None and valid_cached_frame(path, camera.resolution)
-                    for path in paths
+                    frame_cache is not None
+                    and valid_cached_frame(path, camera.resolution)
+                    and self._valid_frame_audit(camera.name, frame, path)
+                    for frame, path in enumerate(paths)
                 ]
                 missing = [frame for frame, valid in enumerate(cached) if not valid]
                 if missing:
@@ -442,8 +530,10 @@ class SortingReplayJob(SortingJob):
                             width=camera.resolution[0],
                             height=camera.resolution[1],
                             camera_prim=camera.prim_path,
-                            camera_sequence=True,
+                            camera_sequence=frame != missing[0],
                         )
+                        if frame in getattr(self, "sync_audit_frames", ()):
+                            self._audit_captured_frame(camera, frame, paths[frame])
                         if frame_cache is not None and not valid_cached_frame(
                             paths[frame], camera.resolution
                         ):

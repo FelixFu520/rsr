@@ -45,7 +45,7 @@ backend = "stub"
 # arm_stiffness/arm_damping=6000/300、finger_stiffness/finger_damping=40/1。
 # finger_friction=1.4；cameras 支持头部及左右腕部挂载。
 # initial_gripper_rad=0.0：可将初始夹爪设为打开姿态，所有从动关节遵守原 mimic 比例。
-# pad_width_m=0.03：固定原生指垫，不修改机器人结构。
+# pad_width_m=0.027：按原生可视胶垫测量碰撞尺寸，避免使用膨大的碰撞代理。
 
 [planner]
 backend = "stub"

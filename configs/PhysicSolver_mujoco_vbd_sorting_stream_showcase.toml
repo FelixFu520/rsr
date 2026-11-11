@@ -31,6 +31,10 @@ cameras = '''@reset [
 output_dir = "outputs/sorting_stream_showcase_1k"
 timeout_s = 86400.0
 
+[planner]
+require_bag_gap_quality = true  # 展示数据必须通过原有 10 mm 袋衣间隙门限。
+maximum_shape_rms_m = 0.045  # 允许柔性衣物形变至 45 mm；袋衣间隙和穿透门限不变。
+
 [job.recorder]
 fps = 15
 width = 1024

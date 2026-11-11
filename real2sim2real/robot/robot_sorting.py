@@ -15,7 +15,7 @@ READY = {"left": [0.1, 0.1, 0.1, -1.5, 0, 0, -1.3], "right": [-0.1, 0.1, -0.1, -
 
 
 class SortingRobotConfig(BaseConfig):
-    """Preserve authored robot masses, joints, collision geometry and world placement."""
+    """Preserve authored masses, joints and placement; match contacts to visible rubber."""
 
     backend: str = "pro_m6_newton"
     usd_path: str = "assets/Robot/pro_m6_696/pro_m6_696.usda"
@@ -26,7 +26,7 @@ class SortingRobotConfig(BaseConfig):
     finger_stiffness: float = Field(default=40, gt=0)
     finger_damping: float = Field(default=1, gt=0)
     finger_friction: float = Field(default=1.4, ge=0)
-    pad_width_m: Literal[0.03] = 0.03
+    pad_width_m: Literal[0.027] = 0.027
     initial_gripper_rad: float = Field(default=0.0, ge=0, le=0.7, allow_inf_nan=False)
     cameras: list[CameraConfig] = Field(default_factory=list)
 
@@ -82,6 +82,7 @@ class SortingRobot(BaseRobot):
             load_visual_shapes=False,
         )
         self.source_root = str(self.source_stage.GetDefaultPrim().GetPath())
+        self._match_native_pad_colliders(builder)
         self.arm_indices, self.gripper_indices = {}, {}
         self.mimic = {}
         imported_mimic_pairs = set(
@@ -148,6 +149,57 @@ class SortingRobot(BaseRobot):
         self.joint_names = [
             f"{side}_joint{j}_rad" for side in ("left", "right") for j in range(1, 8)
         ] + ["left_gripper_rad", "right_gripper_rad"]
+
+    def _match_native_pad_colliders(self, builder: Any) -> None:
+        """Use visible rubber surfaces, not the asset's oversized contact proxies."""
+        import numpy as np
+        from pxr import UsdGeom
+
+        from real2sim2real.planner.planner_physic_solver import _rotation_wxyz
+
+        self.native_pad_geometry = []
+        cache = UsdGeom.XformCache()
+        for side in ("left", "right"):
+            for finger in ("left_inner_finger", "right_inner_finger"):
+                root = f"{self.source_root}/robotiq_{side}/{finger}"
+                collision = f"{root}/collisions/mesh_1/box"
+                visual = f"{root}/visuals/mesh_1/box"
+                shape = self.import_map["path_shape_map"][collision]
+                body = builder.shape_body[shape]
+                cube = UsdGeom.Cube(self.source_stage.GetPrimAtPath(visual))
+                if not cube:
+                    raise ValueError(f"Missing native rubber pad cube: {visual}")
+                body_prim = self.source_stage.GetPrimAtPath(builder.body_label[body])
+                local = np.asarray(
+                    cache.GetLocalToWorldTransform(cube.GetPrim())
+                    * cache.GetLocalToWorldTransform(body_prim).GetInverse()
+                ).T
+                scales = np.linalg.norm(local[:3, :3], axis=0)
+                rotation = local[:3, :3] / scales
+                pose = np.asarray(builder.shape_transform[shape])
+                # The authored proxy shares the pad frame; reject a changed asset
+                # rather than silently assuming that only its extents differ.
+                if not (
+                    np.allclose(local[:3, 3], pose[:3], rtol=0, atol=1e-6)
+                    and np.allclose(rotation, _rotation_wxyz(pose[[6, 3, 4, 5]]), atol=1e-6)
+                ):
+                    raise ValueError(f"Native pad collision/visual frames differ: {visual}")
+                half = scales * float(cube.GetSizeAttr().Get()) / 2
+                if not np.isclose(2 * half[0], self.config.pad_width_m, atol=1e-6):
+                    raise ValueError(f"Native pad width differs from configuration: {visual}")
+                self.native_pad_geometry.append(
+                    dict(
+                        side=side,
+                        shape_id=shape,
+                        body_id=body,
+                        visual_path=visual,
+                        authored_collision_size_m=(
+                            2 * np.asarray(builder.shape_scale[shape])
+                        ).tolist(),
+                        size_m=(2 * half).tolist(),
+                    )
+                )
+                builder.shape_scale[shape] = tuple(half)
 
     @property
     def recording_joint_names(self) -> list[str]:

@@ -382,8 +382,12 @@ def capture_viewport_frame(
                 omni.usd.get_context().reset_renderer_accumulation()
             subframes = max(2, world.config.rt_subframes)
             if controlled:
-                if not continuing_sequence:
-                    wait_rendered_frames(max(8, subframes))
+                # USD rigid transforms reach Hydra after deformable point updates.
+                # Even with an unchanged camera, drain actual rendered frames
+                # before resetting accumulation for the newly published sample.
+                # Otherwise the first PT iteration freezes the previous robot
+                # pose together with the current cloth mesh.
+                wait_rendered_frames(2 if continuing_sequence else max(8, subframes))
                 settings.set_bool(history_control, True)
                 counter = int(settings.get("/rtx/externalFrameCounter") or 0) + 1
                 settings.set_int("/rtx/externalFrameCounter", counter)

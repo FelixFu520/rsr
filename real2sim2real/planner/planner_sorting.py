@@ -1054,7 +1054,8 @@ class SortingPlanner(PickPlaceClothPlanner):
             robot_asset_sha256=hashlib.sha256(
                 Path(self.robot.source_path).read_bytes()
             ).hexdigest(),
-            gripper_geometry="authored_ProM6_Robotiq_with_30x7.5x70mm_pads",
+            gripper_geometry="authored_ProM6_Robotiq_with_visual_matched_27x7.5x65mm_pads",
+            native_pad_geometry=self.robot.native_pad_geometry,
             pad_width_m=self.robot.config.pad_width_m,
             garment_mass_kg=float(self.runtime._masses[: self.scene.garment_count].sum()),
             bag_mass_kg=float(self.runtime._masses[self.scene.garment_count :].sum()),

@@ -53,7 +53,7 @@ def audit_held_shape(
     extra_samples: dict[str, list[int]] | None = None,
     quality_reference: dict | None = None,
 ) -> dict:
-    """Check three saved physical frames per transfer using V7's unchanged limits.
+    """Check saved physical frames per transfer against the configured limits.
 
     All bag vertices and face centres contribute to each gap quantile. Sampling
     establishes evidence at those frames, not continuous-time nonpenetration.
@@ -151,7 +151,7 @@ def audit_held_shape(
         maximum_bag_gap_m=maximum_bag_gap_m,
         samples=rows,
         scope=(
-            "Three physics frames per transfer plus recorded online shape checkpoints; "
+            "Three physics frames per transfer plus requested additional physical samples; "
             "all bag vertices and face centres."
             if extra_samples is not None
             else "Three physics frames per transfer; all bag vertices and face centres."

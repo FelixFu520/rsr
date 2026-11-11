@@ -1230,7 +1230,8 @@ assert len(histories[2])==24
 np.testing.assert_allclose(histories[1][3::4],histories[2],atol=1e-9,rtol=0)
 np.testing.assert_allclose(histories[3],histories[4][1::2],atol=1e-9,rtol=0)
 
-# Only the original robot geometry is allowed, including its native pads.
+# Preserve native inertial/link geometry; the four oversized collision boxes
+# must instead coincide with the original visible rubber pads.
 from real2sim2real.robot.robot_sorting import SortingRobotConfig
 from pydantic import ValidationError
 try:
@@ -1244,10 +1245,62 @@ robot.add_newton_robot(other)
 native=newton.ModelBuilder();SolverMuJoCo.register_custom_attributes(native)
 native.add_usd(robot.source_stage, floating=False, collapse_fixed_joints=True,
     enable_self_collisions=False, load_visual_shapes=False)
-for field in ("body_mass", "body_inertia", "body_com", "shape_type", "shape_scale",
+for field in ("body_mass", "body_inertia", "body_com", "shape_type",
               "shape_body", "shape_transform"):
     np.testing.assert_array_equal(np.asarray(getattr(other,field)),np.asarray(getattr(native,field)))
 assert other.shape_count==native.shape_count
+pad_ids=[pad['shape_id'] for pad in robot.native_pad_geometry]
+assert len(pad_ids)==4
+for i in range(other.shape_count):
+    if i in pad_ids:
+        np.testing.assert_allclose(2*np.asarray(other.shape_scale[i]),[.027,.065,.0075],atol=1e-8)
+        np.testing.assert_allclose(2*np.asarray(native.shape_scale[i]),[.030,.070,.0075],atol=1e-8)
+    else:
+        np.testing.assert_array_equal(other.shape_scale[i],native.shape_scale[i])
+
+# Check all eight visible corners in world space against real FK at multiple
+# closures on both arms, then deliberately reproduce an oversized visual.
+from pxr import Usd,UsdGeom
+from pathlib import Path
+stage=Usd.Stage.CreateInMemory()
+UsdGeom.Xform.Define(stage,robot.config.prim_path).GetPrim().GetReferences().AddReference(
+    str(Path(robot.source_path).resolve()))
+robot.sim_world=SimpleNamespace(stage=stage)
+robot.initialize_cameras=lambda:None
+visual_model=other.finalize(device='cpu')
+visual_state=visual_model.state()
+visual_runtime=object.__new__(SortingRuntime)
+visual_runtime.robot=robot;visual_runtime.model=visual_model
+visual_runtime.robot_body_count=visual_model.body_count
+visual_runtime.state_0=visual_state;visual_runtime.physics_origin=np.zeros(3)
+visual_runtime._create_ik()
+newton.eval_fk(visual_model,visual_model.joint_q,visual_model.joint_qd,visual_state)
+visual_runtime._create_robot_visuals()
+for angle in [.28,.61,.675]:
+    q=visual_model.joint_q.numpy().copy()
+    for side,followers in robot.mimic.items():
+        q[robot.arm_indices[side][0]]+=angle/4
+        for index,ratio in followers:q[index]=ratio*angle
+    newton.eval_fk(visual_model,wp.array(q,dtype=float),visual_model.joint_qd,visual_state)
+    visual_runtime._publish_robot_visuals()
+assert visual_runtime.visual_alignment_maximum_m<2e-7
+cube=visual_runtime._pad_visual_checks[0][0]
+while cube.GetPrim().IsInstanceProxy():
+    ancestor=cube.GetPrim().GetParent()
+    while ancestor.IsInstanceProxy():ancestor=ancestor.GetParent()
+    ancestor.SetInstanceable(False)
+    cube=UsdGeom.Cube(stage.GetPrimAtPath(cube.GetPath()))
+_,body,local=visual_runtime._pad_visual_checks[0]
+visual_runtime._pad_visual_checks[0]=(cube,body,local)
+size=cube.GetSizeAttr().Get()
+cube.GetSizeAttr().Set(size*1.1)
+try:
+    visual_runtime._publish_robot_visuals()
+except ValueError as error:
+    assert 'Visible gripper pad differs' in str(error)
+else:
+    raise AssertionError('Misaligned pads must not be published as valid observations')
+cube.GetSizeAttr().Set(size)
 
 opened=SortingRobot(SortingRobotConfig(initial_gripper_rad=.28))
 opened.source_path=robot.source_path
@@ -1371,7 +1424,16 @@ def test_showcase_config_uses_four_hd_views_without_starting_simulation(tmp_path
             assert getattr(showcase, section).config.model_dump(exclude={"cameras"}) == getattr(
                 original, section
             ).config.model_dump(exclude={"cameras"})
-        assert showcase.planner.config == original.planner.config
+        assert showcase.planner.config.require_bag_gap_quality
+        assert showcase.planner.config.maximum_bag_gap_m == 0.01
+        assert showcase.planner.config.maximum_shape_rms_m == 0.045
+        assert showcase.planner.config.model_dump(
+            exclude={"require_bag_gap_quality", "maximum_shape_rms_m"}
+        ) == (
+            original.planner.config.model_dump(
+                exclude={"require_bag_gap_quality", "maximum_shape_rms_m"}
+            )
+        )
     finally:
         reset_settings()
 
@@ -1435,11 +1497,18 @@ def test_synchronous_pt_flushes_view_before_locking_history(
     monkeypatch.setattr(asyncio, "ensure_future", lambda coroutine: loop.create_task(coroutine))
     control = "/rtx-transient/resetPtAccumOnlyWhenExternalFrameCounterChanges"
     values = {}
+    scene = dict(published=0, rendered=0, accumulated=0)
+
+    def set_int(key, value):
+        values[key] = value
+        if key == "/rtx/externalFrameCounter":
+            scene["accumulated"] = scene["rendered"]
+
     settings = SimpleNamespace(
         get=values.get,
         set=lambda key, value: values.__setitem__(key, value),
         set_bool=lambda key, value: values.__setitem__(key, value),
-        set_int=lambda key, value: values.__setitem__(key, value),
+        set_int=set_int,
     )
     rendered, captured = [], []
     viewport = SimpleNamespace(camera_path="/World/GUI", resolution=(640, 480))
@@ -1447,10 +1516,13 @@ def test_synchronous_pt_flushes_view_before_locking_history(
     async def wait_for_rendered_frames(count):
         rendered.append((count, values[control]))
         await asyncio.sleep(0)
+        if count >= 2:
+            scene["rendered"] = scene["published"]
 
     viewport.wait_for_rendered_frames = wait_for_rendered_frames
 
     def capture_to_file(viewport, filename):
+        assert scene["accumulated"] == scene["published"], "Captured previous robot pose"
         captured.append(values["/rtx/externalFrameCounter"])
 
         async def wait_for_result(**kwargs):
@@ -1516,6 +1588,7 @@ def test_synchronous_pt_flushes_view_before_locking_history(
             viewport.camera_path, viewport.resolution = "/World/overview", (1024, 768)
             values[control] = True
         if fail_capture:
+            scene["published"] += 1
             with pytest.raises(RuntimeError, match="capture unavailable"):
                 capture_viewport_frame(
                     world,
@@ -1526,6 +1599,7 @@ def test_synchronous_pt_flushes_view_before_locking_history(
                 )
         else:
             for name in ("overview", "head", "left_wrist", "right_wrist"):
+                scene["published"] += 1
                 capture_viewport_frame(
                     world,
                     tmp_path / f"{name}.png",
@@ -1535,9 +1609,9 @@ def test_synchronous_pt_flushes_view_before_locking_history(
                     camera_sequence=camera_sequence,
                 )
             assert captured == [1, 2, 3, 4]
-        assert rendered == ([(3, True)] if camera_sequence else [(8, False), (3, True)]) * len(
-            captured
-        )
+        assert rendered == (
+            [(2, True), (3, True)] if camera_sequence else [(8, False), (3, True)]
+        ) * len(captured)
         assert values[control] is camera_sequence
         assert reset.call_count == (0 if camera_sequence else len(captured))
         assert world.physics_steps == 0
@@ -1592,7 +1666,7 @@ def test_replay_renders_complete_camera_sequences_with_identical_source_samples(
     )
 
     def capture(world, path, **kwargs):
-        assert kwargs["camera_sequence"]
+        assert kwargs["camera_sequence"] is (current["index"] != 0)
         captured.append((path.parent.name, current["index"]))
         Image.new("RGB", (64, 48), (current["index"], 10, 20)).save(path)
         if advance_physics:
@@ -1660,6 +1734,42 @@ def test_outfeed_fall_requires_departure_before_landing_not_simultaneous_xy_clea
         assert report["first_full_exit_sample"] <= report["first_ground_sample"]
 
 
+@pytest.mark.parametrize("stale_pose", [False, True])
+def test_exported_rgb_audit_rejects_stale_pixels_and_changed_cache(
+    monkeypatch, tmp_path, stale_pose
+):
+    from types import SimpleNamespace
+
+    import scripts.render_sorting_package as module
+
+    job = object.__new__(module.SortingReplayJob)
+    job.output = tmp_path
+    job.indices = np.array([0, 4])
+    job.sync_audit_frames = {1}
+    job.sim_world = SimpleNamespace(physics_steps=0)
+    camera = SimpleNamespace(name="head", resolution=(64, 48), prim_path="/World/head")
+    captured = tmp_path / "captured.png"
+    Image.new("RGB", (64, 48), "black").save(captured)
+
+    def refresh(world, path, **kwargs):
+        assert not kwargs["camera_sequence"]
+        image = Image.new("RGB", (64, 48), "black")
+        if stale_pose:
+            image.putpixel((32, 24), (255, 255, 255))
+        image.save(path)
+
+    monkeypatch.setattr(module, "capture_viewport_frame", refresh)
+    if stale_pose:
+        with pytest.raises(ValueError, match="sequence/static pose check failed"):
+            job._audit_captured_frame(camera, 1, captured)
+        assert not job._valid_frame_audit("head", 1, captured)
+    else:
+        job._audit_captured_frame(camera, 1, captured)
+        assert job._valid_frame_audit("head", 1, captured)
+        Image.new("RGB", (64, 48), "white").save(captured)
+        assert not job._valid_frame_audit("head", 1, captured)
+
+
 def test_render_cache_rejects_changed_source_settings_and_incomplete_images(tmp_path):
     from scripts.render_sorting_package import prepare_frame_cache, valid_cached_frame
 
@@ -1670,6 +1780,14 @@ def test_render_cache_rejects_changed_source_settings_and_incomplete_images(tmp_
     indices = np.array([0, 4])
     frames = prepare_frame_cache(source, tmp_path, configuration, 15, indices)
     assert prepare_frame_cache(source, tmp_path, configuration, 15, indices) == frames
+    manifest_path = frames.parent / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    legacy = dict(manifest, version=2)
+    del legacy["capture_sync_contract"]
+    manifest_path.write_text(json.dumps(legacy))
+    with pytest.raises(ValueError, match="source or settings changed"):
+        prepare_frame_cache(source, tmp_path, configuration, 15, indices)
+    manifest_path.write_text(json.dumps(manifest))
     path = frames / "overview/frame_000000.png"
     assert not valid_cached_frame(path, (64, 48))
     Image.new("RGB", (64, 48)).save(path)

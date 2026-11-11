@@ -384,6 +384,20 @@ class SortingRuntime(PackageRuntime):
             xf.ClearXformOpOrder()
             xf.SetResetXformStack(True)
             self._gripper_ops[side] = (xf.AddTransformOp(), np.linalg.inv(end_world) @ world)
+        self._pad_visual_checks = []
+        unit, _ = unit_box_mesh()
+        shape_poses = self.model.shape_transform.numpy()
+        shape_scales = self.model.shape_scale.numpy()
+        for pad in robot.native_pad_geometry:
+            path = pad["visual_path"].replace(robot.source_root, robot.config.prim_path, 1)
+            cube = UsdGeom.Cube(robot.sim_world.stage.GetPrimAtPath(path))
+            pose = shape_poses[pad["shape_id"]]
+            local = (unit * shape_scales[pad["shape_id"]]) @ _rotation_wxyz(
+                pose[[6, 3, 4, 5]]
+            ).T + pose[:3]
+            self._pad_visual_checks.append((cube, pad["body_id"], local))
+        self.visual_alignment_maximum_m = 0.0
+        self.visual_alignment_samples = 0
         self._publish_robot_visuals()
         robot.initialize_cameras()
 
@@ -402,6 +416,24 @@ class SortingRuntime(PackageRuntime):
             op.Set(Gf.Matrix4d(matrix.T))
         for side, (op, adapter) in self._gripper_ops.items():
             op.Set(Gf.Matrix4d((matrices[self.hand_bodies[side]] @ adapter).T))
+        self._check_pad_visual_alignment(matrices)
+
+    def _check_pad_visual_alignment(self, matrices: list[np.ndarray]) -> None:
+        """Reject a published frame if its visible pads differ from the solved colliders."""
+        from pxr import UsdGeom
+
+        cache = UsdGeom.XformCache()
+        unit, _ = unit_box_mesh()
+        for cube, body, local in self._pad_visual_checks:
+            transform = np.asarray(cache.GetLocalToWorldTransform(cube.GetPrim())).T
+            visible = (unit * float(cube.GetSizeAttr().Get()) / 2) @ transform[:3, :3].T
+            visible += transform[:3, 3]
+            solved = local @ matrices[body][:3, :3].T + matrices[body][:3, 3]
+            error = float(np.linalg.norm(visible - solved, axis=1).max())
+            if error > 2e-6:
+                raise ValueError(f"Visible gripper pad differs from physics by {error:.6g} m")
+            self.visual_alignment_maximum_m = max(self.visual_alignment_maximum_m, error)
+        self.visual_alignment_samples += 1
 
     def publish_recorded_visuals(self, vertices: np.ndarray, body_poses: np.ndarray) -> None:
         """Publish cached observations without modifying either solver's state buffers."""

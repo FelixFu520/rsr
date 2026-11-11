@@ -66,7 +66,7 @@ finger_stiffness = 40.0
 finger_damping = 1.0
 finger_friction = 1.4
 initial_gripper_rad = 0.0  # 仿真初始关节姿态，不修改结构。
-pad_width_m = 0.03  # 原生指垫；机器人结构固定，不允许加宽。
+pad_width_m = 0.027  # 原生可视胶垫；碰撞与可视尺寸一致，不允许加宽。
 
 [[robot.cameras]]
 name = "head"

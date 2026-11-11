@@ -29,15 +29,18 @@ path = Path(sys.argv[1])
 result = json.loads(path.read_text()) if path.is_file() else {}
 accepted = (
     result.get("success")
+    and result.get("strict_quality_success")
     and result.get("completed")
     and result.get("continuous_world")
     and result.get("accepted_demonstration", True)
     and not result.get("diagnostic_restart", False)
+    and result.get("gripper_geometry")
+    == "authored_ProM6_Robotiq_with_visual_matched_27x7.5x65mm_pads"
 )
 raise SystemExit(0 if accepted else 1)
 PY
     then
-        echo "已有 physics/ 未通过完整验收，请选择新的输出目录。旧诊断已保留。" >&2
+        echo "已有 physics/ 未通过胶垫对齐与严格间隙验收，请选择新的输出目录重算。旧数据已保留。" >&2
         exit 1
     fi
     ARGS+=(--source "$OUTPUT/physics")
