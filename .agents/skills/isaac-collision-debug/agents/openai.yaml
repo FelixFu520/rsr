@@ -1,0 +1,4 @@
+interface:
+  display_name: "Isaac 碰撞质量排查"
+  short_description: "依据官方碰撞指南排查穿透、弹飞、接触不稳与 SDF 问题"
+  default_prompt: "使用 $isaac-collision-debug 排查当前碰撞问题，先定位异常对象和碰撞几何，再验证最小改动。"

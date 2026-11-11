@@ -1,0 +1,48 @@
+# 所有刚体/柔体任务共用此世界配置。其余组件保持 stub，便于独立检查世界初始化。
+# ./app/python.sh -m real2sim2real.core.cli collect run -c configs/isaacsim_world.toml
+[sim_world]
+backend = "isaacsim"
+physics_engine = "physx"  # physx / newton / hybrid
+physics_dt = 0.008333333333333333
+rendering_dt = 0.03333333333333333
+gravity = [0.0, 0.0, -9.81]
+device = "cuda:0"
+physx_solver = "TGS"
+physx_enable_ccd = false
+physx_enable_stabilization = true
+
+# 纯 Newton: USD 后端从 stage 建模；direct 由 Scene/Robot/Planner 注册模型 stepper。
+# hybrid: PhysX 步进后调用 Newton stepper；不启用官方 Newton USD 动力学。
+newton_execution = "usd"
+newton_solver = "mujoco"
+newton_substeps = 1
+newton_iterations = 10
+newton_use_cuda_graph = true
+newton_solver_options = {}
+newton_config_options = {}
+
+headless = true
+renderer = "RayTracedLighting"
+width = 1280
+height = 720
+rt_subframes = 1
+samples_per_pixel_per_frame = 64  # PathTracing 每帧采样数；rt_subframes 控制采集前的静态渲染帧数。
+pathtracing_max_bounces = 4
+pathtracing_denoiser = true
+pathtracing_temporal_denoising = false
+pathtracing_cached = true
+pathtracing_many_light_sampling = true
+synchronous_capture = false  # 高清多相机采集设为 true，并关闭上述两个缓存以减少光影闪动。
+warmup_frames = 2
+dlss = false
+auto_exposure = false
+fast_shutdown = true
+extensions = []
+
+# 环境背景由世界加载；桌面物体和机器人由 Scene/Robot 添加。
+stage_usd_path = ""
+background_usd_path = ""
+background_prim_path = "/World/background"
+background_offset = [0.0, 0.0, 0.0]
+background_gravity = false
+background_skip_metrics_assembler = true

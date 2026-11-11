@@ -10,14 +10,14 @@
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import ABC
 from typing import Any
 
 from real2sim2real.core.config import BaseConfig
 from real2sim2real.core.registry import SIM_WORLD_REGISTRY, ensure_sim_world_backends
 
 
-class BaseSimWorld(ABC):
+class BaseSimWorld(ABC):  # noqa: B024 - 生命周期提供可选空实现
     """仿真世界基类:App/World 生命周期、环境 USD 与步进同步."""
 
     def __init__(self) -> None:
@@ -33,14 +33,14 @@ class BaseSimWorld(ABC):
         self.world: Any | None = None
         self.stage: Any | None = None
 
-    def init_world(self) -> None:
+    def init_world(self) -> None:  # noqa: B027
         """建立仿真运行时(App / World)并加载环境 USD.
 
         Returns:
             None.
         """
 
-    def destroy_world(self) -> None:
+    def destroy_world(self) -> None:  # noqa: B027
         """销毁仿真运行时(App/World).
 
         Returns:

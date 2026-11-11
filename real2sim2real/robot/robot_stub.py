@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from real2sim2real.core.config import BaseConfig
 from real2sim2real.robot.base import BaseRobot
-from real2sim2real.robot.config import StubRobotConfig
 from real2sim2real.simworld.base import BaseSimWorld
+
+
+class StubRobotConfig(BaseConfig):
+    """``[robot]``:stub 机器人配置."""
 
 
 class StubRobot(BaseRobot):

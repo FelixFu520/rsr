@@ -1,0 +1,4 @@
+interface:
+  display_name: "Isaac 仿真性能排查"
+  short_description: "依据 NVIDIA 官方指南定位 Isaac Sim 物理性能瓶颈并验证调参效果"
+  default_prompt: "使用 $isaac-physics-performance 排查当前仿真性能问题，先建立基线，再提出并验证最小改动。"

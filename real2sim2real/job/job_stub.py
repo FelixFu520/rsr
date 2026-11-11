@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from real2sim2real.core.config import BaseConfig
 from real2sim2real.job.base import BaseJob
-from real2sim2real.job.config import StubJobConfig
+
+
+class StubJobConfig(BaseConfig):
+    """``[job]``:stub 任务编排配置."""
 
 
 class StubJob(BaseJob):

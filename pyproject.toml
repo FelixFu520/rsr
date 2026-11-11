@@ -37,18 +37,35 @@ select = ["E", "F", "I", "UP", "B"]
 
 [project.entry-points."real2sim2real.job.backends"]
 stub = "real2sim2real.job.job_stub:StubJob"
+pickplace_cloth = "real2sim2real.job.job_physic_solver:PhysicSolverJob"
+sorting_package = "real2sim2real.job.job_sorting:SortingJob"
 
 [project.entry-points."real2sim2real.planner.backends"]
 stub = "real2sim2real.planner.planner_stub:StubPlanner"
+pickplace_cloth = "real2sim2real.planner.planner_physic_solver:PickPlaceClothPlanner"
+newton_cloth_franka = "real2sim2real.planner.planner_newton_cloth:OfficialClothPlanner"
+pickplace_package = "real2sim2real.planner.planner_package:PackagePlanner"
+sorting_package = "real2sim2real.planner.planner_sorting:SortingPlanner"
+sorting_stream = "real2sim2real.planner.planner_sorting_stream:SortingStreamPlanner"
 
 [project.entry-points."real2sim2real.robot.backends"]
 stub = "real2sim2real.robot.robot_stub:StubRobot"
+franka_newton = "real2sim2real.robot.robot_physic_solver:FrankaNewtonRobot"
+franka_package_pads = "real2sim2real.robot.robot_package:PackagePadRobot"
+franka_physx = "real2sim2real.robot.robot_physic_solver:FrankaPhysxRobot"
+pro_m6_newton = "real2sim2real.robot.robot_sorting:SortingRobot"
 
 [project.entry-points."real2sim2real.scene.backends"]
 stub = "real2sim2real.scene.scene_stub:StubScene"
+pickplace_cloth = "real2sim2real.scene.scene_physic_solver:PickPlaceClothScene"
+pickplace_rigid = "real2sim2real.scene.scene_physic_solver:PickPlaceRigidScene"
+newton_cloth_franka = "real2sim2real.scene.scene_newton_cloth:OfficialClothScene"
+pickplace_package = "real2sim2real.scene.scene_package:PackageScene"
+sorting_package = "real2sim2real.scene.scene_sorting:SortingScene"
 
 [project.entry-points."real2sim2real.simworld.backends"]
 stub = "real2sim2real.simworld.stub:StubSimWorld"
+isaacsim = "real2sim2real.simworld.isaacsim:IsaacsimWorld"
 
 [project.entry-points."real2sim2real.cli.commands"]
 collect = "real2sim2real.job.cli:register"

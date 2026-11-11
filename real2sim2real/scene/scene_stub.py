@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from real2sim2real.core.config import BaseConfig
 from real2sim2real.scene.base import BaseScene
-from real2sim2real.scene.config import StubSceneConfig
 from real2sim2real.simworld.base import BaseSimWorld
+
+
+class StubSceneConfig(BaseConfig):
+    """``[scene]``:stub 场景配置."""
 
 
 class StubScene(BaseScene):

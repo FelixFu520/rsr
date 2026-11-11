@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Annotated
 
 import typer
 
@@ -75,6 +76,123 @@ def run(
 
     job = AutoJob.from_config()  # 按 [job].backend 选型
     job.run()  # 五段生命周期,finally close
+
+
+@app.command("render-sorting")
+def render_sorting(
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            file_okay=False,
+            resolve_path=True,
+            help="新视频与 LeRobot v3 的输出目录",
+        ),
+    ],
+    source: Annotated[
+        Path | None,
+        typer.Option(
+            "--source",
+            exists=True,
+            file_okay=False,
+            resolve_path=True,
+            help="可选：复用完整物理轨迹；不指定则先生成到输出目录的 physics/",
+        ),
+    ] = None,
+    render_profile: Annotated[
+        Path,
+        typer.Option(
+            "--render-profile",
+            exists=True,
+            dir_okay=False,
+            resolve_path=True,
+            help="高清路径追踪参数 JSON",
+        ),
+    ] = Path("configs/sorting_stream_showcase_render.json"),
+    fps: Annotated[int, typer.Option("--fps", min=1, help="四路共享的采样率")] = 15,
+    config: Path | None = _CONFIG_OPTION,
+) -> None:
+    """先完成连续分拣物理，再按 overview、head、左腕、右腕依次渲染整段。"""
+    import json
+    import subprocess
+    import sys
+
+    script = Path(__file__).resolve().parents[2] / "scripts" / "render_sorting_package.py"
+    if not script.is_file():
+        raise typer.BadParameter("此命令需要在包含 scripts/render_sorting_package.py 的项目中运行")
+    if (output / "lerobot_v3").exists():
+        raise typer.BadParameter("正式数据已存在，请选择新的 --output")
+    from scripts.render_sorting_package import ReplayRenderProfile
+
+    try:
+        ReplayRenderProfile.model_validate_json(render_profile.read_text())
+    except (OSError, ValueError) as exc:
+        raise typer.BadParameter(str(exc), param_hint="--render-profile") from exc
+    if source is None:
+        from real2sim2real.job.job_sorting import SortingJobConfig
+
+        config = config or Path("configs/PhysicSolver_mujoco_vbd_sorting_stream_showcase.toml")
+        _apply_config_file(config)
+        job_config = SortingJobConfig.from_settings("job")
+        source = output / "physics"
+        if source.exists():
+            raise typer.BadParameter(
+                "physics/ 已存在；复用完整轨迹请指定 --source，否则选择新的 --output"
+            )
+        physics_script = script.with_name("check_sorting_package.py")
+        if not physics_script.is_file():
+            raise typer.BadParameter(f"缺少物理采集脚本：{physics_script}")
+        log.info("先生成完整物理轨迹，不采集 RGB", output=str(source))
+        solved = subprocess.run(
+            [
+                sys.executable,
+                str(physics_script),
+                "--config",
+                str(config.resolve()),
+                "--output",
+                str(source),
+                "--max-steps",
+                str(job_config.max_steps),
+            ],
+            check=False,
+        )
+        if solved.returncode:
+            result_path = source / "result.json"
+            try:
+                outcome = json.loads(result_path.read_text())
+                if not isinstance(outcome, dict):
+                    outcome = {}
+            except (OSError, ValueError):
+                outcome = {}
+            log.error(
+                "分拣物理阶段失败，未启动渲染",
+                exit_code=solved.returncode,
+                result=str(result_path),
+                failure_reason=outcome.get("failure_reason"),
+                failed_checks=outcome.get("failed_checks"),
+                physics_duration_s=outcome.get("physics_duration_s"),
+                maximum_edge_stretch=outcome.get("maximum_edge_stretch"),
+            )
+            raise typer.Exit(solved.returncode if solved.returncode > 0 else 1)
+    elif source == output:
+        raise typer.BadParameter("--output 不能覆盖物理源目录")
+    log.info("按相机依次渲染整段", source=str(source), output=str(output))
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            str(source),
+            "--output",
+            str(output),
+            "--render-profile",
+            str(render_profile),
+            "--fps",
+            str(fps),
+        ],
+        check=False,
+    )
+    if completed.returncode:
+        raise typer.Exit(completed.returncode if completed.returncode > 0 else 1)
 
 
 def register(main_app: typer.Typer) -> None:

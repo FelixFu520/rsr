@@ -7,16 +7,14 @@ Job 在 ``place_robot`` 末尾调用 ``init_planner``;
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import ABC
 from typing import Any
-
-import numpy as np
 
 from real2sim2real.core.config import BaseConfig
 from real2sim2real.core.registry import PLANNER_REGISTRY, ensure_planner_backends
 
 
-class BasePlanner(ABC):
+class BasePlanner(ABC):  # noqa: B024 - 生命周期提供可选空实现
     """运动规划后端接口.
 
     Job ``place_robot`` 固定先 ``init_planner``;采集循环再推进 / 落盘 / 复位.
@@ -40,7 +38,7 @@ class BasePlanner(ABC):
         self.state["phase"] = "idle"  # 执行阶段名,recorder 落盘
         self.state["last_action"] = None  # 最近下发的动作
 
-    def init_planner(self, robot: Any) -> None:
+    def init_planner(self, robot: Any) -> None:  # noqa: B027
         """初始化运动规划后端.
 
         Args:

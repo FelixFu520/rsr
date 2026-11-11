@@ -1,0 +1,40 @@
+# 已交付1条56.8s连续双臂流程；四路视频终验见outputs/sorting_package/qa。
+# workflow_gap_advisory：仅袋衣间隙为advisory，严格失败仍记录。
+# 目标向量保留@reset：项目父子配置会合并列表，需显式替换。
+inherit = "PhysicSolver_mujoco_vbd_sorting_package_workflow.toml"
+
+[scene]
+cloth_usd_path = "assets/PhysicSolver/Package/v10_station/parcel_two_mesh.usd"
+garment_mass_kg = 0.025
+bag_mass_kg = 0.0025677532
+outfeed_target_xy = "@reset [-0.55, -0.84]"
+platform_target_xy = "@reset [0.0, -0.93]"
+
+[planner]
+release_s = 4.0
+contact_stiffness = 40000.0
+shape_contact_stiffness = 40000.0
+contact_sdf_resolution = 128
+self_contact_gap_m = 0.0016
+platform_friction = 0.1
+mujoco_substeps_per_vbd_step = 4
+mimic_time_constant_s = 0.00027
+mimic_impedance = 0.9998
+grasp_pad_bottom_m = 0.015
+regrasp_surface_indent_m = 0.02
+regrasp_surface_indent_fraction = 0.3
+regrasp_offset_xy_m = "@reset [0.0, 0.0]"
+release_lowering_m = 0.0
+strain_limited_grip = true
+grip_strain_target = 1.22
+grip_maximum_relief_rad = 0.035
+grip_relief_rate_rad_s = 0.1
+grip_recovery_rate_rad_s = 0.001
+physics_origin_m = "@reset [0.0, -0.9, 1.8]"
+
+[job]
+output_dir = "outputs/sorting_package"
+
+[job.recorder]
+save_failed_episodes = false
+task = "Relay the garment parcel from infeed through the platform to the outfeed conveyor using both native Pro-M6 arms, releasing at each destination."

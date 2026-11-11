@@ -6,7 +6,7 @@ SimWorld 负责环境 USD 与生命周期;Scene 不启停 App.
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import ABC
 from typing import Any
 
 import numpy as np
@@ -16,7 +16,7 @@ from real2sim2real.core.registry import SCENE_REGISTRY, ensure_scene_backends
 from real2sim2real.simworld.base import BaseSimWorld
 
 
-class BaseScene(ABC):
+class BaseScene(ABC):  # noqa: B024 - 生命周期提供可选空实现
     """场景模块:在 simworld 已加载的环境中添加额外资产.
 
     Job ``arrange_scene`` 中调用, 先 ``init_scene`` 再 ``arrange``, 再 ``adjust``;采集循环再读
@@ -39,7 +39,7 @@ class BaseScene(ABC):
         self.state: dict[str, Any] = {}  # 额外状态,子类可用
 
 
-    def init_scene(self, sim_world: BaseSimWorld) -> None:
+    def init_scene(self, sim_world: BaseSimWorld) -> None:  # noqa: B027
         """打开 USD 并添加到 sim world 对应 prim;不负责位姿编排.
 
         Args:
@@ -49,7 +49,7 @@ class BaseScene(ABC):
             None.
         """
 
-    def arrange(self) -> None:
+    def arrange(self) -> None:  # noqa: B027
         """按配置把已加载资产摆到 sim world 中的目标位姿.
 
         Returns:

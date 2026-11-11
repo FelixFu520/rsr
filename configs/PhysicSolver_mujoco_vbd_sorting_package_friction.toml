@@ -1,0 +1,14 @@
+# 原装 Pro-M6、100 g 衣物；有效指端—包裹摩擦 2.0 的实验配置，尚待完整验收。
+inherit = "PhysicSolver_mujoco_vbd_sorting_package_diagnostic.toml"
+
+[sim_world]
+newton_substeps = 16
+
+[planner]
+# 保持袋膜、衣物自接触及各支撑面的摩擦参数不变。
+gripper_package_friction = 2.0
+closed_gripper_rad = 0.675
+hold_gripper_rad = 0.675
+
+[job]
+output_dir = "outputs/PhysicSolver/sorting_native_100g_mu20_collection"

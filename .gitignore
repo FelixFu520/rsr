@@ -1,7 +1,10 @@
 app
 uv.lock
-
-tests/
+assets/
+outputs/
+bak/
+tests/*
+!tests/test_sorting_package.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

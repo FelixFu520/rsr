@@ -1,0 +1,4 @@
+interface:
+  display_name: "Isaac 物理 FAQ 与已知限制"
+  short_description: "核对 PhysX 功能组合、版本限制和官方替代方案，辅助仿真故障定位"
+  default_prompt: "使用 $isaac-physics-faq 核对当前异常是否符合官方已知限制，并提出可验证的处理方案。"

@@ -146,9 +146,25 @@ uv lock
 
 改依赖只动 `pyproject.toml`，再 `uv lock`，然后用 Isaac `pip install -e ".[dev]"`。
 
+## 仿真调试 Skills
+
+项目内 skills 位于 `.agents/skills/`。按当前主要问题选择入口；先读该 skill 的 `SKILL.md` 和相关本地 reference，不需要一次加载全部 skills。
+
+| 主要问题 | 入口 |
+|----------|------|
+| 吞吐、步耗时、CPU fallback、碰撞内存增长 | [isaac-physics-performance](.agents/skills/isaac-physics-performance/SKILL.md) |
+| 穿透、弹飞、接触抖动、碰撞几何/SDF | [isaac-collision-debug](.agents/skills/isaac-collision-debug/SKILL.md) |
+| 机器人关节发散、驱动振荡、闭环/mimic 稳定性 | [isaac-articulation-stability](.agents/skills/isaac-articulation-stability/SKILL.md) |
+| 夹爪驱动力、闭合速度、夹持不足与具体调参 | [isaac-gripper-tuning](.agents/skills/isaac-gripper-tuning/SKILL.md) |
+| 功能组合不支持、版本行为差异、官方已知限制 | [isaac-physics-faq](.agents/skills/isaac-physics-faq/SKILL.md) |
+
+混合问题先按直接证据选主入口：夹爪参数估算从 gripper 开始，接触几何异常从 collision 开始，驱动/约束异常从 articulation 开始；只有证据涉及其他领域时再读取对应 skill，避免循环加载。
+
+本地 references 是可离线阅读的摘要和工作笔记，**不是完整教程镜像**。具体 API、schema、单位约定及版本限制需查对应安装版本的官方资料或本机实现。无法核实时标明待验证；`latest` 页面不构成当前安装版本的兼容保证。
+
 ## 编码约定
 
-- Python 3.12（与 Isaac Sim 6.0.1 一致）；类型标注；公共 API 写简短 docstring
+- Python 3.12（与 Isaac Sim 6.2 一致）；类型标注；公共 API 写简短 docstring
 - Lint：`ruff`（`E,F,I,UP,B`），行宽 100
 - 日志：`get_logger` / `LoggerMixin`（structlog），勿散落 `print`
 - 插件加载失败：告警并继续，勿拖垮 CLI / Registry
