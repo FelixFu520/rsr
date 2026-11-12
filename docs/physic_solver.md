@@ -1,4 +1,4 @@
-# 物理求解器验证：Franka 抓放衣服、刚体方块与 V7 包裹
+# 物理求解器验证
 
 更新日期：2026-11-11。
 
@@ -9,7 +9,7 @@
 
 - **衣服**：一件 0.2 kg 的衬衫（质量按三角面积分配），无固定顶点、无抓取附件。
 - **刚体方块**：0.1 kg 方块，全部由 PhysX 求解，作为刚体对照。
-- **V7 包裹**：袋膜（约 20.54 g）+ 内部衣物（200 g）两个物理网格，衣物内部有被动弹簧。
+- **自定义柔性包裹**：袋膜（约 20.54 g）+ 内部衣物（200 g）两个物理网格，衣物内部有被动弹簧。
 
 任务目的不是训练策略，而是在同一套 `IsaacsimWorld` 和固定 Job 生命周期下，比较不同
 “机器人求解器 + 接触/柔体求解器”组合能否完成真实接触驱动的抓放，并把每次成功的过程采集为
@@ -28,8 +28,8 @@ PhysX 的实际求解器写作 `tgs`；引擎归属由 `sim_world.physics_engine
 | `xpbd_vbd_pickplace_cloth` | Newton direct | FR3 URDF | XPBD / VBD | 衣服 | 通过 |
 | `tgs_vbd_pickplace_cloth` | hybrid | Panda USD + Lula IK | PhysX TGS / Newton VBD | 衣服 | 通过 |
 | `tgs_tgs_pickplace_rigid` | PhysX | Panda USD + Lula IK | TGS / TGS | 刚体方块 | 通过 |
-| `mujoco_vbd_pickplace_package` | Newton direct | FR3 原装短指，位置控制 | MuJoCo / VBD | V7 包裹 | 通过 |
-| `featherstone_vbd_pickplace_package` | Newton direct | FR3 + V7 长夹块 | Featherstone / VBD | V7 包裹 | 对照组，未通过验收 |
+| `mujoco_vbd_pickplace_package` | Newton direct | FR3 原装短指，位置控制 | MuJoCo / VBD |  柔性包裹 | 通过 |
+| `featherstone_vbd_pickplace_package` | Newton direct | FR3 + 长夹块 | Featherstone / VBD | 柔性包裹 | 对照组，未通过验收 |
 | `xpbd_xpbd_pickplace_cloth` | Newton direct | FR3 URDF | 统一 XPBD（机器人与衣服同一求解器） | 衣服 | 实验组，未通过验收 |
 
 求解器区别：
@@ -129,7 +129,7 @@ TCP 轨迹由预设阶段插值生成，不做避障路径搜索。
 | 脚本 | 用途 |
 |---|---|
 | [collect_physic_solver_cases.py](../scripts/physic_solver/collect_physic_solver_cases.py) | 串行采集全部 8 个组合并校验；未通过的组合移到 `outputs/debug/physic_solver/` |
-| [prepare_physic_solver_assets.py](../scripts/physic_solver/prepare_physic_solver_assets.py) | 从 `assets/Demo` 复制桌子、衣服、方块、Franka 等到 `assets/PhysicSolver` |
+| [prepare_physic_solver_assets.py](../scripts/physic_solver/prepare_physic_solver_assets.py) | 从 `assets/bak/Demo` 复制桌子、衣服、方块、Franka 等到 `assets/PhysicSolver` |
 | [prepare_official_newton_cloth.py](../scripts/physic_solver/prepare_official_newton_cloth.py) | 从 Isaac Sim 自带 Newton 复制官方 `unisex_shirt.usd`、许可证和来源记录 |
 | [prepare_package_assets.py](../scripts/physic_solver/prepare_package_assets.py) | 复制 V7 包裹快照；`--source/--target` 也用于分拣任务的 V10 快照 |
 | [check_package_pickplace.py](../scripts/physic_solver/check_package_pickplace.py) | 包裹抓放只跑物理、不录 RGB，用于低成本调参 |
@@ -138,13 +138,15 @@ TCP 轨迹由预设阶段插值生成，不做避障路径搜索。
 
 ### 3.2 资产
 
-所有资产放在 `assets/PhysicSolver/`（git 忽略），全部是独立副本：
+所有资产放在 `assets/PhysicSolver/`（git 忽略，约 578 MB），全部是独立副本，只引用该目录内的文件，
+整个目录可以单独打包发给别人：
 
 | 目录 | 内容 |
 |---|---|
 | `Table/`、`Cube/`、`Cloth/` | 桌子、刚体方块、项目衣服 |
 | `Cloth/newton_official/` | 官方 Newton 衬衫 + `LICENSE.md` + 带 SHA-256 的 `provenance.json` |
-| `Robot/franka_emika_panda/` | FR3 URDF（Newton）与 Panda USD（PhysX） |
+| `Robot/franka_emika_panda/` | FR3 URDF 与网格（Newton） |
+| `Isaac/Robots/FrankaRobotics/FrankaPanda/` | Panda USD（PhysX） |
 | `Isaac/Environments/Simple_Warehouse/` | 背景仓库 |
 | `Package/v7/` | V7 包裹：Bag、Garment 两个网格，原始 UV/材质、逐点质量和被动弹簧 |
 

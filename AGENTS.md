@@ -39,13 +39,19 @@
 
 | 任务 | 后缀 | 后端名（scene / robot / planner / job） |
 |------|------|------------------------------------------|
-| 物理求解器验证 | `physic_solver` | `pickplace_cloth`、`pickplace_rigid`、`newton_cloth_franka`、`pickplace_package` / `franka_newton`、`franka_physx`、`franka_package_pads` / `pickplace_cloth`、`newton_cloth_franka`、`pickplace_package` / `pickplace_cloth` |
-| 分拣包裹 | `sorting` | `sorting_package` / `pro_m6_newton` / `sorting_package`、`sorting_stream` / `sorting_package` |
-| 机器狗巡检 | `fire_inspection` | `fire_warehouse` / `x30_kinematic` / `fire_patrol` / `fire_inspection` |
+| 任务 | 后缀 | 资产目录 | 后端名（scene / robot / planner / job） |
+|------|------|----------|------------------------------------------|
+| 物理求解器验证 | `physic_solver` | `assets/PhysicSolver/` | `pickplace_cloth`、`pickplace_rigid`、`newton_cloth_franka`、`pickplace_package` / `franka_newton`、`franka_physx`、`franka_package_pads` / `pickplace_cloth`、`newton_cloth_franka`、`pickplace_package` / `pickplace_cloth` |
+| 分拣包裹 | `sorting` | `assets/SortingPackage/` | `sorting_package` / `pro_m6_newton` / `sorting_package`、`sorting_stream` / `sorting_package` |
+| 机器狗巡检 | `fire_inspection` | `assets/FireInspection/` | `fire_warehouse` / `x30_kinematic` / `fire_patrol` / `fire_inspection` |
 
 - 同一任务的多个后端、运行时和辅助类放在同一文件中，按依赖顺序分节（节首注释说明内容）。
 - 新任务依次新增 `{domain}/{domain}_<task>.py`、`utils/<task>_utils.py`、`configs/<task>/`、
-  `scripts/<task>/`、`docs/<task>.md`；后端名保持配置里的小写字符串，改名需同步配置与文档。
+  `scripts/<task>/`、`docs/<task>.md` 和资产目录 `assets/<Task>/`；后端名保持配置里的小写字符串，
+  改名需同步配置与文档。
+- 资产：每个任务只引用自己资产目录里的文件（含 USD 依赖、MDL 与贴图），可以单独打包发给别人；
+  任务之间共用的资产各自复制一份。不属于任何任务的资产放 `assets/bak/`，任务配置和运行代码不引用它
+  （资产准备脚本可以从这里复制）。
 - 任务之间可以继承（分拣复用物理求解器任务的 `PackageScene` / `PackageRuntime` / `PhysicSolverJob`），
   不要复制代码。
 - 包内模块顶层不导入 Kit / pxr / Newton / Warp；Warp kernel 和依赖 Newton 的子类在首次使用时定义

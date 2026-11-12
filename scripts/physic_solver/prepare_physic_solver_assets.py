@@ -59,7 +59,7 @@ def prepare_assets(source: Path, destination: Path) -> dict:
 def main() -> None:
     """Prepare assets using the project's Isaac Sim Python runtime."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", type=Path, default=Path("assets/Demo"))
+    parser.add_argument("--source", type=Path, default=Path("assets/bak/Demo"))
     parser.add_argument("--destination", type=Path, default=Path("assets/PhysicSolver"))
     args = parser.parse_args()
     result = prepare_assets(args.source, args.destination)

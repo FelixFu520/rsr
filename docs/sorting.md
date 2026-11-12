@@ -131,16 +131,22 @@ LeRobot 布局通过项目导出器及校验器验收，**尚未执行官方 LeR
 
 ### 3.4 资产与求解模型
 
+本任务的全部资产放在 `assets/SortingPackage/`（git 忽略，约 563 MB），只引用该目录内的文件，
+整个目录可以单独打包发给别人：
+
 | 资产 | 内容 |
 | --- | --- |
-| `assets/Scene/sorting_station/` | 分拣工位：入料带、中间平台、出料带 |
-| `assets/Robot/pro_m6_696/pro_m6_696.usda` | Pro-M6 + Robotiq 2F-140；保留原 USD 世界位姿、质量、惯量与力矩限值 |
-| `assets/PhysicSolver/Package/v10_station/` | 软包：衣物与袋膜共 4950 个顶点、9584 个三角形，保留材料、UV 和内部被动弹簧 |
-| `assets/PhysicSolver/Package/v10_box02/` | 纸箱：源 USD 和贴图保留哈希，场景缩放 0.5，约 63×101×71 mm |
+| `Background/Factory/factory_002/` | 工厂背景 `Factory_Interior.usd` 及其材质贴图 |
+| `Scene/sorting_station/` | 分拣工位：入料带、中间平台、出料带；`composed/` 是正式配置引用的组合场景 |
+| `Robot/pro_m6_696/pro_m6_696.usda` | Pro-M6 + Robotiq 2F-140；保留原 USD 世界位姿、质量、惯量与力矩限值。通过相对路径引用 `../../Scene/sorting_station/composed/snapshot.usdc`，两个目录须保持同级 |
+| `Package/v10_station/` | 软包：衣物与袋膜共 4950 个顶点、9584 个三角形，保留材料、UV 和内部被动弹簧 |
+| `Package/v10_box02/` | 纸箱：源 USD 和贴图保留哈希，场景缩放 0.5，约 63×101×71 mm |
+| `Package/v7_sorting/` | `SortingSceneConfig` 默认软包与单元测试使用的 V7 快照；`v7_sorting_refined/` 是其细分版本 |
+| `Background/sorting_station/` | 早期工位灯光层，当前配置未引用 |
 
 衣物质量 25 g、袋膜约 2.568 g，按原逐点质量比例缩放，不改源资产文件；纸箱 31.25 g。
 软包快照用 `scripts/physic_solver/prepare_package_assets.py --source <V10 station_clothing> --target
-assets/PhysicSolver/Package/v10_station` 生成。
+assets/SortingPackage/Package/v10_station` 生成。
 
 环境为 Isaac Sim 6.2、Newton 1.6.1、Warp 1.17.0。刚体使用原生 MuJoCo CPU，柔体使用 CUDA VBD，
 不是 PhysX 接触后端，不能直接套用 PhysX 的传送带或驱动参数。刚体到柔体是单向耦合。

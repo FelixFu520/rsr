@@ -18,7 +18,7 @@ class SortingRobotConfig(BaseConfig):
     """Preserve authored masses, joints and placement; match contacts to visible rubber."""
 
     backend: str = "pro_m6_newton"
-    usd_path: str = "assets/Robot/pro_m6_696/pro_m6_696.usda"
+    usd_path: str = "assets/SortingPackage/Robot/pro_m6_696/pro_m6_696.usda"
     prim_path: str = "/World/robots/ProM6"
     control_mode: Literal["position"] = "position"
     arm_stiffness: float = Field(default=6000, gt=0)
