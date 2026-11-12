@@ -16,9 +16,9 @@ class SortingSceneConfig(PackageSceneConfig):
     """Station supports are measured from their USD visuals in world metres."""
 
     backend: str = "sorting_package"
-    cloth_usd_path: str = "assets/PhysicSolver/Package/v7_sorting/parcel_two_mesh.usd"
+    cloth_usd_path: str = "assets/SortingPackage/Package/v7_sorting/parcel_two_mesh.usd"
     station_usd_path: str = (
-        "assets/Scene/sorting_station/composed/scene_parcel_5cm_loose_edges.usdc"
+        "assets/SortingPackage/Scene/sorting_station/composed/scene_parcel_5cm_loose_edges.usdc"
     )
     infeed_path: str = "ConveyorBelt_A06_01/Belt"
     platform_path: str = "platform/Empty/Plane/Plane_002"

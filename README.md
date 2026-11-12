@@ -58,6 +58,8 @@ uv lock                                    # 更新 uv.lock（不创建运行时
 
 不要 `uv sync` 出 `.venv` 当仿真环境。录制依赖 Pillow、PyArrow，视频编码与校验需要系统 `ffmpeg` / `ffprobe`。
 资产（`assets/`）与输出（`outputs/`）不进 git；各任务的资产准备脚本见对应文档。
+每个任务的资产自成一个目录，可单独打包：`assets/PhysicSolver/`（物理求解器验证）、
+`assets/SortingPackage/`（分拣包裹）、`assets/FireInspection/`（机器狗巡检）；其余资产在 `assets/bak/`。
 本项目同时运行的 Isaac Sim 实例不超过两个。
 
 ## 目录结构

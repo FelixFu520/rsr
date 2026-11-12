@@ -49,7 +49,7 @@ if __name__ == "__main__":
         "--source", type=Path, default=Path("/home/fufa/Projects/package/output/simulation_v10")
     )
     parser.add_argument(
-        "--destination", type=Path, default=Path("assets/PhysicSolver/Package/v10_box02")
+        "--destination", type=Path, default=Path("assets/SortingPackage/Package/v10_box02")
     )
     args = parser.parse_args()
     prepare(args.source, args.destination)

@@ -426,7 +426,7 @@ def test_sorting_mass_override_preserves_bag_geometry_and_original_asset(monkeyp
 
 @pytest.mark.skipif(
     not __import__("pathlib")
-    .Path("assets/PhysicSolver/Package/v7_sorting/parcel_two_mesh.usd")
+    .Path("assets/SortingPackage/Package/v7_sorting/parcel_two_mesh.usd")
     .is_file(),
     reason="Local V7 source asset required",
 )
@@ -465,7 +465,7 @@ def _check_real_usd_mass(monkeypatch):
 
     from real2sim2real.scene.scene_sorting import SortingScene, SortingSceneConfig
 
-    path = Path("assets/PhysicSolver/Package/v7_sorting/parcel_two_mesh.usd")
+    path = Path("assets/SortingPackage/Package/v7_sorting/parcel_two_mesh.usd")
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     scenes = []
     for target in (0.2, 0.1, 0.05):
@@ -971,7 +971,9 @@ def test_jaw_audit_detects_a_face_crossing_even_when_all_vertices_are_outside():
 
 
 @pytest.mark.skipif(
-    not __import__("pathlib").Path("assets/Robot/pro_m6_696/pro_m6_696.usda").is_file(),
+    not __import__("pathlib")
+    .Path("assets/SortingPackage/Robot/pro_m6_696/pro_m6_696.usda")
+    .is_file(),
     reason="Local Pro-M6 USD required for native gripper regression",
 )
 def test_native_mimics_are_not_duplicated_and_closed_fingers_clear_the_support():
@@ -998,7 +1000,7 @@ from real2sim2real.robot.robot_sorting import SortingRobot
 from real2sim2real.planner.planner_sorting import SortingArmIK
 from real2sim2real.planner.planner_physic_solver import _rotation_wxyz
 from real2sim2real.utils.sorting_utils import unit_box_mesh
-robot=SortingRobot();robot.source_path='assets/Robot/pro_m6_696/pro_m6_696.usda'
+robot=SortingRobot();robot.source_path='assets/SortingPackage/Robot/pro_m6_696/pro_m6_696.usda'
 builder=newton.ModelBuilder();SolverMuJoCo.register_custom_attributes(builder)
 robot.add_newton_robot(builder)
 model=builder.finalize(device='cpu')

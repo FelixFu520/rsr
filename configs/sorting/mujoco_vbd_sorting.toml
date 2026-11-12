@@ -38,7 +38,7 @@ dlss = false
 auto_exposure = false
 warmup_frames = 2
 fast_shutdown = true
-background_usd_path = "assets/Background/Factory/factory_002/Factory_Interior.usd"
+background_usd_path = "assets/SortingPackage/Background/Factory/factory_002/Factory_Interior.usd"
 background_prim_path = "/World/background"
 background_gravity = false
 background_skip_metrics_assembler = true
@@ -47,9 +47,9 @@ background_light_scale = 0.25
 [scene]
 backend = "sorting_package"
 object_kind = "cloth"
-station_usd_path = "assets/Scene/sorting_station/composed/scene_parcel_5cm_loose_edges.usdc"
+station_usd_path = "assets/SortingPackage/Scene/sorting_station/composed/scene_parcel_5cm_loose_edges.usdc"
 # V10 软包：衣物 + 袋膜两网格，保留 UV、材质和内部被动弹簧。
-cloth_usd_path = "assets/PhysicSolver/Package/v10_station/parcel_two_mesh.usd"
+cloth_usd_path = "assets/SortingPackage/Package/v10_station/parcel_two_mesh.usd"
 garment_mass_kg = 0.025  # 按原逐点质量比例缩放，几何不变。
 bag_mass_kg = 0.0025677532
 prim_path = "/World/scene"
@@ -68,7 +68,7 @@ clear_legacy_parcels = true  # 清除工位自带的旧包裹。
 infeed_travel_m = 0.75  # 从抓取点上游 0.75 m 入料。
 floor_z_m = 0.0  # 离带后的真实落地碰撞面。
 # 软包流程结束后生成的 V10 纸箱（缩放 0.5，约 63×101×71 mm）。
-rigid_usd_path = "assets/PhysicSolver/Package/v10_box02/source.usd"
+rigid_usd_path = "assets/SortingPackage/Package/v10_box02/source.usd"
 rigid_scale = 0.5
 rigid_mass_kg = 0.03125
 belt_markers = true  # 用循环移动的细缝显示带面实际位移。
@@ -85,7 +85,7 @@ horizontal_aperture = 20.955
 
 [robot]
 backend = "pro_m6_newton"
-usd_path = "assets/Robot/pro_m6_696/pro_m6_696.usda"
+usd_path = "assets/SortingPackage/Robot/pro_m6_696/pro_m6_696.usda"
 prim_path = "/World/robots/ProM6"
 control_mode = "position"
 arm_stiffness = 6000.0
