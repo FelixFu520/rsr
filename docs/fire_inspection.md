@@ -1,6 +1,6 @@
 # 机器狗巡检：X30 仓库消防巡检
 
-更新日期：2026-11-11。
+更新日期：2026-11-12。
 
 ## 1. 任务介绍
 
@@ -32,6 +32,8 @@ finally: close
 
 ## 2. 当前结果
 
+### 2.1 原有正式结果
+
 本节数据来自 2026-11-11 16:38–17:00 UTC 用整理后代码重新采集的 [outputs/fire_inspection](../outputs/fire_inspection/)。
 
 | 项目 | 结果 |
@@ -56,6 +58,29 @@ finally: close
 [巡航路线与实际轨迹](../outputs/fire_inspection/map/patrol_map_result.png)、
 [各视角关键帧](../outputs/fire_inspection/qa/keyframes.jpg)、
 [验收报告](../outputs/fire_inspection/validation.json)。
+
+### 2.2 2K 展示版
+
+2026-11-12 09:10–11:12 UTC 完成独立采集，结果位于
+[outputs/fire_inspection_demo_2k](../outputs/fire_inspection_demo_2k/)。原有正式输出保留。
+先完整跑通 640×360、15 fps 预验证，再用相同机位采集原生 2560×1440、30 fps。
+
+| 项目 | 结果 |
+|---|---|
+| 视频 | front_rgb / follow 两路 H.264，16:9，2029 帧，67.63 s；不含 fire_overview |
+| 渲染 | PathTracing，256 spp、`rt_subframes=12`；墙钟 7281.7 s |
+| 跟随机位 | TORSO 左后上方 `[-1.6, 0.35, 0.8]` m，下俯约 25°；焦距 12 mm，水平光圈 27.94 mm |
+| 全程相机检查 | 最终实际轨迹的 2029 个采样位置全部通过：相机周围半边长 0.1 m 净空、关键部位无遮挡、整机包围盒距画面边缘至少 4.11% |
+| 视觉复核 | 每 0.2 s 抽查及旧穿模位置第 1730–1800 帧逐帧，共 398 帧；第 1754 帧可清楚看到整机和前方火点 |
+| 火情与报警 | 2K 照片火点窗口内火焰像素 6036 个、占比 5.89%；拍照后原地报警 7 s，警示灯爆闪 14 次 |
+| 验收 | Job 内 12 项、独立校验 34 项全部通过；两路视频完整解码通过 |
+
+直接展示：[跟随视频](../outputs/fire_inspection_demo_2k/demo/follow_2k_30fps.mp4)、
+[前视视频](../outputs/fire_inspection_demo_2k/demo/front_rgb_2k_30fps.mp4)、
+[火情照片](../outputs/fire_inspection_demo_2k/demo/fire_photo_2k.png)。
+验收依据：[独立报告](../outputs/fire_inspection_demo_2k/validation.json)、
+[相机报告](../outputs/fire_inspection_demo_2k/camera_validation_30fps.json)、
+[视觉复核记录](../outputs/fire_inspection_demo_2k/qa/visual_review.json)。
 
 ## 3. 设计选择
 
@@ -205,7 +230,31 @@ assets/FireInspection/
 | 文件 | 用途 | 输出 |
 |---|---|---|
 | [x30_physx_warehouse.toml](../configs/fire_inspection/x30_physx_warehouse.toml) | 正式采集；只发布全部验收通过的数据；已有数据集时拒绝覆盖 | `outputs/fire_inspection/` |
+| [x30_physx_warehouse_demo_2k.toml](../configs/fire_inspection/x30_physx_warehouse_demo_2k.toml) | 展示版；front_rgb / follow 两路视频和照片原生 2560×1440、16:9，30 fps；保留正式路径追踪质量；独立配置，不覆盖原结果 | `outputs/fire_inspection_demo_2k/` |
+| [x30_physx_warehouse_demo_640.toml](../configs/fire_inspection/x30_physx_warehouse_demo_640.toml) | 展示版机位的完整预验证；640×360、15 fps，64 spp；通过全流程、独立校验和相机检查后再运行 2K 版 | `outputs/debug/fire_inspection/demo_640_validation/` |
 | [x30_physx_warehouse_debug.toml](../configs/fire_inspection/x30_physx_warehouse_debug.toml) | 继承正式配置；可重复运行并覆盖上次数据集；失败轨迹也导出为 `diagnostic` | `outputs/debug/fire_inspection/` |
+
+2K 展示版按用户要求取消 `fire_overview` 全景相机，只录制前视和跟随两路视频。
+对应的全景机位预热像素检查关闭，4 s 火焰预热及最终前视照片的严格火焰像素验收保留。
+展示版跟随相机位于 TORSO 左后上方 `[-1.6, 0.35, 0.8]` m，约下俯 25°，
+焦距 12 mm、水平光圈 27.94 mm，兼顾前方环境和机器狗全身。前视相机保持原水平视场。
+`check_follow_camera.py` 使用完整 120 Hz 轨迹，在每个 30 fps 采样时刻检查相机周围
+半边长 0.1 m 的净空、环境对机器人关键部位的遮挡，以及整机包围盒的画面边距。
+640×360、15 fps 的完整预验证已通过：1015 帧，任务及 34 项独立校验通过；
+按本次实际 120 Hz 轨迹检查 2029 个 30 fps 相机位置，相机净空、遮挡和全身取景全部通过，
+整机包围盒距画面边缘至少 4.11%。视觉复核覆盖每 0.2 s 及旧穿模位置附近逐帧，共 363 帧。
+预验证结果位于 `outputs/debug/fire_inspection/demo_640_validation/`，相机报告为
+`camera_validation_30fps.json`，视觉范围记录于 `qa/visual_review.json`。
+照片验收窗口随宽度从 160 增至 320 px，最少火焰像素从 50
+按面积增至 200，火焰占比门限仍为 1%。在新的输出目录中依次运行：
+
+```bash
+./scripts/rsr collect run -c configs/fire_inspection/x30_physx_warehouse_demo_640.toml
+./app/python.sh scripts/fire_inspection/validate_fire_inspection.py outputs/debug/fire_inspection/demo_640_validation
+# 完整预验证及全路线相机检查通过后，再运行 2K 采集。
+./scripts/rsr collect run -c configs/fire_inspection/x30_physx_warehouse_demo_2k.toml
+./app/python.sh scripts/fire_inspection/validate_fire_inspection.py outputs/fire_inspection_demo_2k
+```
 
 主要字段：
 
