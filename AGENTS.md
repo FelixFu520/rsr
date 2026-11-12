@@ -191,6 +191,7 @@ uv lock
 | 机器人关节发散、驱动振荡、闭环/mimic 稳定性 | [isaac-articulation-stability](.agents/skills/isaac-articulation-stability/SKILL.md) |
 | 夹爪驱动力、闭合速度、夹持不足与具体调参 | [isaac-gripper-tuning](.agents/skills/isaac-gripper-tuning/SKILL.md) |
 | 功能组合不支持、版本行为差异、官方已知限制 | [isaac-physics-faq](.agents/skills/isaac-physics-faq/SKILL.md) |
+| 迁移任务、新增任务、丰富已有任务（引擎选型、组件接入、资产打包、回归、采集验收） | [rsr-task-development](.agents/skills/rsr-task-development/SKILL.md) |
 
 混合问题先按直接证据选主入口：夹爪参数估算从 gripper 开始，接触几何异常从 collision 开始，驱动/约束异常从 articulation 开始；只有证据涉及其他领域时再读取对应 skill，避免循环加载。
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "rsr 任务迁移 / 新增 / 丰富"
+  short_description: "按阶段完成 rsr 任务的引擎选型、组件接入、资产打包、回归与采集验收"
+  default_prompt: "使用 $rsr-task-development 把这个任务迁移或新增到 Real2Sim2Real，完成资产整理、组件接入和采集验收，直到正式结果通过。"
