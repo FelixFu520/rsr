@@ -315,7 +315,10 @@ class IsaacsimWorld(BaseSimWorld):
 
     def _configure_rendering(self) -> None:
         """Apply spatial rendering and optional synchronous multi-camera capture settings."""
-        self._settings.set("/rtx/rendermode", self.config.renderer)
+        # SimulationApp already selected the mode. On 6.2, writing the same PathTracing mode again
+        # after the stage is open makes NVIDIA Flow volumes disappear from the render.
+        if self._settings.get("/rtx/rendermode") != self.config.renderer:
+            self._settings.set("/rtx/rendermode", self.config.renderer)
         self._settings.set_bool("/rtx/post/dlss/enabled", self.config.dlss)
         # SimulationApp defaults to AA mode 3 (DLSS). Select spatial FXAA when
         # DLSS is disabled, avoiding incompatible temporal history across cameras.

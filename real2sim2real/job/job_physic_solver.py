@@ -43,7 +43,7 @@ class PhysicSolverRecorderConfig(BaseModel):
 class PhysicSolverJobConfig(BaseConfig):
     """Finite task execution and accepted dataset destination."""
 
-    output_dir: str = "outputs/PhysicSolver/featherstone_vbd_pickplace_cloth"
+    output_dir: str = "outputs/physic_solver/featherstone_vbd_pickplace_cloth"
     max_steps: int = Field(default=6000, gt=0)
     timeout_s: float = Field(
         default=1800, gt=0, description="Wall-clock limit for the loop, including RGB capture."

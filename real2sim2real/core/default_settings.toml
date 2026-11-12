@@ -16,14 +16,14 @@ backend = "stub"  # 不启动 Kit
 backend = "stub"
 # pickplace_cloth / pickplace_rigid 支持 [[scene.cameras]] 固定相机列表。
 # 每项含 name、prim_path、pose_relative_to、pose、resolution 和可选镜头参数。
-# 示例见 configs/PhysicSolver_featherstone_vbd_pickplace_cloth.toml。
+# 示例见 configs/physic_solver/featherstone_vbd_pickplace_cloth.toml。
 # newton_cloth_franka 使用 newton_official/unisex_shirt.usd 和未经压扁的官方布局。
 # cloth_base_color=[0.16,0.20,0.65]、cloth_roughness=0.92、cloth_specular=0.02。
 # pickplace 系列场景：fill_light_intensity=650、key_light_intensity=2200。
 
 # pickplace_package：cloth_usd_path="assets/PhysicSolver/Package/v7/parcel_two_mesh.usd"。
 # target_xy=[0.10,0]、robot_base_xy=[-0.42,0]；保持两个网格及原始 UV/材质。
-# sorting_package：station_usd_path 指向旧分拣工位，cloth_usd_path 使用 v7_sorting 独立快照。
+# sorting_package：station_usd_path 指向旧分拣工位，cloth_usd_path 默认 v7_sorting 快照（正式配置用 v10_station）。
 # infeed_path/platform_path/outfeed_path 读取各自 USD 支撑面；support_depth_m=0.04。
 # garment_mass_kg=0.2；bag_mass_kg 默认不覆盖袋膜质量。可显式设置两者并保持各自质量分布。
 # initial_clearance_m=0.002、outfeed_target_xy=[-0.55,-0.876]。
@@ -32,6 +32,9 @@ backend = "stub"
 # clear_legacy_parcels=false：清理工位自带的 box01/box02/重复衣物视觉资产。
 # infeed_travel_m=0：从目标点上游指定距离入料（沿世界 +Y），整包必须在带面范围内。
 # floor_z_m=0：启用远端入料时增加真实落地碰撞面。
+# fire_warehouse：fire_manifest_path、fire_fx_prim="/FireFX"、fire_sight_margin_m=0.15。
+# flow_max_steps_per_update=8：运行时覆盖 Flow maxStepsPerSimulate，须覆盖一帧录制间隔。
+# light_scale=1.0：仓库全部灯光强度倍率，只改运行时 stage。
 # rigid_usd_path=""、rigid_scale=0.5、rigid_mass_kg=0.03125：可选 V10 纸箱及声明的缩放/质量。
 # belt_markers=false：用循环移动的细缝显示实际传送带表面偏移。
 
@@ -46,10 +49,14 @@ backend = "stub"
 # finger_friction=1.4；cameras 支持头部及左右腕部挂载。
 # initial_gripper_rad=0.0：可将初始夹爪设为打开姿态，所有从动关节遵守原 mimic 比例。
 # pad_width_m=0.027：按原生可视胶垫测量碰撞尺寸，避免使用膨大的碰撞代理。
+# x30_kinematic：base_xy/base_yaw_deg 为 TORSO 出发位姿，stance_height_m=0.5226。
+# leg.*：官方 URDF 腿长；gait.mode="trot"/"stand"、period_s=0.5、lift_m=0.07。
+# gait.max_stride_m=0.13、max_tracking_error_rad=0.35；camera_for_detection="front_rgb"。
+# beacon：护笼顶部红色警示灯，base_position_m=[0.14,0,0.462]、light_intensity=6000，仅视觉。
 
 [planner]
 backend = "stub"
-# newton_cloth_franka：keyframe_limit=7（首轮抓放）；完整官方序列见 OFFICIAL_KEYFRAMES。
+# newton_cloth_franka：keyframe_limit=7（首轮抓放）；完整官方序列见 planner_physic_solver.OFFICIAL_KEYFRAMES。
 # final_settle_s=2；shape_contact_stiffness=50000、shape_contact_damping=50、shape_contact_friction=1.5。
 # newton_cloth_franka 的 table_friction=1.5（官方默认），可独立于夹指摩擦设置。
 # 官方手指默认 open_finger_m=0.032、closed_finger_m=0.004，单位为单侧米。
@@ -113,8 +120,16 @@ backend = "stub"
 # maximum_edge_stretch=1.3、minimum_triangle_area_ratio=0.03；沿用 V7 的形变检查。
 # maximum_shape_rms_m=0.037413、maximum_bag_gap_m=0.01、maximum_tcp_error_m=0.03。
 # label_up_min_cos=0.9；每次放置后使用实际标签网格法线检查。
+# fire_patrol：map_bounds_xy、map_resolution_m=0.05、map_z_band_m=[0.10,1.15]（PhysX 扫描）。
+# robot_radius_m=0.6、clearance_margin_m=0.3；route_xy 相邻航点由 A* 连通，首点等于 robot.base_xy。
+# cruise_speed_mps=0.8、approach_speed_mps=0.5、detect_max_distance_m=10、detect_confirm_steps=12。
+# standoff_xy=None 时在火点周围 standoff_m=2.1 的圆上选可达且视线通畅的拍照点。
+# 拍照后 detect_hold_s=4 原地停留，再报警 alarm_s=3；全程警示灯 alarm_flash_hz=2 爆闪，途中不停留。
 
 [job]
 backend = "stub"  # StubJob 只串工厂,不采集
 # pickplace_cloth 的 timeout_s=1800：包含采集与渲染的墙钟时限；运行中约每 30 秒记录进度。
 # sorting_package：timeout_s=14400，output_dir 使用独立的分拣目录，LeRobot v3 记录 16 维关节角。
+# fire_inspection：command 为空时终端输入，否则用 default_command="巡检仓库"；关键词解析，不调用 LLM。
+# output_dir="outputs/fire_inspection"、overwrite_dataset=false、fire_warmup_s=4、fire_check_camera、fire_check_min_pixels=20。
+# photo.resolution=[1280,960]、photo.min_window_fraction=0.01；recorder.fps=15。
