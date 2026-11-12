@@ -35,41 +35,43 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
-[project.entry-points."real2sim2real.job.backends"]
-stub = "real2sim2real.job.job_stub:StubJob"
-pickplace_cloth = "real2sim2real.job.job_physic_solver:PhysicSolverJob"
-sorting_package = "real2sim2real.job.job_sorting:SortingJob"
-fire_inspection = "real2sim2real.job.job_fire_inspection:FireInspectionJob"
-
-[project.entry-points."real2sim2real.planner.backends"]
-stub = "real2sim2real.planner.planner_stub:StubPlanner"
-pickplace_cloth = "real2sim2real.planner.planner_physic_solver:PickPlaceClothPlanner"
-newton_cloth_franka = "real2sim2real.planner.planner_newton_cloth:OfficialClothPlanner"
-pickplace_package = "real2sim2real.planner.planner_package:PackagePlanner"
-sorting_package = "real2sim2real.planner.planner_sorting:SortingPlanner"
-sorting_stream = "real2sim2real.planner.planner_sorting_stream:SortingStreamPlanner"
-fire_patrol = "real2sim2real.planner.planner_fire_patrol:FirePatrolPlanner"
-
-[project.entry-points."real2sim2real.robot.backends"]
-stub = "real2sim2real.robot.robot_stub:StubRobot"
-franka_newton = "real2sim2real.robot.robot_physic_solver:FrankaNewtonRobot"
-franka_package_pads = "real2sim2real.robot.robot_package:PackagePadRobot"
-franka_physx = "real2sim2real.robot.robot_physic_solver:FrankaPhysxRobot"
-pro_m6_newton = "real2sim2real.robot.robot_sorting:SortingRobot"
-x30_kinematic = "real2sim2real.robot.robot_x30:X30Robot"
+# 后端名 = 配置里的 backend 字符串。实现按任务分文件：
+# *_physic_solver（物理求解器验证）、*_sorting（分拣包裹）、*_fire_inspection（机器狗巡检）。
+[project.entry-points."real2sim2real.simworld.backends"]
+stub = "real2sim2real.simworld.stub:StubSimWorld"
+isaacsim = "real2sim2real.simworld.isaacsim:IsaacsimWorld"
 
 [project.entry-points."real2sim2real.scene.backends"]
 stub = "real2sim2real.scene.scene_stub:StubScene"
 pickplace_cloth = "real2sim2real.scene.scene_physic_solver:PickPlaceClothScene"
 pickplace_rigid = "real2sim2real.scene.scene_physic_solver:PickPlaceRigidScene"
-newton_cloth_franka = "real2sim2real.scene.scene_newton_cloth:OfficialClothScene"
-pickplace_package = "real2sim2real.scene.scene_package:PackageScene"
+newton_cloth_franka = "real2sim2real.scene.scene_physic_solver:OfficialClothScene"
+pickplace_package = "real2sim2real.scene.scene_physic_solver:PackageScene"
 sorting_package = "real2sim2real.scene.scene_sorting:SortingScene"
 fire_warehouse = "real2sim2real.scene.scene_fire_inspection:FireWarehouseScene"
 
-[project.entry-points."real2sim2real.simworld.backends"]
-stub = "real2sim2real.simworld.stub:StubSimWorld"
-isaacsim = "real2sim2real.simworld.isaacsim:IsaacsimWorld"
+[project.entry-points."real2sim2real.robot.backends"]
+stub = "real2sim2real.robot.robot_stub:StubRobot"
+franka_newton = "real2sim2real.robot.robot_physic_solver:FrankaNewtonRobot"
+franka_physx = "real2sim2real.robot.robot_physic_solver:FrankaPhysxRobot"
+franka_package_pads = "real2sim2real.robot.robot_physic_solver:PackagePadRobot"
+pro_m6_newton = "real2sim2real.robot.robot_sorting:SortingRobot"
+x30_kinematic = "real2sim2real.robot.robot_fire_inspection:X30Robot"
+
+[project.entry-points."real2sim2real.planner.backends"]
+stub = "real2sim2real.planner.planner_stub:StubPlanner"
+pickplace_cloth = "real2sim2real.planner.planner_physic_solver:PickPlaceClothPlanner"
+newton_cloth_franka = "real2sim2real.planner.planner_physic_solver:OfficialClothPlanner"
+pickplace_package = "real2sim2real.planner.planner_physic_solver:PackagePlanner"
+sorting_package = "real2sim2real.planner.planner_sorting:SortingPlanner"
+sorting_stream = "real2sim2real.planner.planner_sorting:SortingStreamPlanner"
+fire_patrol = "real2sim2real.planner.planner_fire_inspection:FirePatrolPlanner"
+
+[project.entry-points."real2sim2real.job.backends"]
+stub = "real2sim2real.job.job_stub:StubJob"
+pickplace_cloth = "real2sim2real.job.job_physic_solver:PhysicSolverJob"
+sorting_package = "real2sim2real.job.job_sorting:SortingJob"
+fire_inspection = "real2sim2real.job.job_fire_inspection:FireInspectionJob"
 
 [project.entry-points."real2sim2real.cli.commands"]
 collect = "real2sim2real.job.cli:register"

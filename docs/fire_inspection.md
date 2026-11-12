@@ -1,37 +1,15 @@
-# X30 仓库消防巡检
+# 机器狗巡检：X30 仓库消防巡检
+
+更新日期：2026-11-11。
+
+## 1. 任务介绍
 
 操作员输入一句话（例如“巡检仓库”），X30 机器狗沿巡航路线巡检仓库北区货架。
 着火纸箱进入视野后，机器狗不停留，直接走到观察点、对准火点，用云台可见光相机拍照。
 拍完照后，它在原地停留 4 s 并继续报警 3 s，这 7 s 内红色警示灯一直爆闪，之后任务结束。
-途中不停留、不亮灯。
-整个过程同步录制为 LeRobot v3 数据集。
+途中不停留、不亮灯。整个过程同步录制为 LeRobot v3 数据集。
 
-更新日期：2026-11-11。
-
-## 1. 当前结果
-
-| 项目 | 结果 |
-|---|---|
-| 正式输出 | [outputs/xunjian](../outputs/xunjian/)，`success=true`，`dataset_use=demonstration` |
-| 调试输出 | [outputs/xunjian-debug](../outputs/xunjian-debug/)，同一配置继承而来，轨迹与正式输出逐步一致 |
-| 数据集 | 1 个 episode，1015 帧，15 fps，67.7 s；3 路 640×480 H.264 视频 |
-| 渲染 | RTX 全路径追踪（PathTracing），256 spp、`rt_subframes=12`；仓库灯光 ×1.5 |
-| 指令 | `巡检仓库`（作为 LeRobot `task` 原样保存） |
-| 巡航 | 规划路线 37.6 m，最小净空 0.65 m（要求 ≥ 0.6 m） |
-| 发现火点 | 巡航开始后 42.0 s，位置 (-3.14, 46.09)，相机距火点 6.44 m |
-| 途中 | 发现后不停车，直接走 7.2 m 到拍照点（最小净空 0.67 m）；途中警示灯一直是灭的 |
-| 拍照 | 位置 (-5.405, 39.448)，距火点 2.13 m，警示灯已熄灭；火点窗口内火焰色像素 5.6%（1436 个，门限 1%） |
-| 停留与报警 | 拍照后原地停留 4.0 s + 报警 3.0 s，警示灯爆闪 14 次，直到最后一帧；灯罩区域红色通道 42 → 156（8 bit） |
-| 全景视角 | `fire_overview` 中机器狗整机可见（包围盒投影 363–468 × 286–426 px），火点同在画面内 |
-| 物理 | PhysX CPU，120 Hz，共 8595 步；墙钟约 20 min，其中渲染采集占 86% |
-| 验收 | Job 内 12 项全部通过；`validate_fire_inspection.py` 37 项全部通过 |
-
-直接查看：[巡检照片](../outputs/xunjian/photos/)、
-[巡航路线与实际轨迹](../outputs/xunjian/map/patrol_map_result.png)、
-[各视角关键帧](../outputs/xunjian/qa/keyframes.jpg)、
-[验收报告](../outputs/xunjian/validation.json)。
-
-## 2. 任务流程
+### 1.1 任务流程
 
 ```
 操作员一句话 ──► 关键词解析（巡检/巡逻/检查/找…，或提到“火”）
@@ -51,6 +29,33 @@ finally: close
 
 巡航路线：西侧货架过道南端出发向北 → 北端横移到中间过道 → 中间过道向南 → 出口转向西南空地。
 着火纸箱在出发点身后，被环形货架挡住。中间过道走到南端出口附近时，火点才首次进入前视相机视野。
+
+## 2. 当前结果
+
+本节数据来自 2026-11-11 16:38–17:00 UTC 用整理后代码重新采集的 [outputs/fire_inspection](../outputs/fire_inspection/)。
+
+| 项目 | 结果 |
+|---|---|
+| 正式输出 | [outputs/fire_inspection](../outputs/fire_inspection/)，`success=true`，`dataset_use=demonstration` |
+| 数据集 | [lerobot_v3](../outputs/fire_inspection/lerobot_v3/)：1 个 episode，1015 帧，15 fps，67.7 s；3 路 640×480 H.264 视频 |
+| 渲染 | RTX 全路径追踪（PathTracing），256 spp、`rt_subframes=12`；仓库灯光 ×1.5 |
+| 指令 | `巡检仓库`（作为 LeRobot `task` 原样保存） |
+| 巡航 | 规划路线 37.61 m，最小净空 0.65 m（要求 ≥ 0.6 m） |
+| 发现火点 | 位置 (-3.14, 46.09)，相机距火点 6.44 m |
+| 途中 | 发现后不停车，直接走 7.23 m 到拍照点（最小净空 0.667 m）；途中警示灯一直是灭的 |
+| 拍照 | 位置 (-5.405, 39.448)，距火点 2.134 m，警示灯已熄灭；火点窗口内火焰色像素 5.68%（1454 个，门限 1%） |
+| 停留与报警 | 拍照后原地停留 4.0 s + 报警 3.0 s（第 910–1014 帧），警示灯爆闪 14 次；灯罩区域红色通道 41 → 155（8 bit） |
+| 全景视角 | `fire_overview` 中机器狗整机可见（包围盒投影 363–468 × 286–426 px），火点同在画面内 |
+| 物理 | PhysX CPU，120 Hz，共 8595 步（含 480 步火焰预热）；墙钟 1290 s，其中渲染采集 1136 s（88%） |
+| 验收 | Job 内 12 项全部通过；`validate_fire_inspection.py` 37 项全部通过 |
+
+与整理前的交付相比，轨迹、发现位置、拍照位姿和报警时序一致；火焰像素数随路径追踪采样略有波动
+（1436 → 1454）。本次正式采集一次通过，没有运行调试配置。
+
+直接查看：[巡检照片](../outputs/fire_inspection/photos/)、
+[巡航路线与实际轨迹](../outputs/fire_inspection/map/patrol_map_result.png)、
+[各视角关键帧](../outputs/fire_inspection/qa/keyframes.jpg)、
+[验收报告](../outputs/fire_inspection/validation.json)。
 
 ## 3. 设计选择
 
@@ -147,12 +152,12 @@ inspect、patrol、search、find、check 之一，或提到火、烟、fire、sm
 
 | 模块 | 后端名 | 实现 | 对应原项目 Real2Sim2Real |
 |---|---|---|---|
-| SimWorld | `isaacsim` | [simworld/isaacsim.py](../real2sim2real/simworld/isaacsim.py)（未改动） | `isaacsim` 世界 |
+| SimWorld | `isaacsim` | [simworld/isaacsim.py](../real2sim2real/simworld/isaacsim.py) | `isaacsim` 世界 |
 | Scene | `fire_warehouse` | [scene/scene_fire_inspection.py](../real2sim2real/scene/scene_fire_inspection.py) | `NavigationScene` |
-| Robot | `x30_kinematic` | [robot/robot_x30.py](../real2sim2real/robot/robot_x30.py) | `Go2Robot` + RL 步态 |
-| Planner | `fire_patrol` | [planner/planner_fire_patrol.py](../real2sim2real/planner/planner_fire_patrol.py) | `NavigationPlanner` |
+| Robot | `x30_kinematic` | [robot/robot_fire_inspection.py](../real2sim2real/robot/robot_fire_inspection.py) | `Go2Robot` + RL 步态 |
+| Planner | `fire_patrol` | [planner/planner_fire_inspection.py](../real2sim2real/planner/planner_fire_inspection.py) | `NavigationPlanner` |
 | Job | `fire_inspection` | [job/job_fire_inspection.py](../real2sim2real/job/job_fire_inspection.py) | `FactorySearchJob` |
-| 几何工具 | — | [utils/patrol_geometry.py](../real2sim2real/utils/patrol_geometry.py) | `utils/occupancy.py` |
+| 几何工具 | — | [utils/fire_inspection_utils.py](../real2sim2real/utils/fire_inspection_utils.py) | `utils/occupancy.py` |
 
 原项目是 Go2 在仓库中按对话找物体拍照：omap 建占用图、A* 导航、RL 步态、LLM 理解指令、LeRobot v2。
 迁移后保留了“一句话指令 → 导航 → 拍照 → 数据集”的结构，并按本项目约定调整：
@@ -169,7 +174,7 @@ inspect、patrol、search、find、check 之一，或提到火、烟、fire、sm
 所有资产放在 `assets/FireInspection/`（git 忽略，约 355 MB），由脚本从 x30 项目复制，源文件不改动：
 
 ```bash
-./app/python.sh scripts/prepare_fire_inspection_assets.py
+./app/python.sh scripts/fire_inspection/prepare_fire_inspection_assets.py
 ```
 
 ```text
@@ -199,8 +204,8 @@ assets/FireInspection/
 
 | 文件 | 用途 | 输出 |
 |---|---|---|
-| [fire_inspection_x30_physx_warehouse.toml](../configs/fire_inspection_x30_physx_warehouse.toml) | 正式采集；只发布全部验收通过的数据；已有数据集时拒绝覆盖 | `outputs/xunjian/` |
-| [fire_inspection_x30_physx_warehouse_debug.toml](../configs/fire_inspection_x30_physx_warehouse_debug.toml) | 继承正式配置；可重复运行并覆盖上次数据集；失败轨迹也导出为 `diagnostic` | `outputs/xunjian-debug/` |
+| [x30_physx_warehouse.toml](../configs/fire_inspection/x30_physx_warehouse.toml) | 正式采集；只发布全部验收通过的数据；已有数据集时拒绝覆盖 | `outputs/fire_inspection/` |
+| [x30_physx_warehouse_debug.toml](../configs/fire_inspection/x30_physx_warehouse_debug.toml) | 继承正式配置；可重复运行并覆盖上次数据集；失败轨迹也导出为 `diagnostic` | `outputs/debug/fire_inspection/` |
 
 主要字段：
 
@@ -232,17 +237,17 @@ assets/FireInspection/
 
 ```bash
 ./app/python.sh -m pip install -e ".[dev]"            # 注册新后端
-./app/python.sh scripts/prepare_fire_inspection_assets.py
+./app/python.sh scripts/fire_inspection/prepare_fire_inspection_assets.py
 ./scripts/rsr list-backends                           # 应看到 fire_inspection、fire_patrol、x30_kinematic、fire_warehouse
 ./app/python.sh -m pytest -q tests/test_fire_inspection.py   # 无 Kit 单元测试：解析、腿部运动学、trot、A*、巡检与报警状态机
 
 # 1. 调试（约 13 min，64 spp）
-./scripts/rsr collect run -c configs/fire_inspection_x30_physx_warehouse_debug.toml
-./app/python.sh scripts/validate_fire_inspection.py outputs/xunjian-debug
+./scripts/rsr collect run -c configs/fire_inspection/x30_physx_warehouse_debug.toml
+./app/python.sh scripts/fire_inspection/validate_fire_inspection.py outputs/debug/fire_inspection
 
-# 2. 正式采集（约 20 min，256 spp；outputs/xunjian 中已有 lerobot_v3 时拒绝覆盖）
-./scripts/rsr collect run -c configs/fire_inspection_x30_physx_warehouse.toml
-./app/python.sh scripts/validate_fire_inspection.py outputs/xunjian
+# 2. 正式采集（约 20 min，256 spp；outputs/fire_inspection 中已有 lerobot_v3 时拒绝覆盖）
+./scripts/rsr collect run -c configs/fire_inspection/x30_physx_warehouse.toml
+./app/python.sh scripts/fire_inspection/validate_fire_inspection.py outputs/fire_inspection
 ```
 
 终端提示 `请输入巡检指令 [巡检仓库]:` 时可以直接回车。
@@ -273,12 +278,12 @@ assets/FireInspection/
 5. 把时间轴（Flow 的时钟）设为新的物理时间。
 
 多相机采集只刷新渲染，不推进物理和 Flow。Job 会核对采集前后的物理步数和 Flow 时间，二者必须不变。
-因此同一帧的三路图像、状态和火焰形态都对应同一个仿真时刻；`fire_time_s` 与 `simulation_time_s` 相等（65.6083 s）。
+因此同一帧的三路图像、状态和火焰形态都对应同一个仿真时刻；`fire_time_s` 与 `simulation_time_s` 相等（本次结束时均为 71.625 s，含 4 s 火焰预热）。
 
 ## 9. 输出
 
 ```text
-outputs/xunjian[-debug]/
+outputs/fire_inspection/（调试为 outputs/debug/fire_inspection/）
 ├── lerobot_v3/                 # 全部验收通过后原子发布
 │   ├── meta/info.json, stats.json, tasks.parquet, episodes/..., task_outcome.json
 │   ├── data/chunk-000/file-000.parquet
@@ -320,14 +325,14 @@ Job 中以下 12 项全部通过，数据才标记为 `demonstration` 并发布�
 | `approach_clear` | 接近路径净空 ≥ 0.6 m | 最小 0.67 m |
 | `reached_photo_phase` | 到达观察点、对准火点并完成拍照 | — |
 | `photo_taken` | 照片文件已写出 | — |
-| `photo_shows_fire` | 火点窗口内火焰色像素 ≥ 1% 且 ≥ 50 个 | 5.6%，1436 个 |
+| `photo_shows_fire` | 火点窗口内火焰色像素 ≥ 1% 且 ≥ 50 个 | 5.68%，1454 个 |
 | `base_follows_command` | PhysX 机身位姿与指令积分的单步偏差 < 1 mm | 最大 0.53 mm |
 | `legs_track_gait` | 腿关节与 trot 目标的最大偏差 < 0.35 rad（不卡腿） | 最大 0.19 rad（踩线缆槽） |
 
 另有两道前置检查：航点之间 A* 规划失败时，在 `arrange_scene` 阶段直接报错并输出地图；
 火焰预热后用 `fire_overview` 检查火焰像素，Flow 没有生效时直接失败。
 
-[validate_fire_inspection.py](../scripts/validate_fire_inspection.py) 不启动 Kit，独立复核 37 项：
+[validate_fire_inspection.py](../scripts/fire_inspection/validate_fire_inspection.py) 不启动 Kit，独立复核 37 项：
 v3 元数据与帧数、时间戳等间隔、数值有限、单 episode、`task` 等于指令原句、只有一帧拍照触发、
 机身速度不超过上限、按录制指令积分能复现录制的位移（误差 2 mm）和航向（0.004 rad）、
 拍照帧机器人静止且对准火点（0.024 rad）、各路视频能完整解码且分辨率正确、地图文件存在，

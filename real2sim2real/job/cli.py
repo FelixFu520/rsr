@@ -108,7 +108,7 @@ def render_sorting(
             resolve_path=True,
             help="高清路径追踪参数 JSON",
         ),
-    ] = Path("configs/sorting_stream_showcase_render.json"),
+    ] = Path("configs/sorting/render_profile.json"),
     fps: Annotated[int, typer.Option("--fps", min=1, help="四路共享的采样率")] = 15,
     config: Path | None = _CONFIG_OPTION,
 ) -> None:
@@ -117,12 +117,12 @@ def render_sorting(
     import subprocess
     import sys
 
-    script = Path(__file__).resolve().parents[2] / "scripts" / "render_sorting_package.py"
+    script = Path(__file__).resolve().parents[2] / "scripts/sorting/render_sorting_package.py"
     if not script.is_file():
-        raise typer.BadParameter("此命令需要在包含 scripts/render_sorting_package.py 的项目中运行")
+        raise typer.BadParameter(f"此命令需要在项目源码树中运行，缺少 {script}")
     if (output / "lerobot_v3").exists():
         raise typer.BadParameter("正式数据已存在，请选择新的 --output")
-    from scripts.render_sorting_package import ReplayRenderProfile
+    from scripts.sorting.render_sorting_package import ReplayRenderProfile
 
     try:
         ReplayRenderProfile.model_validate_json(render_profile.read_text())
@@ -131,7 +131,7 @@ def render_sorting(
     if source is None:
         from real2sim2real.job.job_sorting import SortingJobConfig
 
-        config = config or Path("configs/PhysicSolver_mujoco_vbd_sorting_stream_showcase.toml")
+        config = config or Path("configs/sorting/mujoco_vbd_sorting.toml")
         _apply_config_file(config)
         job_config = SortingJobConfig.from_settings("job")
         source = output / "physics"

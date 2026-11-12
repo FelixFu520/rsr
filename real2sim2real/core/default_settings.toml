@@ -16,14 +16,14 @@ backend = "stub"  # 不启动 Kit
 backend = "stub"
 # pickplace_cloth / pickplace_rigid 支持 [[scene.cameras]] 固定相机列表。
 # 每项含 name、prim_path、pose_relative_to、pose、resolution 和可选镜头参数。
-# 示例见 configs/PhysicSolver_featherstone_vbd_pickplace_cloth.toml。
+# 示例见 configs/physic_solver/featherstone_vbd_pickplace_cloth.toml。
 # newton_cloth_franka 使用 newton_official/unisex_shirt.usd 和未经压扁的官方布局。
 # cloth_base_color=[0.16,0.20,0.65]、cloth_roughness=0.92、cloth_specular=0.02。
 # pickplace 系列场景：fill_light_intensity=650、key_light_intensity=2200。
 
 # pickplace_package：cloth_usd_path="assets/PhysicSolver/Package/v7/parcel_two_mesh.usd"。
 # target_xy=[0.10,0]、robot_base_xy=[-0.42,0]；保持两个网格及原始 UV/材质。
-# sorting_package：station_usd_path 指向旧分拣工位，cloth_usd_path 使用 v7_sorting 独立快照。
+# sorting_package：station_usd_path 指向旧分拣工位，cloth_usd_path 默认 v7_sorting 快照（正式配置用 v10_station）。
 # infeed_path/platform_path/outfeed_path 读取各自 USD 支撑面；support_depth_m=0.04。
 # garment_mass_kg=0.2；bag_mass_kg 默认不覆盖袋膜质量。可显式设置两者并保持各自质量分布。
 # initial_clearance_m=0.002、outfeed_target_xy=[-0.55,-0.876]。
@@ -56,7 +56,7 @@ backend = "stub"
 
 [planner]
 backend = "stub"
-# newton_cloth_franka：keyframe_limit=7（首轮抓放）；完整官方序列见 OFFICIAL_KEYFRAMES。
+# newton_cloth_franka：keyframe_limit=7（首轮抓放）；完整官方序列见 planner_physic_solver.OFFICIAL_KEYFRAMES。
 # final_settle_s=2；shape_contact_stiffness=50000、shape_contact_damping=50、shape_contact_friction=1.5。
 # newton_cloth_franka 的 table_friction=1.5（官方默认），可独立于夹指摩擦设置。
 # 官方手指默认 open_finger_m=0.032、closed_finger_m=0.004，单位为单侧米。
@@ -131,5 +131,5 @@ backend = "stub"  # StubJob 只串工厂,不采集
 # pickplace_cloth 的 timeout_s=1800：包含采集与渲染的墙钟时限；运行中约每 30 秒记录进度。
 # sorting_package：timeout_s=14400，output_dir 使用独立的分拣目录，LeRobot v3 记录 16 维关节角。
 # fire_inspection：command 为空时终端输入，否则用 default_command="巡检仓库"；关键词解析，不调用 LLM。
-# output_dir="outputs/xunjian"、overwrite_dataset=false、fire_warmup_s=4、fire_check_camera、fire_check_min_pixels=20。
+# output_dir="outputs/fire_inspection"、overwrite_dataset=false、fire_warmup_s=4、fire_check_camera、fire_check_min_pixels=20。
 # photo.resolution=[1280,960]、photo.min_window_fraction=0.01；recorder.fps=15。

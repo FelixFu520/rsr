@@ -31,13 +31,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from real2sim2real.core.config import BaseConfig
 from real2sim2real.job.base import BaseJob
 from real2sim2real.utils.cameras import CameraConfig, validate_camera_list
-from real2sim2real.utils.lerobot_v3 import LeRobotV3Recorder, capture_viewport_frame
-from real2sim2real.utils.patrol_geometry import (
+from real2sim2real.utils.fire_inspection_utils import (
     fire_pixel_score,
     project_point,
     save_patrol_map,
     scan_physx_occupancy,
 )
+from real2sim2real.utils.lerobot_v3 import LeRobotV3Recorder, capture_viewport_frame
 
 _MISSION_WORDS = (
     "巡检", "巡逻", "巡查", "巡航", "巡视", "检查", "查看", "排查", "搜索", "寻找", "找",
@@ -96,7 +96,7 @@ class FireInspectionJobConfig(BaseConfig):
     command: str = ""
     default_command: str = "巡检仓库"
     prompt_command: bool = True
-    output_dir: str = "outputs/xunjian"
+    output_dir: str = "outputs/fire_inspection"
     overwrite_dataset: bool = Field(
         default=False, description="Delete an existing lerobot_v3 first (debug output only)"
     )

@@ -9,7 +9,7 @@ class SortingJobConfig(PhysicSolverJobConfig):
     """One continuous relay episode; physical failures remain diagnostic data."""
 
     backend: str = "sorting_package"
-    output_dir: str = "outputs/PhysicSolver/mujoco_vbd_sorting_package"
+    output_dir: str = "outputs/sorting"
     timeout_s: float = Field(default=14400, gt=0)
 
 

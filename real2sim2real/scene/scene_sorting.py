@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 from pydantic import Field, FiniteFloat, field_validator
 
-from real2sim2real.scene.scene_package import PackageScene, PackageSceneConfig
+from real2sim2real.scene.scene_physic_solver import PackageScene, PackageSceneConfig
 from real2sim2real.utils.asset_utils import prim_aabb
 from real2sim2real.utils.cameras import create_cameras
 

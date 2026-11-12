@@ -1,0 +1,238 @@
+# 分拣包裹：Pro-M6 双臂把软包（衣物袋）和纸箱依次从入料带经中间平台送到出料带。
+# 同一物理世界连续求解：MuJoCo（CPU）求解机器人与纸箱，VBD（CUDA）求解袋膜、衣物与刚软接触。
+# 不固定粒子、不加抓取吸附、不瞬移或重置包裹。说明见 docs/sorting.md。
+#
+# 完整流程（物理 → 四路 1K 渲染 → LeRobot v3 → 独立验收）：
+#   ./scripts/sorting/run_sorting_showcase.sh outputs/sorting
+# 仅物理（调试，结果放 outputs/debug）：
+#   ./app/python.sh scripts/sorting/check_sorting_package.py \
+#       --config configs/sorting/mujoco_vbd_sorting.toml --max-steps 16000 \
+#       --output outputs/debug/sorting/physics
+
+[sim_world]
+backend = "isaacsim"
+physics_engine = "newton"
+newton_execution = "direct"  # Newton 模型负责全部动力学，Kit 时间轴只用于显示。
+newton_solver = "mujoco"
+newton_substeps = 32  # 每个 60 Hz 帧 32 个 VBD 子步。
+newton_iterations = 28  # 每个 VBD 子步 28 次迭代。
+newton_use_cuda_graph = true
+physics_dt = 0.016666666666666666
+rendering_dt = 0.06666666666666667
+gravity = [0.0, 0.0, -9.81]
+device = "cuda:0"
+headless = true
+# 正式渲染参数；回放渲染另由 configs/sorting/render_profile.json 覆盖显示设置，不改物理。
+renderer = "PathTracing"
+width = 1024
+height = 768
+samples_per_pixel_per_frame = 32
+rt_subframes = 2
+pathtracing_max_bounces = 4
+pathtracing_denoiser = true
+pathtracing_temporal_denoising = false
+pathtracing_cached = false
+pathtracing_many_light_sampling = false
+synchronous_capture = true
+dlss = false
+auto_exposure = false
+warmup_frames = 2
+fast_shutdown = true
+background_usd_path = "assets/Background/Factory/factory_002/Factory_Interior.usd"
+background_prim_path = "/World/background"
+background_gravity = false
+background_skip_metrics_assembler = true
+background_light_scale = 0.25
+
+[scene]
+backend = "sorting_package"
+object_kind = "cloth"
+station_usd_path = "assets/Scene/sorting_station/composed/scene_parcel_5cm_loose_edges.usdc"
+# V10 软包：衣物 + 袋膜两网格，保留 UV、材质和内部被动弹簧。
+cloth_usd_path = "assets/PhysicSolver/Package/v10_station/parcel_two_mesh.usd"
+garment_mass_kg = 0.025  # 按原逐点质量比例缩放，几何不变。
+bag_mass_kg = 0.0025677532
+prim_path = "/World/scene"
+infeed_path = "ConveyorBelt_A06_01/Belt"
+platform_path = "platform/Empty/Plane/Plane_002"
+outfeed_path = "ConveyorBelt_A06/Belt"
+target_xy = [0.55, -0.9]  # 入料抓取点。
+platform_target_xy = [0.0, -0.96]  # 平台落点前移，给软包后缘与固定机器人基座留出余量。
+outfeed_target_xy = [-0.55, -0.84]
+initial_clearance_m = 0.002
+support_depth_m = 0.04
+label_uv_bounds = [0.2, 0.44, 0.66, 0.65]
+fill_light_intensity = 650.0
+key_light_intensity = 2200.0
+clear_legacy_parcels = true  # 清除工位自带的旧包裹。
+infeed_travel_m = 0.75  # 从抓取点上游 0.75 m 入料。
+floor_z_m = 0.0  # 离带后的真实落地碰撞面。
+# 软包流程结束后生成的 V10 纸箱（缩放 0.5，约 63×101×71 mm）。
+rigid_usd_path = "assets/PhysicSolver/Package/v10_box02/source.usd"
+rigid_scale = 0.5
+rigid_mass_kg = 0.03125
+belt_markers = true  # 用循环移动的细缝显示带面实际位移。
+
+[[scene.cameras]]
+name = "overview"
+prim_path = "/World/Cameras/overview"
+pose_relative_to = "/World"
+pose = { position = [3.2, -4.6, 4.4], orientation_wxyz = [0.820381835618835, 0.4335524724233305, 0.1742040276597923, 0.3296344250672163] }
+resolution = [1024, 768]
+clipping_range = [0.1, 80.0]
+focal_length = 18.0
+horizontal_aperture = 20.955
+
+[robot]
+backend = "pro_m6_newton"
+usd_path = "assets/Robot/pro_m6_696/pro_m6_696.usda"
+prim_path = "/World/robots/ProM6"
+control_mode = "position"
+arm_stiffness = 6000.0
+arm_damping = 300.0
+finger_stiffness = 40.0
+finger_damping = 1.0
+finger_friction = 1.4
+initial_gripper_rad = 0.28  # 仿真开始前的夹爪姿态；从动关节按原 mimic 比例初始化。
+pad_width_m = 0.027  # 碰撞胶垫与可视胶垫一致（27×7.5×65 mm），不允许加宽。
+
+[[robot.cameras]]
+name = "head"
+prim_path = "/World/robots/ProM6/Geometry/base_link/tn__Headdepth_Link_oE/Camera_Head/sorting_head_camera"
+pose_relative_to = "/World/robots/ProM6/Geometry/base_link/tn__Headdepth_Link_oE/Camera_Head"
+pose = { position = [0.0, 0.0, 0.0], orientation_wxyz = [1.0, 0.0, 0.0, 0.0] }
+resolution = [1024, 768]
+clipping_range = [0.01, 80.0]
+focal_length = 10.0
+horizontal_aperture = 20.955
+
+[[robot.cameras]]
+name = "left_wrist"
+prim_path = "/World/robots/ProM6/robotiq_left/sorting_wrist_camera"
+pose_relative_to = "/World/robots/ProM6/robotiq_left"
+pose = { position = [0.22, 0.0, 0.1], orientation_wxyz = [-0.29427033899711486, 0.6429657592644596, -0.6429657592644596, 0.29427033899711486] }
+resolution = [1024, 768]
+clipping_range = [0.005, 20.0]
+focal_length = 8.0
+horizontal_aperture = 20.955
+
+[[robot.cameras]]
+name = "right_wrist"
+prim_path = "/World/robots/ProM6/robotiq_right/sorting_wrist_camera"
+pose_relative_to = "/World/robots/ProM6/robotiq_right"
+pose = { position = [0.22, 0.0, 0.1], orientation_wxyz = [-0.29427033899711486, 0.6429657592644596, -0.6429657592644596, 0.29427033899711486] }
+resolution = [1024, 768]
+clipping_range = [0.005, 20.0]
+focal_length = 8.0
+horizontal_aperture = 20.955
+
+[planner]
+backend = "sorting_stream"  # 先软包、后纸箱的连续编排。
+# --- 求解器 ---
+mujoco_cpu = true  # 原生 MuJoCo CPU 双精度；VBD 仍在 CUDA 上运行。
+mujoco_iterations = 100
+mujoco_control_per_frame = true  # 只合并恒定控制输入的同步，保留每个 MuJoCo/VBD 子步。
+mujoco_substeps_per_vbd_step = 4  # 32 × 4 = 每帧 128 个刚体子步（7680 Hz）。
+mimic_time_constant_s = 0.00027  # Robotiq 原生 mimic 等式约束。
+mimic_impedance = 0.9998
+physics_origin_m = [0.0, -0.9, 1.8]  # 局部求解原点；控制、USD 与缓存仍用世界坐标。
+cloth_solver = "vbd"
+# --- 接触与材料（有效摩擦 = sqrt(粒子 × shape)）---
+full_surface_contacts = true
+contact_sdf_resolution = 128
+contact_stiffness = 40000.0
+contact_damping = 30.0
+shape_contact_stiffness = 40000.0
+shape_contact_damping = 30.0
+shape_contact_friction = 1.4
+cloth_friction = 1.4
+gripper_package_friction = 2.0  # 内指—包裹有效摩擦 2.0（内指材料约 2.857）。
+table_friction = 0.5  # 输送带，有效摩擦约 0.837。
+platform_friction = 0.1  # 中间平台，有效摩擦约 0.374。
+self_contact_buffer = 512
+self_contact_gap_m = 0.0016
+friction_epsilon_m_s = 0.001
+floor_contact_stiffness = 400000.0
+floor_contact_margin_m = 0.004  # 约 6 m/s 落地冲击的单子步行程超过 3 mm，提前建立地面接触。
+# --- 夹爪与抓取 ---
+tcp_orientation_wxyz = [0.0, 0.7071067811865476, 0.7071067811865476, 0.0]  # 世界 X 闭合。
+lower_drop_tcp_orientation_wxyz = [0.1830127018922193, 0.6830127018922193, 0.6830127018922193, -0.1830127018922193]
+open_gripper_rad = 0.28
+closed_gripper_rad = 0.64
+hold_gripper_rad = 0.675
+grasp_height_m = 0.055
+grasp_pad_bottom_m = 0.015  # 按原生 FK 定位指垫底边。
+infeed_grasp_pad_bottom_m = 0.02  # 左臂入料抓取深度。
+grasp_offset_xy_m = [0.0, 0.0]
+regrasp_offset_xy_m = [0.0, 0.0]
+regrasp_surface_indent_m = 0.025  # 右臂按实时衣物表面 q90 高度下压。
+regrasp_surface_indent_fraction = 0.3
+rigid_closed_gripper_rad = 0.4
+rigid_hold_gripper_rad = 0.42
+rigid_pad_bottom_m = 0.015
+# --- 减夹反馈：瞬时边长比超过目标时小幅松爪 ---
+strain_limited_grip = true
+grip_strain_target = 1.22
+grip_maximum_relief_rad = 0.035
+grip_relief_rate_rad_s = 0.1
+grip_recovery_rate_rad_s = 0.001
+grip_strain_hysteresis = 0.03
+# --- 动作时序与高度（TCP 高度，不是指垫或包裹高度）---
+approach_s = 3.0
+descend_s = 1.5
+close_s = 2.5
+lift_s = 4.0
+hold_s = 1.0
+transfer_s = 3.0
+transfer_profile = "quintic"  # 起止速度、加速度均为零的五次曲线。
+lower_s = 2.5
+release_s = 4.0
+retract_s = 1.0
+return_s = 2.5
+rest_s = 1.5
+lift_height_m = 0.28  # 避开右腕高位转运的关节限位。
+place_height_m = 0.13
+outfeed_place_height_m = 0.2
+release_lowering_m = 0.0
+# --- 输送与连续编排 ---
+infeed_speed_mps = 0.12
+infeed_settle_s = 2.0
+belt_speed_mps = 0.18
+belt_transport_s = 6.0
+continuous_outfeed = true  # 出料带从初帧持续运行。
+sleep_soft_when_settled = true  # 已落地静止且远离纸箱的软包休眠，接近时唤醒。
+rigid_contact_time_constant_s = 0.0005
+rigid_mujoco_iterations = 100
+rigid_mujoco_solver = "pgs"
+rigid_disable_warmstart = false
+separate_ground_drop_lanes = true  # 按已落地软包选择纸箱出料侧位，避免压坏软包。
+ground_lane_margin_m = 0.012
+# --- 验收门限 ---
+minimum_lift_m = 0.08
+minimum_release_drop_m = 0.0  # 受支撑的平稳放手；仍记录实际下落量。
+minimum_belt_displacement_m = 0.3
+maximum_table_penetration_m = 0.0015
+maximum_place_error_m = 0.08
+maximum_edge_stretch = 1.3
+minimum_triangle_area_ratio = 0.03
+maximum_shape_rms_m = 0.045  # 经用户授权由 37.4 mm 提高；袋衣间隙和穿透门限不变。
+maximum_bag_gap_m = 0.01
+require_bag_gap_quality = true  # 正式数据必须通过 10 mm 袋衣间隙门限。
+early_stop_on_shape_failure = true
+maximum_tcp_error_m = 0.03
+label_up_min_cos = 0.9
+
+[job]
+backend = "sorting_package"
+output_dir = "outputs/sorting"
+max_steps = 16000
+timeout_s = 86400.0
+inspect_gui = false
+
+[job.recorder]
+format = "lerobot_v3"
+fps = 15
+width = 1024
+height = 768
+save_failed_episodes = false
+task = "Relay a soft garment parcel followed by a rigid carton from the remote infeed belt through the platform with both native Pro-M6 arms, dropping each onto the continuously running outfeed belt."

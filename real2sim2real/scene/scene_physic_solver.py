@@ -1,12 +1,17 @@
-"""PhysicSolver 案例的共用桌面布局、衣服场景和刚体场景。
+"""物理求解器验证任务的场景：共用桌面、衣服、刚体方块、官方 Newton 衬衫与 V7 包裹。
 
-pickplace_cloth 后端使用 PickPlaceClothScene，发布交给 Newton 模拟的自由衣服网格；
-pickplace_rigid 后端使用 PickPlaceRigidScene，在相同桌面上添加 PhysX 刚体方块。
-两者复用桌子、灯光和摆放逻辑；世界初始化与物理步进仍由 IsaacsimWorld 管理。
+- ``pickplace_cloth``：``PickPlaceClothScene`` 发布交给 Newton 模拟的自由衣服网格。
+- ``pickplace_rigid``：``PickPlaceRigidScene`` 在相同桌面上添加 PhysX 刚体方块。
+- ``newton_cloth_franka``：``OfficialClothScene`` 把官方 cloth_franka 布局整体平移到项目桌面。
+- ``pickplace_package``：``PackageScene`` 加载 V7 袋膜 + 衣物双网格，保留质量、UV 与材质；
+  分拣任务的 ``SortingScene`` 继承它。
+
+世界初始化与物理步进由 ``IsaacsimWorld`` 管理。
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Literal
 
@@ -19,6 +24,14 @@ from real2sim2real.scene.base import BaseScene
 from real2sim2real.simworld.base import BaseSimWorld
 from real2sim2real.utils.asset_utils import prim_aabb, read_prim_world_pose, resolve_usd_path
 from real2sim2real.utils.cameras import CameraConfig, create_cameras, validate_camera_list
+
+# ================================================================================================
+# PhysicSolver 案例的共用桌面布局、衣服场景和刚体场景。
+#
+# pickplace_cloth 后端使用 PickPlaceClothScene，发布交给 Newton 模拟的自由衣服网格；
+# pickplace_rigid 后端使用 PickPlaceRigidScene，在相同桌面上添加 PhysX 刚体方块。
+# 两者复用桌子、灯光和摆放逻辑；世界初始化与物理步进仍由 IsaacsimWorld 管理。
+# ================================================================================================
 
 
 class PickPlaceClothSceneConfig(BaseConfig):
@@ -284,7 +297,7 @@ class PickPlaceClothScene(BaseScene):
         if not Path(resolved).is_file():
             raise FileNotFoundError(
                 f"Missing cloth asset: {resolved}. "
-                "Run scripts/prepare_physic_solver_assets.py with Isaac Sim python.sh first."
+                "Run ./app/python.sh scripts/physic_solver/prepare_physic_solver_assets.py first."
             )
         return resolved
 
@@ -355,3 +368,232 @@ class PickPlaceRigidScene(PickPlaceClothScene):
         self.target_rigid_prim = SingleRigidPrim(
             prim_path=self.target_prim_path, name="pickplace_cube", reset_xform_properties=False
         )
+
+
+# ================================================================================================
+# Official Newton shirt layout, translated onto the project's table without flattening.
+# ================================================================================================
+
+
+class OfficialClothSceneConfig(PickPlaceClothSceneConfig):
+    """Use the independently copied Newton asset and the official 80 cm workspace."""
+
+    backend: str = "newton_cloth_franka"
+    cloth_usd_path: str = "assets/PhysicSolver/Cloth/newton_official/unisex_shirt.usd"
+    table_scale: list[float] = [4 / 3, 0.8, 1.0]
+    robot_base_xy: list[float] = [-0.5, 0.0]
+    cloth_thickness_scale: float = 1.0
+    cloth_base_color: tuple[float, float, float] = Field(default=(0.16, 0.20, 0.65))
+    cloth_roughness: float = Field(default=0.92, ge=0, le=1)
+    cloth_specular: float = Field(default=0.02, ge=0, le=1)
+
+    @field_validator("cloth_base_color")
+    @classmethod
+    def _color_range(cls, value: tuple[float, float, float]) -> tuple[float, float, float]:
+        if any(not 0 <= component <= 1 for component in value):
+            raise ValueError("cloth_base_color components must be between 0 and 1")
+        return value
+
+
+class OfficialClothScene(PickPlaceClothScene):
+    """Preserve official rest geometry, rotation, and placement relative to the tabletop."""
+
+    config_cls = OfficialClothSceneConfig
+
+    @property
+    def official_frame_translation(self) -> np.ndarray:
+        """Translate official world metres (table centre 0,-0.5,0.2) to this table."""
+        return np.array([*self.config.table_xy, self.table_top_z]) - [0.0, -0.5, 0.2]
+
+    @property
+    def robot_base_position(self) -> np.ndarray:
+        """Match the official robot/table height difference and horizontal placement."""
+        return np.array([-0.5, -0.5, 0.0]) + self.official_frame_translation
+
+    def _initial_cloth_points(self, source: Any, mesh_prim: Any) -> np.ndarray:
+        from pxr import Gf, UsdGeom
+
+        points = np.asarray(UsdGeom.Mesh(mesh_prim).GetPointsAttr().Get(), dtype=float)
+        transform = UsdGeom.XformCache().GetLocalToWorldTransform(mesh_prim)
+        points = np.asarray([transform.Transform(Gf.Vec3d(*point)) for point in points])
+        points *= UsdGeom.GetStageMetersPerUnit(source)
+        # Official cloth_franka: rotate pi about Z; translate (0,70,30) centimetres.
+        points[:, :2] *= -1
+        points += np.array([0.0, 0.7, 0.3]) + self.official_frame_translation
+        return points
+
+    def arrange(self) -> None:
+        """Place the authored shirt and add a visible support below the robot base."""
+        from pxr import Gf, UsdGeom
+
+        super().arrange()
+        self._bind_cloth_material()
+        height = float(self.robot_base_position[2])
+        if height > 0:
+            pedestal = UsdGeom.Cube.Define(
+                self.sim_world.stage, f"{self.config.prim_path}/robot_pedestal"
+            )
+            pedestal.CreateSizeAttr(1.0)
+            pedestal.AddTranslateOp().Set(Gf.Vec3d(*self.robot_base_position[:2], height / 2))
+            pedestal.AddScaleOp().Set(Gf.Vec3f(0.18, 0.18, height))
+            pedestal.CreateDisplayColorAttr([Gf.Vec3f(0.35, 0.35, 0.35)])
+
+    def _bind_cloth_material(self) -> None:
+        """Bind a matte dielectric; displayColor alone uses renderer fallback shading."""
+        from pxr import Gf, Sdf, UsdShade
+
+        stage = self.sim_world.stage
+        path = f"{self.config.prim_path}/cloth_material"
+        material = UsdShade.Material.Define(stage, path)
+        shader = UsdShade.Shader.Define(stage, f"{path}/Shader")
+        shader.CreateIdAttr("UsdPreviewSurface")
+        color = Gf.Vec3f(*self.config.cloth_base_color)
+        specular = Gf.Vec3f(self.config.cloth_specular)
+        for name, kind, value in (
+            ("diffuseColor", Sdf.ValueTypeNames.Color3f, color),
+            ("roughness", Sdf.ValueTypeNames.Float, self.config.cloth_roughness),
+            ("metallic", Sdf.ValueTypeNames.Float, 0.0),
+            ("clearcoat", Sdf.ValueTypeNames.Float, 0.0),
+            ("useSpecularWorkflow", Sdf.ValueTypeNames.Int, 1),
+            ("specularColor", Sdf.ValueTypeNames.Color3f, specular),
+        ):
+            shader.CreateInput(name, kind).Set(value)
+        shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
+        material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+        UsdShade.MaterialBindingAPI.Apply(self.cloth_mesh.GetPrim()).Bind(material)
+        self.cloth_mesh.CreateDisplayColorAttr([color])
+
+    def publish_cloth_vertices(self, world_vertices: np.ndarray) -> None:
+        """Update physical vertices and smooth shading normals on the same surface."""
+        from pxr import UsdGeom, Vt
+
+        super().publish_cloth_vertices(world_vertices)
+        triangles = self.triangle_indices.reshape(-1, 3)
+        points = np.asarray(world_vertices)
+        face_normals = np.cross(
+            points[triangles[:, 1]] - points[triangles[:, 0]],
+            points[triangles[:, 2]] - points[triangles[:, 0]],
+        )
+        normals = np.zeros_like(points)
+        for corner in range(3):
+            np.add.at(normals, triangles[:, corner], face_normals)
+        normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
+        self.cloth_mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
+        self.cloth_mesh.CreateNormalsAttr(Vt.Vec3fArray.FromNumpy(normals.astype(np.float32)))
+
+
+# ================================================================================================
+# V7 two-surface parcel, preserving authored masses, UVs and material bindings.
+# ================================================================================================
+
+
+class PackageSceneConfig(PickPlaceClothSceneConfig):
+    """Load the independent V7 copy without flattening either physical mesh."""
+
+    backend: str = "pickplace_package"
+    cloth_usd_path: str = "assets/PhysicSolver/Package/v7/parcel_two_mesh.usd"
+    target_xy: list[float] = [0.10, 0.0]
+    robot_base_xy: list[float] = [-0.42, 0.0]
+
+
+class PackageScene(PickPlaceClothScene):
+    """Publish both freely simulated surfaces using the original asset's materials."""
+
+    config_cls = PackageSceneConfig
+
+    def _arrange_cloth(self) -> None:
+        from pxr import Gf, Usd, UsdGeom
+
+        path = self._asset(self.config.cloth_usd_path)
+        source = Usd.Stage.Open(path)
+        if UsdGeom.GetStageMetersPerUnit(source) != 1 or UsdGeom.GetStageUpAxis(source) != "Z":
+            raise ValueError("Package asset must use metres and Z up")
+        root = source.GetPrimAtPath("/World/Parcel")
+        reference = root.GetAttribute("parcel:qualityReference")
+        self.quality_reference = (
+            json.loads(reference.Get())
+            if reference and reference.HasAuthoredValueOpinion()
+            else None
+        )
+        self.package_parameters = json.loads(root.GetAttribute("parcel:runtimeParameters").Get())
+        self.loft_springs = np.asarray(root.GetAttribute("parcel:loftSpringIndices").Get(), int)
+        weights = root.GetAttribute("parcel:loftSpringStiffnessWeights")
+        self.loft_weights = (
+            np.asarray(weights.Get(), float)
+            if weights and weights.HasAuthoredValueOpinion()
+            else np.ones(len(self.loft_springs))
+        )
+        self.package_offset = np.array([*self.config.target_xy, self.table_top_z])
+        target = UsdGeom.Xform.Define(self.sim_world.stage, self.target_prim_path)
+        # Looks is a sibling of Parcel. Reference their common ancestor so USD
+        # remaps material bindings and GeomSubsets into the same composition arc.
+        asset_path = f"{self.target_prim_path}/asset"
+        asset = UsdGeom.Xform.Define(self.sim_world.stage, asset_path)
+        asset.GetPrim().GetReferences().AddReference(path, "/World")
+        # The copied asset's standalone PhysicsScene is inactive in the host world.
+        self.sim_world.stage.GetPrimAtPath(f"{asset_path}/PhysicsScene").SetActive(False)
+        target.ClearXformOpOrder()
+        target.AddTranslateOp().Set(Gf.Vec3d(*self.package_offset))
+        self.package_parts: list[dict[str, Any]] = []
+        points, triangles, offset = [], [], 0
+        for name in ("Garment", "Bag"):
+            relative = f"{name}Body/{name}"
+            original = UsdGeom.Mesh(source.GetPrimAtPath(f"/World/Parcel/{relative}"))
+            vertices = np.asarray(original.GetPointsAttr().Get(), dtype=float)
+            counts = np.asarray(original.GetFaceVertexCountsAttr().Get())
+            indices = np.asarray(original.GetFaceVertexIndicesAttr().Get(), dtype=np.int32)
+            masses = np.asarray(original.GetPrim().GetAttribute("physics:masses").Get(), float)
+            if not np.all(counts == 3) or len(masses) != len(vertices) or np.any(masses <= 0):
+                raise ValueError(f"Invalid dynamic triangle surface: {name}")
+            mesh = UsdGeom.Mesh.Get(self.sim_world.stage, f"{asset_path}/Parcel/{relative}")
+            mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+            self.package_parts.append(
+                dict(
+                    name=name,
+                    mesh=mesh,
+                    start=offset,
+                    end=offset + len(vertices),
+                    triangles=indices.reshape(-1, 3),
+                    masses=masses,
+                )
+            )
+            points.append(vertices + self.package_offset)
+            triangles.append(indices + offset)
+            offset += len(vertices)
+        self.cloth_vertices = np.concatenate(points)
+        self.triangle_indices = np.concatenate(triangles)
+        self.garment_count = self.package_parts[0]["end"]
+        if np.any(self.loft_springs < 0) or np.any(self.loft_springs >= self.garment_count):
+            raise ValueError("Loft springs must connect garment vertices only")
+        if self.package_parameters.get("bag_prestretch", 0) != 0:
+            raise ValueError("This V7 importer requires an unprestretched bag")
+        self.cloth_grasp_vertex = int(np.argmax(self.cloth_vertices[:, 2]))
+        self.publish_cloth_vertices(self.cloth_vertices)
+
+    def publish_cloth_vertices(self, world_vertices: np.ndarray) -> None:
+        """Update actual local mesh points and normals, retaining UVs and subsets."""
+        from pxr import UsdGeom, Vt
+
+        points = np.asarray(world_vertices)
+        if points.shape != self.cloth_vertices.shape or not np.isfinite(points).all():
+            raise ValueError("Package positions must have the original finite (N, 3) shape")
+        self.cloth_vertices = points.copy()
+        for part in self.package_parts:
+            local = points[part["start"] : part["end"]] - self.package_offset
+            mesh, tri = part["mesh"], part["triangles"]
+            mesh.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(local.astype(np.float32)))
+            mesh.CreateExtentAttr(
+                Vt.Vec3fArray.FromNumpy(
+                    np.asarray([local.min(axis=0), local.max(axis=0)], dtype=np.float32)
+                )
+            )
+            normals = np.zeros_like(local)
+            face = np.cross(
+                local[tri[:, 1]] - local[tri[:, 0]], local[tri[:, 2]] - local[tri[:, 0]]
+            )
+            for corner in range(3):
+                np.add.at(normals, tri[:, corner], face)
+            normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
+            mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
+            mesh.CreateNormalsAttr(Vt.Vec3fArray.FromNumpy(normals.astype(np.float32)))
+        self.refresh_poses()

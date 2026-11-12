@@ -419,3 +419,116 @@ def capture_viewport_frame(
     finally:
         if controlled:
             settings.set_bool(history_control, previous_control)
+
+
+def validate_dataset(
+    output: Path,
+    *,
+    allow_failure: bool = False,
+    expected_cameras: dict[str, tuple[int, int]] | None = None,
+) -> dict[str, Any]:
+    """Check physical outcome, data/video time ranges, finite joints and video decodability."""
+    import pyarrow.parquet as pq
+
+    result = json.loads((output / "result.json").read_text())
+    root = output / "lerobot_v3"
+    info = json.loads((root / "meta/info.json").read_text())
+    episode = pq.read_table(root / "meta/episodes/chunk-000/file-000.parquet").to_pylist()[0]
+    if info["codebase_version"] != "v3.0" or not result["completed"]:
+        raise ValueError("Incomplete task or unsupported dataset version")
+    if not result["success"] and not allow_failure:
+        raise ValueError("Physical acceptance failed; dataset cannot be treated as a demonstration")
+    if result["success"] != all(result["checks"].values()):
+        raise ValueError("Physical outcome disagrees with measured checks")
+    if episode.get("success", result["success"]) != result["success"]:
+        raise ValueError("Episode metadata mislabels the physical outcome")
+    if not result["success"] and episode.get("dataset_use") != "diagnostic":
+        raise ValueError("Failed trajectory is not marked as diagnostic")
+    frames = info["total_frames"]
+    data = pq.read_table(root / info["data_path"].format(chunk_index=0, file_index=0))
+    if len(data) != frames or episode["length"] != frames or episode["dataset_to_index"] != frames:
+        raise ValueError("Episode frame ranges do not match the data")
+    np.testing.assert_array_equal(data["frame_index"].to_numpy(), np.arange(frames))
+    np.testing.assert_allclose(
+        data["timestamp"].to_numpy(), np.arange(frames) / info["fps"], atol=2e-6
+    )
+    for feature in ("observation.state", "action"):
+        values = np.array(data[feature].to_pylist())
+        metadata = info["features"][feature]
+        size = metadata["shape"][0]
+        if (
+            values.shape != (frames, size)
+            or len(metadata["names"]) != size
+            or not np.isfinite(values).all()
+        ):
+            raise ValueError(f"Invalid {feature}")
+        if feature == "observation.state":
+            arm_range = float(np.ptp(values[:, :7], axis=0).max())
+            if result["success"] and arm_range < 0.1:
+                raise ValueError("Successful grasp has stale or non-moving joint observations")
+    video_features = {
+        key: value for key, value in info["features"].items() if value["dtype"] == "video"
+    }
+    if not video_features:
+        raise ValueError("No camera videos in dataset")
+    if expected_cameras:
+        for name, (width, height) in expected_cameras.items():
+            if video_features.get(f"observation.images.{name}", {}).get("shape") != [
+                height,
+                width,
+                3,
+            ]:
+                raise ValueError(f"Missing or incompatible camera: {name}; choose a new output_dir")
+    videos = {}
+    for video_key, feature in video_features.items():
+        video = root / info["video_path"].format(video_key=video_key, chunk_index=0, file_index=0)
+        stream = json.loads(
+            subprocess.check_output(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-count_frames",
+                    "-show_entries",
+                    "stream=codec_name,nb_read_frames,r_frame_rate,width,height",
+                    "-of",
+                    "json",
+                    str(video),
+                ]
+            )
+        )["streams"][0]
+        if int(stream["nb_read_frames"]) != frames:
+            raise ValueError("Video/data frame count mismatch")
+        numerator, denominator = map(int, stream["r_frame_rate"].split("/"))
+        if numerator / denominator != info["fps"]:
+            raise ValueError("Video/data FPS mismatch")
+        if (stream["width"], stream["height"]) != tuple(feature["shape"][1::-1]):
+            raise ValueError(f"Video/metadata dimensions mismatch: {video_key}")
+        if stream["codec_name"] != "h264":
+            raise ValueError(f"Expected H.264 video: {video_key}")
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-xerror", "-i", str(video), "-f", "null", "-"],
+            check=True,
+            capture_output=True,
+        )
+        if episode[f"videos/{video_key}/from_timestamp"] != 0.0:
+            raise ValueError("Video must start at timestamp zero")
+        if abs(episode[f"videos/{video_key}/to_timestamp"] - frames / info["fps"]) > 1e-6:
+            raise ValueError("Video episode time range mismatch")
+        videos[video_key] = str(video)
+    report = {
+        "validated": True,
+        "grasp_success": result["success"],
+        "frames": frames,
+        "fps": info["fps"],
+        "dataset": str(root),
+        "video": videos.get("observation.images.overview", next(iter(videos.values()))),
+        "videos": videos,
+        "dataset_use": "demonstration" if result["success"] else "diagnostic",
+        "place_error_m": result.get("place_error_m"),
+        "minimum_hold_lift_m": result.get("minimum_hold_lift_m"),
+        "checks": result["checks"],
+        "maximum_arm_joint_range_rad": arm_range,
+    }
+    (output / "validation.json").write_text(json.dumps(report, indent=2) + "\n")
+    return report

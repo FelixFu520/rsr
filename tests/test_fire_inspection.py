@@ -9,8 +9,8 @@ import numpy as np
 import pytest
 
 from real2sim2real.job.job_fire_inspection import parse_inspection_command
-from real2sim2real.planner.planner_fire_patrol import FirePatrolPlanner, FirePatrolPlannerConfig
-from real2sim2real.robot.robot_x30 import (
+from real2sim2real.planner.planner_fire_inspection import FirePatrolPlanner, FirePatrolPlannerConfig
+from real2sim2real.robot.robot_fire_inspection import (
     LEGS,
     TrotGait,
     X30GaitConfig,
@@ -19,7 +19,7 @@ from real2sim2real.robot.robot_x30 import (
     leg_ik,
 )
 from real2sim2real.utils.cameras import CameraConfig
-from real2sim2real.utils.patrol_geometry import (
+from real2sim2real.utils.fire_inspection_utils import (
     OccupancyGrid,
     fire_pixel_score,
     polyline_length,

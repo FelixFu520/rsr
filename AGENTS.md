@@ -11,9 +11,13 @@
 
 | 路径 | 何时改 |
 |------|--------|
-| `real2sim2real/{simworld,scene,robot,planner,job}/` | ABC（`base.py`）、模块工厂、配置、本包 stub |
+| `real2sim2real/{simworld,scene,robot,planner,job}/` | ABC（`base.py`）、模块工厂、本包 stub、每个任务一个实现文件 |
 | `real2sim2real/core/` | 配置、Registry、CLI、日志、运行时、`default_settings.toml` |
-| `real2sim2real/utils/` | 辅助函数（isaacsim_utils、pose、recorder、validate） |
+| `real2sim2real/utils/` | 共用辅助（asset_utils、cameras、kit_process、lerobot_v3）+ 每个任务一个 `<task>_utils.py` |
+| `configs/<task>/` | 任务配置|
+| `scripts/<task>/` | 资产准备、采集、独立校验；`scripts/rsr` 是 CLI 包装 |
+| `docs/<task>.md` | 任务说明、运行方法、问题与解决方案、当前结果 |
+| `tests/` | 无 Kit 单元测试 |
 | `pyproject.toml` | 依赖、uv、entry points、脚本 `rsr` |
 
 项目用 **uv** 管锁文件与 wheel；**唯一运行时是 Isaac Sim `python.sh`**。不要 `uv sync` 出 `.venv` 当仿真环境。
@@ -25,8 +29,28 @@
 每个能力域（simworld / scene / robot / planner / job）保持：
 
 - `{domain}/base.py` — ABC + `Auto*.from_config()` 工厂：`peek_backend` + 实现类 `config_cls` → Registry
-- `{domain}/config.py` — section 级 pydantic（继承 `BaseConfig`，含公共字段）
-- 各 stub 文件（如 `job_stub.py`）— 实现类通过 `config_cls` 指定 `config.py` 中的配置；在 `pyproject.toml` entry points 注册。新增插件可将实现类与专用配置放在同文件
+- `{domain}/{domain}_stub.py`（simworld 为 `stub.py`）— 无依赖的 stub 后端
+- `{domain}/{domain}_<task>.py` — 该任务在本能力域的全部实现类及其 pydantic 配置（继承 `BaseConfig`），
+  实现类通过 `config_cls` 指定配置；在 `pyproject.toml` entry points 注册
+
+### 1.1 任务布局
+
+每个任务在 scene / robot / planner / job / utils 中**各只有一个文件**，文件名后缀即任务名：
+
+| 任务 | 后缀 | 后端名（scene / robot / planner / job） |
+|------|------|------------------------------------------|
+| 物理求解器验证 | `physic_solver` | `pickplace_cloth`、`pickplace_rigid`、`newton_cloth_franka`、`pickplace_package` / `franka_newton`、`franka_physx`、`franka_package_pads` / `pickplace_cloth`、`newton_cloth_franka`、`pickplace_package` / `pickplace_cloth` |
+| 分拣包裹 | `sorting` | `sorting_package` / `pro_m6_newton` / `sorting_package`、`sorting_stream` / `sorting_package` |
+| 机器狗巡检 | `fire_inspection` | `fire_warehouse` / `x30_kinematic` / `fire_patrol` / `fire_inspection` |
+
+- 同一任务的多个后端、运行时和辅助类放在同一文件中，按依赖顺序分节（节首注释说明内容）。
+- 新任务依次新增 `{domain}/{domain}_<task>.py`、`utils/<task>_utils.py`、`configs/<task>/`、
+  `scripts/<task>/`、`docs/<task>.md`；后端名保持配置里的小写字符串，改名需同步配置与文档。
+- 任务之间可以继承（分拣复用物理求解器任务的 `PackageScene` / `PackageRuntime` / `PhysicSolverJob`），
+  不要复制代码。
+- 包内模块顶层不导入 Kit / pxr / Newton / Warp；Warp kernel 和依赖 Newton 的子类在首次使用时定义
+  （见 `utils/physic_solver_utils.moving_frame_vbd_class`），保证 `list-backends` 和单元测试不启动 Kit。
+- 输出：`outputs/<task>/` 只放通过验收的结果；调试、对照和失败轨迹放 `outputs/debug/<task>/`。
 
 模块职责（分离，由 Job 编排）：
 
@@ -124,6 +148,10 @@ Entry point 组名以 `pyproject.toml` / `core/registry.py` 为准，勿自创�
 - 业务：`real2sim2real.cli.commands` 插件，`register(app)` 挂子命令
 - stub 示例：`./app/python.sh -m real2sim2real.core.cli collect run`
 - 指定配置：`./app/python.sh -m real2sim2real.core.cli collect run -c settings.toml`
+- 任务入口：
+  - 物理求解器验证：`./app/python.sh scripts/physic_solver/collect_physic_solver_cases.py`
+  - 分拣包裹：`./scripts/sorting/run_sorting_showcase.sh outputs/sorting`（内部调用 `rsr collect render-sorting`）
+  - 机器狗巡检：`./scripts/rsr collect run -c configs/fire_inspection/x30_physx_warehouse.toml`
 
 调试子命令时使用 `./app/python.sh -m real2sim2real.core.cli`（`main()` 内加载插件）。
 
@@ -132,8 +160,8 @@ Entry point 组名以 `pyproject.toml` / `core/registry.py` 为准，勿自创�
 ```bash
 uv lock
 ./app/python.sh -m pip install -e ".[dev]"
-./app/python.sh -m ruff check real2sim2real
-./app/python.sh -m ruff format real2sim2real
+./app/python.sh -m ruff check real2sim2real scripts
+./app/python.sh -m ruff format <改动的文件>   # 不要整包 format：会改写未改动的 base 文件
 ./app/python.sh -m pytest -q
 ./app/python.sh -m real2sim2real.core.cli list-backends
 ./app/python.sh -m real2sim2real.core.cli collect run
@@ -174,13 +202,15 @@ uv lock
 - **改 `{domain}/base.py`**：同步 stub、相关 Config，并考虑外部插件兼容
 - **改 entry point 组名 / section 名**：同步 `pyproject.toml`、`registry.py`、文档
 - **加配置字段**：更新对应 `*Config`、`default_settings.toml`及适用的配置示例
+- **移动配置 / 脚本**：`inherit` 相对配置文件所在目录；脚本用 `from scripts.<task>.<name> import ...` 互相引用
 - **不要**提交密钥、`.secrets.toml`、大体积生成物；遵守 `.gitignore`
 - **不要**在未要求时创建 git commit / push
 
 ## 快速自检清单
 
-- [ ] `./app/python.sh -m ruff check real2sim2real` 通过
+- [ ] `./app/python.sh -m ruff check real2sim2real scripts` 与 `./app/python.sh -m pytest -q` 通过
 - [ ] 新后端已在 `pyproject.toml` entry points 注册，`./app/python.sh -m real2sim2real.core.cli list-backends` 能看到
 - [ ] 配置字段已写入对应 `*Config`、`default_settings.toml`及适用的配置示例
 - [ ] Job 仍走固定五段生命周期（含 `close`）
+- [ ] 任务代码仍是每个能力域一个文件；对应 `docs/<task>.md` 已更新
 

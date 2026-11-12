@@ -13,11 +13,11 @@ from real2sim2real.core.config import apply_settings_file, reset_settings
 from real2sim2real.job.base import AutoJob
 from real2sim2real.job.job_sorting import SortingJob
 from real2sim2real.utils.lerobot_v3 import LeRobotV3Recorder
-from real2sim2real.utils.sorting_quality import aligned_shape_rms, audit_held_shape
+from real2sim2real.utils.sorting_utils import aligned_shape_rms, audit_held_shape
 
 
 def test_surface_distance_pruning_matches_all_triangles_including_degenerate_faces():
-    from real2sim2real.utils.package_geometry import _surface_distance, _surface_distance_dense
+    from real2sim2real.utils.physic_solver_utils import _surface_distance, _surface_distance_dense
 
     rng = np.random.default_rng(42)
     triangles = rng.normal(size=(256, 3, 3))
@@ -32,7 +32,7 @@ def test_surface_distance_pruning_matches_all_triangles_including_degenerate_fac
 
 
 def test_surface_distance_does_not_discard_a_large_face_with_a_remote_centroid():
-    from real2sim2real.utils.package_geometry import _surface_distance, _surface_distance_dense
+    from real2sim2real.utils.physic_solver_utils import _surface_distance, _surface_distance_dense
 
     rng = np.random.default_rng(7)
     small = rng.normal(size=(256, 3, 3)) * 0.01 + [0, 0, 0.1]
@@ -108,7 +108,7 @@ def test_sorting_metrics_preserve_nested_landing_coordinates_in_strict_json():
 
 
 def test_fixed_root_clearance_includes_particle_radius_and_shape_margin():
-    from real2sim2real.utils.sorting_quality import audit_fixed_robot_clearance, unit_box_mesh
+    from real2sim2real.utils.sorting_utils import audit_fixed_robot_clearance, unit_box_mesh
 
     box, triangles = unit_box_mesh()
     collider = dict(shape_id=0, vertices=box, triangles=triangles)
@@ -277,7 +277,7 @@ def test_contact_materials_change_only_declared_roles(
     from types import SimpleNamespace
 
     from real2sim2real.planner.planner_sorting import SortingPlannerConfig
-    from real2sim2real.planner.sorting_runtime import SortingRuntime
+    from real2sim2real.planner.planner_sorting import SortingRuntime
 
     class Array:
         def __init__(self, values):
@@ -383,7 +383,7 @@ def test_strain_relief_preserves_the_acquired_grip_during_lift_ramp():
 def test_sorting_mass_override_preserves_bag_geometry_and_original_asset(monkeypatch):
     from types import SimpleNamespace
 
-    from real2sim2real.scene.scene_package import PackageScene
+    from real2sim2real.scene.scene_physic_solver import PackageScene
     from real2sim2real.scene.scene_sorting import SortingScene, SortingSceneConfig
 
     garment = np.array([0.02, 0.06, 0.12])
@@ -543,13 +543,14 @@ def test_kit_worker_checks_fresh_results_after_fast_exit(
 
 def test_sorting_is_lazy_and_routes_native_components(monkeypatch, tmp_path):
     monkeypatch.setenv("RSR_JOB__OUTPUT_DIR", str(tmp_path))
-    apply_settings_file("configs/PhysicSolver_mujoco_vbd_sorting_package.toml")
+    apply_settings_file("configs/sorting/mujoco_vbd_sorting.toml")
     try:
         job = AutoJob.from_config()
         assert isinstance(job, SortingJob)
         assert job.sim_world.app is None
         assert job.sim_world.config.newton_solver == "mujoco"
         assert job.planner.config.cloth_solver == "vbd"
+        assert job.planner.config.backend == "sorting_stream"
         assert job.robot.config.backend == "pro_m6_newton"
         assert [camera.name for camera in job.recording_cameras] == [
             "overview",
@@ -559,7 +560,7 @@ def test_sorting_is_lazy_and_routes_native_components(monkeypatch, tmp_path):
         ]
         assert job.record_stride == 4
         assert job.planner.config.maximum_edge_stretch == 1.3
-        assert job.planner.config.grasp_height_m == pytest.approx(0.048)
+        assert job.planner.config.grasp_height_m == pytest.approx(0.055)
     finally:
         monkeypatch.delenv("RSR_SETTINGS_FILE")
         reset_settings()
@@ -753,55 +754,6 @@ def test_final_shape_sampling_cannot_omit_a_recorded_failed_checkpoint():
     assert {row["sample_index"] for row in report["samples"]} == {0, 1, 2, 4}
 
 
-@pytest.mark.parametrize("half_size", [(2.0, 2.0), (0.2, 0.2)])
-def test_contact_refinement_preserves_surface_mass_uv_provenance_and_closed_edges(half_size):
-    from real2sim2real.utils.package_refinement import lumped_areas, refine_surface
-    from real2sim2real.utils.sorting_quality import unit_box_mesh
-
-    vertices, triangles = unit_box_mesh()
-    areas = lumped_areas(vertices, triangles)
-    masses = 0.2 * areas / areas.sum()
-    refined = refine_surface(vertices, triangles, masses, half_size_xy=half_size)
-    np.testing.assert_array_equal(refined.vertices[: len(vertices)], vertices)
-    assert len(refined.vertices) > len(vertices)
-    assert np.all(refined.masses > 0)
-    assert refined.masses.sum() == pytest.approx(0.2)
-    np.testing.assert_allclose(
-        np.average(refined.vertices, axis=0, weights=refined.masses),
-        np.average(vertices, axis=0, weights=masses),
-        atol=1e-14,
-    )
-    np.testing.assert_allclose(lumped_areas(refined.vertices, refined.triangles).sum(), areas.sum())
-    expected = np.einsum("fci,fij->fcj", refined.barycentric, vertices[triangles[refined.parents]])
-    np.testing.assert_allclose(refined.vertices[refined.triangles], expected, atol=1e-14)
-    old_face = vertices[triangles[refined.parents]]
-    new_face = refined.vertices[refined.triangles]
-    old_normal = np.cross(old_face[:, 1] - old_face[:, 0], old_face[:, 2] - old_face[:, 0])
-    new_normal = np.cross(new_face[:, 1] - new_face[:, 0], new_face[:, 2] - new_face[:, 0])
-    assert np.all(np.sum(old_normal * new_normal, axis=1) > 0)
-    edges = np.sort(
-        np.concatenate(
-            [refined.triangles[:, :2], refined.triangles[:, 1:], refined.triangles[:, [2, 0]]]
-        ),
-        axis=1,
-    )
-    assert np.all(np.unique(edges, axis=0, return_counts=True)[1] == 2)
-    uv = np.tile(np.array([[0, 0], [1, 0], [0, 1]], float), (len(triangles), 1, 1))
-    uv += np.arange(len(triangles))[:, None, None] * 2
-    mapped = np.einsum("fci,fij->fcj", refined.barycentric, uv[refined.parents])
-    assert np.all(refined.barycentric >= 0)
-    np.testing.assert_allclose(refined.barycentric.sum(2), 1)
-    seam = {}
-    for index, value in zip(refined.triangles.ravel(), mapped.reshape(-1, 2), strict=True):
-        if index >= len(vertices):
-            seam.setdefault(index, []).append(value)
-    assert any(np.ptp(values, axis=0).max() > 1 for values in seam.values())
-    with pytest.raises(ValueError, match="uniform areal density"):
-        changed = masses.copy()
-        changed[0] *= 2
-        refine_surface(vertices, triangles, changed)
-
-
 def test_refined_sampling_also_checks_the_original_probe_population():
     garment = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], float)
     original_bag = np.array([[0.1, 0.1, 0.02], [0.2, 0.1, 0.005], [0.1, 0.2, 0.005]])
@@ -824,65 +776,8 @@ def test_refined_sampling_also_checks_the_original_probe_population():
     assert report["samples"][0]["reference_bag_gap_q95_m"] > 0.01
 
 
-def test_original_face_probe_follows_the_refined_material_not_a_coarse_chord():
-    from real2sim2real.utils.package_refinement import map_material_probes, refine_surface
-
-    vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], float)
-    triangles = np.array([[0, 1, 2]])
-    refined = refine_surface(vertices, triangles, np.ones(3), half_size_xy=(2, 2))
-    indices, weights = map_material_probes(refined, triangles, triangles, np.full((1, 3), 1 / 3))
-    np.testing.assert_allclose(
-        (refined.vertices[indices] * weights[:, :, None]).sum(1), [[1 / 3, 1 / 3, 0]]
-    )
-    deformed = refined.vertices.copy()
-    deformed[3:, 2] = 1
-    point = (deformed[indices] * weights[:, :, None]).sum(1)[0]
-    assert point[2] == pytest.approx(1)
-    assert deformed[triangles].mean(1)[0, 2] == 0
-
-
-@pytest.mark.skipif(
-    not __import__("pathlib")
-    .Path("assets/PhysicSolver/Package/v7_sorting/parcel_two_mesh.usd")
-    .is_file(),
-    reason="Local V7 source asset required",
-)
-def test_refined_usd_keeps_source_unchanged_and_carries_original_quality_reference(tmp_path):
-    import hashlib
-    import sys
-    from pathlib import Path
-
-    source = Path("assets/PhysicSolver/Package/v7_sorting")
-    digest = hashlib.sha256((source / "parcel_two_mesh.usd").read_bytes()).hexdigest()
-    target = tmp_path / "refined"
-    subprocess.run(
-        [
-            sys.executable,
-            "scripts/refine_package_assets.py",
-            "--source",
-            str(source),
-            "--target",
-            str(target),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    manifest = json.loads((target / "provenance.json").read_text())
-    assert hashlib.sha256((source / "parcel_two_mesh.usd").read_bytes()).hexdigest() == digest
-    assert manifest["source_asset_sha256"] == digest
-    assert manifest["original_sampling_retained"] and not manifest["materials_modified"]
-    assert manifest["usd_roundtrip_verified"]
-    assert manifest["reference_probe_counts"]["garment_vertices"] == 3300
-    assert manifest["reference_probe_counts"]["bag_vertices"] == 1650
-    assert not manifest["loft_spring_anchors_modified"]
-    assert manifest["refinement"]["Garment"]["mass_kg"] == pytest.approx(0.2, abs=1e-7)
-    assert manifest["refinement"]["Garment"]["refined_vertices"] > 3300
-    assert manifest["refinement"]["Bag"]["bag_closed"]
-
-
 def test_replay_uses_exact_physics_times_and_excludes_the_terminal_sample():
-    from scripts.render_sorting_package import replay_indices
+    from scripts.sorting.render_sorting_package import replay_indices
 
     np.testing.assert_array_equal(replay_indices(np.arange(61) / 60, 15), np.arange(0, 60, 4))
     np.testing.assert_array_equal(replay_indices(np.array([0.0]), 15), [0])
@@ -893,7 +788,7 @@ def test_replay_uses_exact_physics_times_and_excludes_the_terminal_sample():
 
 
 def test_workflow_gap_policy_retains_grasp_and_original_shape_failures():
-    from real2sim2real.utils.sorting_quality import without_bag_gap_checks
+    from real2sim2real.utils.sorting_utils import without_bag_gap_checks
 
     checks = dict(
         sequence_completed=True,
@@ -918,7 +813,7 @@ def test_workflow_gap_policy_retains_grasp_and_original_shape_failures():
 
 
 def test_replay_optical_overrides_reject_nonoptical_fields_and_preserve_source():
-    from scripts.render_sorting_package import override_camera_poses
+    from scripts.sorting.render_sorting_package import override_camera_poses
 
     source = {
         "scene": {"cameras": [], "garment_mass_kg": 0.05},
@@ -945,7 +840,7 @@ def test_replay_optical_overrides_reject_nonoptical_fields_and_preserve_source()
 def test_presentation_profile_cannot_modify_physics_or_camera_mounts():
     import copy
 
-    from scripts.render_sorting_package import ReplayRenderProfile, override_render_profile
+    from scripts.sorting.render_sorting_package import ReplayRenderProfile, override_render_profile
 
     source = {
         "sim_world": {"physics_dt": 1 / 60, "renderer": "RayTracedLighting"},
@@ -982,7 +877,7 @@ def test_presentation_profile_cannot_modify_physics_or_camera_mounts():
 
 def test_sorting_ik_honors_the_configured_closing_direction():
     from real2sim2real.planner.planner_sorting import SortingPlannerConfig
-    from real2sim2real.planner.sorting_runtime import SortingRuntime
+    from real2sim2real.planner.planner_sorting import SortingRuntime
 
     runtime = object.__new__(SortingRuntime)
     runtime.config = SortingPlannerConfig(tcp_orientation_wxyz=(0, 1, 0, 0))
@@ -994,7 +889,7 @@ def test_sorting_ik_honors_the_configured_closing_direction():
 def test_right_approach_switches_the_measured_tcp_and_contact_aliases():
     from types import SimpleNamespace
 
-    from real2sim2real.planner.sorting_runtime import SortingRuntime
+    from real2sim2real.planner.planner_sorting import SortingRuntime
 
     runtime = object.__new__(SortingRuntime)
     runtime.active_side = "left"
@@ -1015,7 +910,7 @@ def test_right_approach_switches_the_measured_tcp_and_contact_aliases():
 def test_external_contacts_query_current_rigids_and_previous_particles():
     from types import SimpleNamespace
 
-    from real2sim2real.planner.sorting_runtime import SortingRuntime
+    from real2sim2real.planner.planner_sorting import SortingRuntime
 
     runtime = object.__new__(SortingRuntime)
     runtime.state_0 = SimpleNamespace(
@@ -1043,7 +938,7 @@ def test_external_contacts_query_current_rigids_and_previous_particles():
 
 
 def test_jaw_audit_detects_a_face_crossing_even_when_all_vertices_are_outside():
-    from real2sim2real.utils.sorting_quality import audit_jaw_penetration
+    from real2sim2real.utils.sorting_utils import audit_jaw_penetration
 
     cube = np.array(
         [[x, y, z] for x in (-0.01, 0.01) for y in (-0.01, 0.01) for z in (-0.01, 0.01)]
@@ -1100,9 +995,9 @@ import newton,warp as wp
 wp.set_device('cpu')
 from newton.solvers import SolverMuJoCo
 from real2sim2real.robot.robot_sorting import SortingRobot
-from real2sim2real.planner.sorting_kinematics import SortingArmIK
+from real2sim2real.planner.planner_sorting import SortingArmIK
 from real2sim2real.planner.planner_physic_solver import _rotation_wxyz
-from real2sim2real.utils.sorting_quality import unit_box_mesh
+from real2sim2real.utils.sorting_utils import unit_box_mesh
 robot=SortingRobot();robot.source_path='assets/Robot/pro_m6_696/pro_m6_696.usda'
 builder=newton.ModelBuilder();SolverMuJoCo.register_custom_attributes(builder)
 robot.add_newton_robot(builder)
@@ -1151,7 +1046,7 @@ np.testing.assert_array_equal(model.joint_q.numpy(),initial)
 # Batching only the constant inputs must preserve every solved substep. This
 # compares native integration, mimic equalities and FK, rather than final poses.
 from types import SimpleNamespace
-from real2sim2real.planner.sorting_runtime import SortingRuntime
+from real2sim2real.planner.planner_sorting import SortingRuntime
 from real2sim2real.planner.planner_sorting import SortingPlannerConfig
 runtime=object.__new__(SortingRuntime)
 runtime.model=model;runtime.robot=robot;runtime.wp=wp;runtime.newton=newton
@@ -1360,12 +1255,12 @@ np.testing.assert_allclose(world_states[0][3][:26],world_states[1][3][:26],atol=
     assert completed.returncode == 0, completed.stderr
 
 
-def test_stream_config_keeps_successful_soft_asset_and_native_head_mount(tmp_path):
+def test_sorting_config_keeps_successful_soft_asset_and_native_head_mount(tmp_path):
     from real2sim2real.job.job_sorting import SortingJob, SortingJobConfig
-    from real2sim2real.planner.planner_sorting_stream import SortingStreamPlanner
+    from real2sim2real.planner.planner_sorting import SortingStreamPlanner
 
     try:
-        apply_settings_file("configs/PhysicSolver_mujoco_vbd_sorting_stream.toml")
+        apply_settings_file("configs/sorting/mujoco_vbd_sorting.toml")
         config = SortingJobConfig.from_settings("job")
         config.output_dir = str(tmp_path)
         job = SortingJob(config=config)
@@ -1385,55 +1280,38 @@ def test_stream_config_keeps_successful_soft_asset_and_native_head_mount(tmp_pat
         reset_settings()
 
 
-def test_showcase_config_uses_four_hd_views_without_starting_simulation(tmp_path):
+def test_sorting_config_uses_four_hd_views_without_starting_simulation(tmp_path):
     from real2sim2real.job.job_sorting import SortingJobConfig
 
     try:
-        apply_settings_file("configs/PhysicSolver_mujoco_vbd_sorting_stream.toml")
-        base_config = SortingJobConfig.from_settings("job")
-        base_config.output_dir = str(tmp_path / "base")
-        original = SortingJob(config=base_config)
-        apply_settings_file("configs/PhysicSolver_mujoco_vbd_sorting_stream_showcase.toml")
+        apply_settings_file("configs/sorting/mujoco_vbd_sorting.toml")
         config = SortingJobConfig.from_settings("job")
-        assert config.output_dir == "outputs/sorting_stream_showcase_1k"
-        config.output_dir = str(tmp_path / "showcase")
-        showcase = SortingJob(config=config)
-        assert showcase.sim_world.app is None
-        assert showcase.sim_world.config.renderer == "PathTracing"
-        assert showcase.sim_world.config.synchronous_capture
-        assert not showcase.sim_world.config.pathtracing_cached
-        assert not showcase.sim_world.config.pathtracing_many_light_sampling
-        assert not showcase.sim_world.config.pathtracing_temporal_denoising
-        assert not showcase.sim_world.config.auto_exposure
-        assert showcase.config.recorder.fps == 15
-        assert showcase.record_stride == 4
-        assert [camera.name for camera in showcase.recording_cameras] == [
+        assert config.output_dir == "outputs/sorting"
+        config.output_dir = str(tmp_path / "sorting")
+        job = SortingJob(config=config)
+        assert job.sim_world.app is None
+        assert job.sim_world.config.renderer == "PathTracing"
+        assert job.sim_world.config.synchronous_capture
+        assert not job.sim_world.config.pathtracing_cached
+        assert not job.sim_world.config.pathtracing_many_light_sampling
+        assert not job.sim_world.config.pathtracing_temporal_denoising
+        assert not job.sim_world.config.auto_exposure
+        assert job.config.recorder.fps == 15
+        assert job.config.max_steps == 16000
+        assert not job.config.recorder.save_failed_episodes
+        assert job.record_stride == 4
+        assert [camera.name for camera in job.recording_cameras] == [
             "overview",
             "head",
             "left_wrist",
             "right_wrist",
         ]
-        for camera, source in zip(
-            showcase.recording_cameras, original.recording_cameras, strict=True
-        ):
-            assert camera.resolution == (1024, 768)
-            assert camera.model_dump(exclude={"resolution"}) == source.model_dump(
-                exclude={"resolution"}
-            )
-        for section in ("scene", "robot"):
-            assert getattr(showcase, section).config.model_dump(exclude={"cameras"}) == getattr(
-                original, section
-            ).config.model_dump(exclude={"cameras"})
-        assert showcase.planner.config.require_bag_gap_quality
-        assert showcase.planner.config.maximum_bag_gap_m == 0.01
-        assert showcase.planner.config.maximum_shape_rms_m == 0.045
-        assert showcase.planner.config.model_dump(
-            exclude={"require_bag_gap_quality", "maximum_shape_rms_m"}
-        ) == (
-            original.planner.config.model_dump(
-                exclude={"require_bag_gap_quality", "maximum_shape_rms_m"}
-            )
-        )
+        assert all(camera.resolution == (1024, 768) for camera in job.recording_cameras)
+        assert job.planner.config.require_bag_gap_quality
+        assert job.planner.config.maximum_bag_gap_m == 0.01
+        assert job.planner.config.maximum_shape_rms_m == 0.045
+        assert job.planner.config.maximum_edge_stretch == 1.3
+        assert job.planner.config.maximum_table_penetration_m == 0.0015
     finally:
         reset_settings()
 
@@ -1626,7 +1504,7 @@ def test_replay_renders_complete_camera_sequences_with_identical_source_samples(
     from types import SimpleNamespace
     from unittest.mock import Mock
 
-    import scripts.render_sorting_package as replay_module
+    import scripts.sorting.render_sorting_package as replay_module
     from real2sim2real.utils.cameras import CameraConfig
 
     names = ["overview", "head", "left_wrist", "right_wrist"]
@@ -1725,7 +1603,7 @@ def test_replay_renders_complete_camera_sequences_with_identical_source_samples(
 def test_outfeed_fall_requires_departure_before_landing_not_simultaneous_xy_clearance(
     trajectory, expected_exit, expected_ground
 ):
-    from scripts.validate_sorting_stream import outfeed_departure
+    from scripts.sorting.validate_sorting_stream import outfeed_departure
 
     report = outfeed_departure(np.asarray(trajectory), edge=0, floor=0)
     assert report["fully_exits_outfeed"] is expected_exit
@@ -1740,7 +1618,7 @@ def test_exported_rgb_audit_rejects_stale_pixels_and_changed_cache(
 ):
     from types import SimpleNamespace
 
-    import scripts.render_sorting_package as module
+    import scripts.sorting.render_sorting_package as module
 
     job = object.__new__(module.SortingReplayJob)
     job.output = tmp_path
@@ -1771,7 +1649,7 @@ def test_exported_rgb_audit_rejects_stale_pixels_and_changed_cache(
 
 
 def test_render_cache_rejects_changed_source_settings_and_incomplete_images(tmp_path):
-    from scripts.render_sorting_package import prepare_frame_cache, valid_cached_frame
+    from scripts.sorting.render_sorting_package import prepare_frame_cache, valid_cached_frame
 
     source = tmp_path / "physics"
     source.mkdir()
@@ -1810,7 +1688,7 @@ def test_camera_worker_resume_recaptures_only_missing_or_corrupt_source_frames(
 ):
     from types import SimpleNamespace
 
-    import scripts.render_sorting_package as module
+    import scripts.sorting.render_sorting_package as module
     from real2sim2real.utils.cameras import CameraConfig
 
     job = object.__new__(module.SortingReplayJob)
@@ -1862,7 +1740,7 @@ def test_camera_worker_resume_recaptures_only_missing_or_corrupt_source_frames(
 
 @pytest.mark.parametrize("failure", [False, True])
 def test_render_camera_workers_finish_before_dataset_encoding(monkeypatch, tmp_path, failure):
-    import scripts.render_sorting_package as module
+    import scripts.sorting.render_sorting_package as module
 
     (tmp_path / "configuration.json").write_text(
         json.dumps(
@@ -1894,7 +1772,7 @@ def test_render_camera_workers_finish_before_dataset_encoding(monkeypatch, tmp_p
 def test_camera_batches_must_finish_and_make_progress_before_encoding(
     monkeypatch, tmp_path, no_progress
 ):
-    import scripts.render_sorting_package as module
+    import scripts.sorting.render_sorting_package as module
 
     (tmp_path / "configuration.json").write_text(
         json.dumps(dict(scene=dict(cameras=[dict(name="overview")]), robot=dict(cameras=[])))
@@ -1925,7 +1803,7 @@ def test_complete_render_cache_commits_matching_state_and_action_without_recaptu
     from unittest.mock import Mock
 
     from real2sim2real.utils.cameras import CameraConfig
-    from scripts.render_sorting_package import SortingReplayJob
+    from scripts.sorting.render_sorting_package import SortingReplayJob
 
     job = object.__new__(SortingReplayJob)
     job.output = tmp_path
@@ -2091,7 +1969,7 @@ def test_capture_updates_disable_eco_after_stopped_timeline_callbacks():
 def test_cached_soft_success_cannot_hide_damage_during_the_later_rigid_relay():
     from types import SimpleNamespace
 
-    from real2sim2real.planner.planner_sorting_stream import (
+    from real2sim2real.planner.planner_sorting import (
         SortingStreamPlanner,
         SortingStreamPlannerConfig,
     )
@@ -2178,7 +2056,7 @@ def test_native_rigid_belt_force_is_contact_limited_and_stops_in_free_fall():
 import mujoco
 import numpy as np
 from types import SimpleNamespace
-from real2sim2real.planner.sorting_stream_runtime import SortingStreamRuntime
+from real2sim2real.planner.planner_sorting import SortingStreamRuntime
 model = mujoco.MjModel.from_xml_string("""
 <mujoco><option timestep="0.001" integrator="implicitfast"/>
 <worldbody><geom name="belt" type="box" size="1 .3 .02" pos="0 0 -.02"
@@ -2229,7 +2107,7 @@ def test_native_fixed_belt_cannot_drift_during_batched_cpu_steps():
     code = """
 import newton, warp as wp, numpy as np
 from newton.solvers import SolverMuJoCo
-from real2sim2real.planner.sorting_runtime import SortingRuntime
+from real2sim2real.planner.planner_sorting import SortingRuntime
 wp.init()
 b = newton.ModelBuilder()
 SolverMuJoCo.register_custom_attributes(b)
@@ -2424,7 +2302,7 @@ def test_physics_stop_callback_does_not_mark_a_failed_sequence_completed(tmp_pat
     from types import SimpleNamespace
     from unittest.mock import Mock
 
-    from scripts.check_sorting_package import SortingPhysicsCheck
+    from scripts.sorting.check_sorting_package import SortingPhysicsCheck
 
     settings = SimpleNamespace(model_dump=lambda **kwargs: {})
     job = SimpleNamespace(

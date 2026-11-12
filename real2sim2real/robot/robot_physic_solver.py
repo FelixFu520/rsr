@@ -1,8 +1,11 @@
-"""PhysicSolver 案例的机器人定义，重型依赖在初始化阶段加载。
+"""物理求解器验证任务的机器人：Franka FR3（Newton）、Franka Panda（PhysX）和 V7 长夹块 Franka。
 
-franka_newton 后端使用 FrankaNewtonRobot：导入 FR3 URDF，由 Planner 的 Newton
-运行时驱动；franka_physx 后端使用 FrankaPhysxRobot：加载 Panda USD、PhysX 驱动与
-Lula IK，也为 hybrid 世界提供实测的手指/手掌碰撞位姿。两种后端由配置显式选择。
+- ``franka_newton``：``FrankaNewtonRobot`` 导入 FR3 URDF，由 Planner 的 Newton 运行时驱动。
+- ``franka_physx``：``FrankaPhysxRobot`` 加载 Panda USD、PhysX 驱动与 Lula IK，也为 hybrid
+  世界提供实测的手指/手掌碰撞位姿。
+- ``franka_package_pads``：``PackagePadRobot`` 在 FR3 手指刚体上安装 V7 的长平行夹块。
+
+重型依赖在初始化阶段加载，读取配置与列举后端不会启动 Kit。
 """
 
 from __future__ import annotations
@@ -12,12 +15,20 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
-from pydantic import Field, field_validator
+from pydantic import Field, FiniteFloat, PositiveFloat, field_validator
 
 from real2sim2real.core.config import BaseConfig
 from real2sim2real.robot.base import BaseRobot
 from real2sim2real.utils.asset_utils import resolve_usd_path
 from real2sim2real.utils.cameras import CameraConfig, create_cameras, validate_camera_list
+
+# ================================================================================================
+# PhysicSolver 案例的机器人定义，重型依赖在初始化阶段加载。
+#
+# franka_newton 后端使用 FrankaNewtonRobot：导入 FR3 URDF，由 Planner 的 Newton
+# 运行时驱动；franka_physx 后端使用 FrankaPhysxRobot：加载 Panda USD、PhysX 驱动与
+# Lula IK，也为 hybrid 世界提供实测的手指/手掌碰撞位姿。两种后端由配置显式选择。
+# ================================================================================================
 
 
 class _RobotCameraConfig(BaseConfig):
@@ -352,3 +363,59 @@ class FrankaPhysxRobot(BaseRobot):
         if hasattr(values, "detach"):
             values = values.detach().cpu().numpy()
         return np.asarray(values, dtype=float).copy(), self._recorded_action.copy()
+
+
+# ================================================================================================
+# Franka articulation with the supplied V7 experiment's long parallel jaw geometry.
+# ================================================================================================
+
+
+class PackagePadRobotConfig(FrankaNewtonRobotConfig):
+    """V7-sized simulation jaws, expressed in each mirrored finger's local frame."""
+
+    backend: str = "franka_package_pads"
+    pad_half_extents_m: tuple[PositiveFloat, PositiveFloat, PositiveFloat] = (0.03, 0.007, 0.042)
+    pad_center_m: tuple[FiniteFloat, FiniteFloat, FiniteFloat] = (0.0, 0.007, 0.055)
+    pad_density_kg_m3: FiniteFloat = Field(default=1000.0, gt=0)
+
+
+class PackagePadRobot(FrankaNewtonRobot):
+    """Attach the V7 14×60×84 mm boxes to actual Featherstone finger bodies."""
+
+    config_cls = PackagePadRobotConfig
+
+    def add_newton_robot(self, builder: Any, *, scale: float = 100.0) -> None:
+        """Replace finger collision proxies while retaining articulation and finger visuals."""
+        import newton
+        import warp as wp
+
+        super().add_newton_robot(builder, scale=scale)
+        bodies = [
+            i
+            for i, label in enumerate(builder.body_label)
+            if label.endswith(("fr3_leftfinger", "fr3_rightfinger"))
+        ]
+        if len(bodies) != 2:
+            raise ValueError("V7 jaws require two independent Franka finger bodies")
+        collision = int(newton.ShapeFlags.COLLIDE_SHAPES | newton.ShapeFlags.COLLIDE_PARTICLES)
+        for index, body in enumerate(builder.shape_body):
+            if body in bodies:
+                builder.shape_flags[index] &= ~collision
+        self.package_pad_shapes = []
+        extents = [value * scale for value in self.config.pad_half_extents_m]
+        center = [value * scale for value in self.config.pad_center_m]
+        for body in bodies:
+            shape = builder.add_shape_box(
+                body,
+                xform=wp.transform(center, wp.quat_identity()),
+                hx=extents[0],
+                hy=extents[1],
+                hz=extents[2],
+                cfg=newton.ModelBuilder.ShapeConfig(
+                    density=self.config.pad_density_kg_m3 / scale**3,
+                    mu=self.config.finger_friction,
+                    margin=0.0002 * scale,
+                ),
+                label="V7_package_pad",
+            )
+            self.package_pad_shapes.append(shape)
