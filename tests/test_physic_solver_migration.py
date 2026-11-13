@@ -1,5 +1,8 @@
 """Migrated case routing, smooth motion and physical screw-acceptance failure modes."""
 
+import json
+import tomllib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +18,8 @@ from real2sim2real.planner.planner_physic_solver import (
     ScrewPlannerConfig,
 )
 from real2sim2real.utils.physic_solver_utils import (
+    PHYSIC_SOLVER_CASE_NAMES,
+    PHYSIC_SOLVER_PACKAGE_CASES,
     package_finger_reference,
     package_grasp_quaternion,
     package_gripper_activation,
@@ -24,7 +29,9 @@ from real2sim2real.utils.physic_solver_utils import (
 )
 
 
-@pytest.mark.parametrize("path", sorted(Path("configs/physic_solver/package_cases").glob("*.toml")))
+@pytest.mark.parametrize(
+    "path", [Path("configs/physic_solver") / f"{name}.toml" for name in PHYSIC_SOLVER_PACKAGE_CASES]
+)
 def test_migrated_cases_construct_without_kit_and_keep_independent_outputs(
     path, monkeypatch, tmp_path
 ):
@@ -37,14 +44,153 @@ def test_migrated_cases_construct_without_kit_and_keep_independent_outputs(
         assert job.scene.config.backend == "pickplace_package"
         assert job.robot.config.backend in {"franka_package_pads", "franka_newton"}
         assert job.planner.config.attachment_mode == (
-            "spring" if path.stem in {"shake_spring", "shake_spring_x35"} else "none"
+            "spring" if path.stem.endswith("_shake_spring") else "none"
         )
-        if path.stem == "v8_offset_x35":
+        if path.stem == PHYSIC_SOLVER_CASE_NAMES["v8_offset_x35"]:
             assert job.planner.config.grasp_offset_m == (0.035, 0, 0)
-        if path.stem == "v9_mass500g":
+        if path.stem == PHYSIC_SOLVER_CASE_NAMES["v9_mass500g"]:
             assert job.scene.config.garment_mass_kg == 0.5
     finally:
         reset_settings()
+
+
+def test_flat_configs_match_output_names_and_640_capture_contract():
+    root = Path("configs/physic_solver")
+    assert not any(path.is_dir() for path in root.iterdir())
+    paths = list(root.glob("*.toml"))
+    assert {p.stem for p in paths} == set(PHYSIC_SOLVER_CASE_NAMES.values())
+    assert len(PHYSIC_SOLVER_PACKAGE_CASES) == 18
+    for path in paths:
+        config = tomllib.loads(path.read_text())
+        assert "inherit" not in config
+        assert Path(config["job"]["output_dir"]).name == path.stem
+        assert (config["job"]["recorder"]["width"], config["job"]["recorder"]["height"]) == (
+            640,
+            480,
+        )
+        for domain in ("scene", "robot"):
+            assert all(c["resolution"] == [640, 480] for c in config[domain].get("cameras", []))
+
+
+def test_recapture_gpu_lanes_cannot_claim_the_same_physics_case(tmp_path):
+    from scripts.physic_solver.recapture_physic_solver import claim
+
+    state = tmp_path / "queue.json"
+    state.write_text(
+        json.dumps(
+            dict(
+                cases={
+                    name: dict(case=name, sdk=True, status="pending")
+                    for name in ("first", "second")
+                }
+            )
+        )
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        rows = list(pool.map(lambda gpu: claim(state, gpu), (0, 1)))
+    assert {r["case"] for r in rows} == {"first", "second"}
+    assert all(r["status"] == "physics_running" for r in rows)
+    assert all(
+        r["status"] == "physics_running" for r in json.loads(state.read_text())["cases"].values()
+    )
+
+
+def test_recapture_bootstrap_overrides_preparation_status_without_kit(tmp_path, monkeypatch):
+    from scripts.physic_solver import recapture_physic_solver as collector
+
+    run = tmp_path / "run"
+    run.mkdir()
+    pointer = tmp_path / "current.json"
+    pointer.write_text(
+        json.dumps(
+            dict(
+                run_id="test",
+                run_dir=str(run),
+                stage="prepared",
+                complete=False,
+                resolution=[640, 480],
+            )
+        )
+    )
+    monkeypatch.setattr(collector, "POINTER", pointer)
+    _, state = collector.initialize()
+    data = json.loads(state.read_text())
+    assert data["stage"] == "fresh_collection"
+    assert len(data["cases"]) == 29
+    assert sum(row["expected_success"] for row in data["cases"].values()) == 27
+    assert sum(row["sdk"] for row in data["cases"].values()) == 18
+
+
+def test_recapture_resumes_kit_case_with_null_physics_source(tmp_path):
+    from scripts.physic_solver.recapture_physic_solver import recover
+
+    state = tmp_path / "queue.json"
+    state.write_text(
+        json.dumps(
+            dict(
+                cases={
+                    "kit_case": dict(
+                        sdk=False,
+                        status="recording",
+                        physics_source=None,
+                        attempt_dir=str(tmp_path / "attempt"),
+                    )
+                }
+            )
+        )
+    )
+    recover(state)
+    row = json.loads(state.read_text())["cases"]["kit_case"]
+    assert row["status"] == "pending"
+    assert row["physics_source"] is None
+
+
+def test_recapture_first_run_initializes_without_ignored_output_state(tmp_path, monkeypatch):
+    from scripts.physic_solver import recapture_physic_solver as collector
+
+    monkeypatch.setattr(collector, "DEBUG", tmp_path / "debug")
+    monkeypatch.setattr(collector, "OUTPUT", tmp_path / "formal")
+    monkeypatch.setattr(collector, "POINTER", tmp_path / "debug/recapture/current_run.json")
+    run, state = collector.initialize()
+    assert len(list((run / "prepared_configs").glob("*.toml"))) == 30
+    assert len(json.loads(state.read_text())["cases"]) == 29
+
+
+def test_recapture_adopts_surviving_worker_without_claiming_duplicate(tmp_path, monkeypatch):
+    from scripts.physic_solver import recapture_physic_solver as collector
+
+    source = tmp_path / "attempt/physics/case"
+    source.mkdir(parents=True)
+    for name in ("result.json", "physics_audit.json"):
+        (source / name).write_text(json.dumps(dict(success=True)))
+    state = tmp_path / "queue.json"
+    state.write_text(
+        json.dumps(
+            dict(
+                cases={
+                    "case": dict(
+                        case="case",
+                        sdk=True,
+                        gpu=1,
+                        status="physics_running",
+                        attempt_dir=str(tmp_path / "attempt"),
+                        attempts=[dict(fresh_physics=True)],
+                    )
+                }
+            )
+        )
+    )
+    monkeypatch.setattr(collector, "matching_workers", lambda row: [42])
+    collector.recover(state)
+    row = collector.read(state)["cases"]["case"]
+    assert row["status"] == "physics_running" and row["recovered_worker"]
+    assert collector.claim(state, 0) is None
+    assert collector.claim(state, 1) is None
+    monkeypatch.setattr(collector, "matching_workers", lambda row: [])
+    collector.adopt_worker(tmp_path, state, row)
+    row = collector.read(state)["cases"]["case"]
+    assert row["status"] == "physics_passed" and not row["recovered_worker"]
+    assert len(row["attempts"]) == 1 and row["physics_source"] == str(source)
 
 
 def test_shake_starts_and_ends_at_rest_and_rotations_preserve_norm():
@@ -179,7 +325,7 @@ def test_proxy_pose_audit_handles_antipodes_and_detects_geometry_mismatch():
 def test_package_duration_includes_lift_hold_and_post_shake_hold(monkeypatch, tmp_path):
     monkeypatch.setenv(
         "RSR_SETTINGS_FILE",
-        str(Path("configs/physic_solver/package_cases/shake_spring.toml").resolve()),
+        str(Path("configs/physic_solver/mujoco_vbd_package01_center_shake_spring.toml").resolve()),
     )
     monkeypatch.setenv("RSR_JOB__OUTPUT_DIR", str(tmp_path))
     reset_settings()
@@ -248,7 +394,7 @@ def test_screw_rejects_empty_rotation_and_unthreaded_push_through():
 def test_screw_backends_construct_lazily(monkeypatch, tmp_path):
     monkeypatch.setenv(
         "RSR_SETTINGS_FILE",
-        str(Path("configs/physic_solver/mujoco_hydroelastic_screw.toml").resolve()),
+        str(Path("configs/physic_solver/mujoco_hydroelastic_screw01_rotate.toml").resolve()),
     )
     monkeypatch.setenv("RSR_JOB__OUTPUT_DIR", str(tmp_path))
     reset_settings()
@@ -305,7 +451,11 @@ def test_assisted_springs_apply_finite_forces_and_release_without_state_overwrit
 def test_original_cartons_use_a_declared_long_stroke_gripper(name, monkeypatch, tmp_path):
     monkeypatch.setenv(
         "RSR_SETTINGS_FILE",
-        str(Path(f"configs/physic_solver/mujoco_rigid_v10_{name}.toml").resolve()),
+        str(
+            (
+                Path("configs/physic_solver") / f"{PHYSIC_SOLVER_CASE_NAMES['v10_' + name]}.toml"
+            ).resolve()
+        ),
     )
     monkeypatch.setenv("RSR_JOB__OUTPUT_DIR", str(tmp_path))
     reset_settings()

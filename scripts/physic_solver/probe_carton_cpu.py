@@ -15,7 +15,9 @@ ROOT = Path(__file__).resolve().parents[2]
 def main() -> int:
     """Use the fixed Job lifecycle and the SDK shipped with the current Isaac Python."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/physic_solver/mujoco_rigid_v10_box01.toml")
+    parser.add_argument(
+        "--config", default="configs/physic_solver/mujoco_mujoco_package07_center.toml"
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)

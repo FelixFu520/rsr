@@ -1,0 +1,114 @@
+# tgs_tgs_rigid01_baseline
+# 统一分类：机器人求解器_接触求解器_物体_工况；采集640×480。
+# 历史工况：tgs_tgs_pickplace_rigid。物理参数和原验收门限保持。
+[sim_world]
+backend = "isaacsim"
+extensions = [ "isaacsim.robot_motion.motion_generation",]
+physics_engine = "physx"
+physx_solver = "TGS"
+device = "cpu"
+physics_dt = 0.008333333333333333
+rendering_dt = 0.06666666666666667
+headless = true
+renderer = "RayTracedLighting"
+width = 640
+height = 480
+rt_subframes = 1
+warmup_frames = 2
+background_usd_path = "assets/PhysicSolver/Isaac/Environments/Simple_Warehouse/warehouse_multiple_shelves.usd"
+background_prim_path = "/World/background"
+background_offset = [ -4.0, 0.0, 0.0,]
+background_gravity = false
+background_skip_metrics_assembler = true
+
+[scene]
+backend = "pickplace_rigid"
+object_kind = "rigid"
+table_usd_path = "assets/PhysicSolver/Table/Aligned.usd"
+cube_usd_path = "assets/PhysicSolver/Cube/Aligned.usd"
+prim_path = "/World/scene"
+table_scale = [ 2.0, 1.2, 1.0,]
+table_xy = [ 0.0, 0.0,]
+target_xy = [ 0.14, 0.0,]
+robot_base_xy = [ -0.38, 0.0,]
+cube_mass = 0.1
+object_clearance = 0.004
+friction = 1.2
+[[scene.cameras]]
+name = "overview"
+prim_path = "/World/scene/overview_cam"
+pose_relative_to = "/World/scene"
+resolution = [ 640, 480,]
+clipping_range = [ 0.1, 80.0,]
+focal_length = 18.0
+horizontal_aperture = 20.955
+
+[scene.cameras.pose]
+position = [ 1.8, 1.65, 1.85,]
+orientation_wxyz = [ 0.3303108012, 0.2302877772, 0.5234982467, 0.7508740906,]
+
+[robot]
+backend = "franka_physx"
+usd_path = "assets/PhysicSolver/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"
+prim_path = "/World/robots/Franka"
+base_position = [ -0.38, 0.0, 0.732389,]
+base_orientation = [ 1.0, 0.0, 0.0, 0.0,]
+initial_joint_positions = [ 0.0, -0.569, 0.0, -2.81, 0.0, 3.037, 0.741, 0.04, 0.04,]
+arm_stiffness = 1200.0
+arm_damping = 80.0
+finger_stiffness = 1600.0
+finger_damping = 40.0
+finger_max_force = 60.0
+finger_friction = 3.0
+[[robot.cameras]]
+name = "wrist"
+prim_path = "/World/robots/Franka/panda_link7/wrist_cam"
+pose_relative_to = "/World/robots/Franka/panda_link7"
+resolution = [ 640, 480,]
+clipping_range = [ 0.002, 20.0,]
+focal_length = 8.0
+horizontal_aperture = 20.955
+
+[robot.cameras.pose]
+position = [ 0.0282842712, -0.0282842712, 0.175,]
+orientation_wxyz = [ 0.157148418, -0.3489283367, 0.8423875227, -0.3793898419,]
+
+[planner]
+backend = "pickplace_cloth"
+settle_s = 1.0
+approach_s = 3.0
+descend_s = 2.0
+close_s = 2.0
+lift_s = 3.0
+hold_s = 2.0
+transfer_s = 2.5
+lower_s = 1.5
+release_s = 1.0
+retract_s = 1.5
+rest_s = 2.0
+approach_height_m = 0.18
+lift_height_m = 0.25
+place_offset_m = [ -0.05, -0.12, 0.0,]
+place_height_m = 0.08
+maximum_place_error_m = 0.08
+retract_height_m = 0.12
+open_finger_m = 0.04
+closed_finger_m = 0.0
+minimum_lift_m = 0.08
+minimum_release_drop_m = 0.04
+maximum_patch_distance_m = 0.08
+maximum_table_penetration_m = 0.02
+
+[job]
+backend = "pickplace_cloth"
+output_dir = "outputs/physic_solver/tgs_tgs_rigid01_baseline"
+max_steps = 6000
+timeout_s = 7200
+inspect_gui = false
+
+[job.recorder]
+format = "lerobot_v3"
+fps = 15
+width = 640
+height = 480
+task = "tgs_tgs_rigid01_baseline"

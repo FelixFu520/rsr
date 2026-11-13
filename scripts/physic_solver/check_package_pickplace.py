@@ -85,7 +85,7 @@ class PackagePhysicsCheck(PhysicSolverJob):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--config", default="configs/physic_solver/featherstone_vbd_pickplace_package.toml"
+        "--config", default="configs/physic_solver/featherstone_vbd_package01_center_control.toml"
     )
     parser.add_argument("--output", default="outputs/debug/physic_solver/package_physics_check")
     args = parser.parse_args()

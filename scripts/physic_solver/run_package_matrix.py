@@ -24,10 +24,15 @@ from real2sim2real.core.logger import get_logger
 from real2sim2real.job.job_physic_solver import PhysicSolverJobConfig
 from real2sim2real.planner.planner_physic_solver import PackagePlannerConfig
 from real2sim2real.scene.scene_physic_solver import PackageSceneConfig
-from real2sim2real.utils.physic_solver_utils import check_package_containment, proxy_pose_errors
+from real2sim2real.utils.physic_solver_utils import (
+    PHYSIC_SOLVER_PACKAGE_CASES,
+    check_package_containment,
+    physic_solver_case_name,
+    proxy_pose_errors,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
-CONFIGS = ROOT / "configs/physic_solver/package_cases"
+CONFIGS = ROOT / "configs/physic_solver"
 DEBUG = ROOT / "outputs/debug/physic_solver/package_migration"
 
 
@@ -342,9 +347,9 @@ def main() -> int:
     )
     args = parser.parse_args()
     paths = (
-        [CONFIGS / f"{name}.toml" for name in args.cases]
+        [CONFIGS / f"{physic_solver_case_name(name)}.toml" for name in args.cases]
         if args.cases
-        else sorted(CONFIGS.glob("*.toml"))
+        else [CONFIGS / f"{name}.toml" for name in PHYSIC_SOLVER_PACKAGE_CASES]
     )
     DEBUG.mkdir(parents=True, exist_ok=True)
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S_%fZ")

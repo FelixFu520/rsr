@@ -12,15 +12,15 @@ Job 都是独立注册的后端，复用同一个 `IsaacsimWorld` 和固定的 J
 
 | 任务 | 内容 | 物理 | 配置 | 文档 |
 |---|---|---|---|---|
-| 求解器验证 | Franka 抓放衣服／方块；V7–V10 包裹的位置、重量、种类与摇晃／附着矩阵；连续主轴螺纹装配 | Newton（Featherstone、MuJoCo、XPBD、VBD）、PhysX、hybrid、hydroelastic接触 | [configs/physic_solver/](configs/physic_solver/) | [docs/physic_solver.md](docs/physic_solver.md) |
+| 求解器验证 | Franka 抓放衣服／方块；package01–08 的位置、重量、种类与摇晃／附着矩阵；连续主轴螺纹装配 | Newton（Featherstone、MuJoCo、XPBD、VBD）、PhysX、hybrid、hydroelastic接触 | [configs/physic_solver/](configs/physic_solver/) | [docs/physic_solver.md](docs/physic_solver.md) |
 | 分拣包裹 | Pro-M6 双臂把软包和纸箱依次从入料带经平台送到出料带，四路 1K 视频 | MuJoCo（CPU）+ VBD（CUDA） | [configs/sorting/](configs/sorting/) | [docs/sorting.md](docs/sorting.md) |
 | 机器狗巡检 | X30 一句话指令巡航仓库，发现火点、拍照、警示灯报警 | PhysX（CPU）+ Flow 火焰 | [configs/fire_inspection/](configs/fire_inspection/) | [docs/fire_inspection.md](docs/fire_inspection.md) |
 
 采集命令（仓库根目录）：
 
 ```bash
-# 物理求解器验证：串行采集 8 个组合
-./app/python.sh scripts/physic_solver/collect_physic_solver_cases.py
+# 物理求解器验证：按统一分类从初态重采集，640×480
+./app/python.sh scripts/physic_solver/recapture_physic_solver.py
 # 分拣包裹：连续物理 → 四路 1K 渲染 → LeRobot v3 → 独立验收
 ./scripts/sorting/run_sorting_showcase.sh outputs/sorting
 # 机器狗巡检：采集 + 独立验收
@@ -129,8 +129,8 @@ rsr/
 
 [IsaacsimWorld](real2sim2real/simworld/isaacsim.py) 由 `sim_world.physics_engine` 选择 `physx`、
 `newton`（`newton_execution="usd"` 或 `"direct"`）或 `hybrid`；`step()` 每次推进一个 `physics_dt`，
-`update()` 只刷新渲染。direct / hybrid 由组件注册 Newton stepper。完整字段见
-[configs/isaacsim_world.toml](configs/isaacsim_world.toml)，各模式的用法见
+`update()` 只刷新渲染。direct / hybrid 由组件注册 Newton stepper。完整字段见上述模块中的
+`IsaacsimWorldConfig`，各模式的用法见
 [物理求解器验证文档](docs/physic_solver.md#12-世界模式)。
 
 固定相机写在 `[[scene.cameras]]`，机载相机写在 `[[robot.cameras]]`：每项含唯一 `name`、`prim_path`、
@@ -188,4 +188,6 @@ uv build                                                        # 产物：dist/
 
 相对路径的 USD 按工作区根解析（源码树、`RSR_REPO_ROOT`，或当前目录上的 `assets/` + `configs/`）。
 
-物理求解器任务新增 [包裹 V7–V10 矩阵、摇晃／附着对照及螺纹装配](docs/physic_solver.md#9-package-v7v10-迁移矩阵与摇晃附着对照)。求解器图表整理见 [物理引擎与求解器](docs/physics_engines.md)。
+物理求解器任务包含 [package01–08 抓取矩阵、摇晃／附着对照及螺纹装配](docs/physic_solver.md#1-任务与统一分类)。
+本轮640×480重新采集及验收已完成：[带算法标签的抓取总片](outputs/physic_solver/grasp_all_comparison_labeled.mp4) · [分类视频与结果](docs/physic_solver.md#7-视频拼接)。
+求解器图表整理见 [物理引擎与求解器](docs/physics_engines.md)。

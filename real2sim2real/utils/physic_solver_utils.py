@@ -13,6 +13,89 @@ from typing import Any
 
 import numpy as np
 
+# Canonical filenames: robot solver / contact solver / object / experiment variant.
+# Historical keys identify prior experiments only; configurations and outputs use the values.
+PHYSIC_SOLVER_CASE_NAMES = {
+    "featherstone_vbd_pickplace_cloth": "featherstone_vbd_cloth01_baseline",
+    "mujoco_vbd_pickplace_cloth": "mujoco_vbd_cloth02_baseline",
+    "xpbd_vbd_pickplace_cloth": "xpbd_vbd_cloth02_baseline",
+    "tgs_vbd_pickplace_cloth": "tgs_vbd_cloth02_baseline",
+    "tgs_tgs_pickplace_rigid": "tgs_tgs_rigid01_baseline",
+    "mujoco_vbd_pickplace_package": "mujoco_vbd_package01_center_native",
+    "featherstone_vbd_pickplace_package": "featherstone_vbd_package01_center_control",
+    "xpbd_xpbd_pickplace_cloth": "xpbd_xpbd_cloth02_baseline_control",
+    "v7_center": "mujoco_vbd_package01_center_pads",
+    "v8_offset_x35": "mujoco_vbd_package01_pos_x35mm",
+    "v8_offset_y55": "mujoco_vbd_package01_pos_y55mm",
+    "v8_yaw45": "mujoco_vbd_package01_pos_x35mm_yaw45deg",
+    "v8_yaw90": "mujoco_vbd_package01_pos_y175mm_yaw90deg_twoway",
+    "v8_offset_tilt10": "mujoco_vbd_package01_pos_x35mm_yaw30deg_pitch10deg",
+    "v9_mass100g": "mujoco_vbd_package01_mass100g_pos_x35mm",
+    "v9_mass200g": "mujoco_vbd_package01_mass200g_pos_x35mm",
+    "v9_mass350g": "mujoco_vbd_package01_mass350g_pos_x35mm",
+    "v9_mass500g": "mujoco_vbd_package01_mass500g_pos_x35mm",
+    "v10_station_clothing": "mujoco_vbd_package02_center",
+    "v10_station_green": "mujoco_vbd_package03_center",
+    "v10_pink_tshirt": "mujoco_vbd_package04_center",
+    "v10_frosted_top": "mujoco_vbd_package05_center",
+    "v10_black_hoodie": "mujoco_vbd_package06_center",
+    "v10_box01": "mujoco_mujoco_package07_center",
+    "v10_box02": "mujoco_mujoco_package08_center",
+    "shake_none": "mujoco_vbd_package01_pos_x35mm_shake_noattach",
+    "shake_spring": "mujoco_vbd_package01_center_shake_spring",
+    "shake_spring_x35": "mujoco_vbd_package01_pos_x35mm_shake_spring",
+    "mujoco_hydroelastic_screw": "mujoco_hydroelastic_screw01_rotate",
+    "mujoco_hydroelastic_screw_debug": "mujoco_hydroelastic_screw01_rotate_debug",
+}
+
+PHYSIC_SOLVER_CASE_GROUPS = {
+    "solver": (
+        "tgs_tgs_pickplace_rigid",
+        "featherstone_vbd_pickplace_cloth",
+        "tgs_vbd_pickplace_cloth",
+        "mujoco_vbd_pickplace_cloth",
+        "xpbd_vbd_pickplace_cloth",
+        "mujoco_vbd_pickplace_package",
+    ),
+    "positions": (
+        "v7_center",
+        "v8_offset_x35",
+        "v8_offset_y55",
+        "v8_yaw45",
+        "v8_yaw90",
+        "v8_offset_tilt10",
+    ),
+    "weights": ("v9_mass100g", "v9_mass200g", "v9_mass350g", "v9_mass500g"),
+    "types": (
+        "v10_station_clothing",
+        "v10_station_green",
+        "v10_pink_tshirt",
+        "v10_frosted_top",
+        "v10_black_hoodie",
+    ),
+    "shake_cartons": (
+        "shake_none",
+        "shake_spring",
+        "shake_spring_x35",
+        "v10_box01",
+        "v10_box02",
+    ),
+    "controls": ("featherstone_vbd_pickplace_package", "xpbd_xpbd_pickplace_cloth"),
+    "assembly": ("mujoco_hydroelastic_screw",),
+}
+
+PHYSIC_SOLVER_PACKAGE_CASES = tuple(
+    PHYSIC_SOLVER_CASE_NAMES[key]
+    for group in ("positions", "weights", "types", "shake_cartons")
+    for key in PHYSIC_SOLVER_CASE_GROUPS[group]
+    if key not in {"v10_box01", "v10_box02"}
+)
+
+
+def physic_solver_case_name(key: str) -> str:
+    """Resolve an experiment identifier to its canonical flat config/output stem."""
+    return PHYSIC_SOLVER_CASE_NAMES.get(key, key)
+
 
 def proxy_pose_errors(source: np.ndarray, proxy: np.ndarray) -> tuple[float, float]:
     """Measure maximum proxy position/rotation error, accepting antipodal quaternions."""

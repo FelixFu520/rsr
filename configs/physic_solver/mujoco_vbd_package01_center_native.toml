@@ -1,0 +1,132 @@
+# mujoco_vbd_package01_center_native
+# 统一分类：机器人求解器_接触求解器_物体_工况；采集640×480。
+# 历史工况：mujoco_vbd_pickplace_package。物理参数和原验收门限保持。
+[sim_world]
+backend = "isaacsim"
+physics_engine = "newton"
+newton_execution = "direct"
+newton_solver = "mujoco"
+newton_substeps = 32
+newton_iterations = 28
+newton_use_cuda_graph = true
+physics_dt = 0.016666666666666666
+rendering_dt = 0.06666666666666667
+gravity = [ 0.0, 0.0, -9.81,]
+device = "cuda:0"
+headless = true
+renderer = "RayTracedLighting"
+width = 640
+height = 480
+rt_subframes = 16
+samples_per_pixel_per_frame = 64
+warmup_frames = 2
+fast_shutdown = true
+background_usd_path = "assets/PhysicSolver/Isaac/Environments/Simple_Warehouse/warehouse_multiple_shelves.usd"
+background_prim_path = "/World/background"
+background_offset = [ -4.0, 0.0, 0.0,]
+background_gravity = false
+background_skip_metrics_assembler = true
+background_light_scale = 0.25
+
+[scene]
+backend = "pickplace_package"
+object_kind = "cloth"
+table_usd_path = "assets/PhysicSolver/Table/Aligned.usd"
+cloth_usd_path = "assets/PhysicSolver/Package/v7/parcel_two_mesh.usd"
+prim_path = "/World/scene"
+table_scale = [ 1.3333333333333333, 0.8, 1.0,]
+table_xy = [ 0.0, 0.0,]
+target_xy = [ 0.1, 0.0,]
+robot_base_xy = [ -0.34, 0.0,]
+fill_light_intensity = 162.5
+key_light_intensity = 550.0
+[[scene.cameras]]
+name = "overview"
+prim_path = "/World/scene/overview_cam"
+pose_relative_to = "/World/scene"
+resolution = [ 640, 480,]
+clipping_range = [ 0.1, 80.0,]
+focal_length = 18.0
+horizontal_aperture = 20.955
+
+[scene.cameras.pose]
+position = [ 1.8, 1.65, 1.85,]
+orientation_wxyz = [ 0.3303108012, 0.2302877772, 0.5234982467, 0.7508740906,]
+
+[robot]
+backend = "franka_newton"
+urdf_path = "assets/PhysicSolver/Robot/franka_emika_panda/urdf/fr3_franka_hand.urdf"
+prim_path = "/World/robots/Franka"
+base_position = [ -0.34, 0.0, 0.732389,]
+base_orientation = [ 1.0, 0.0, 0.0, 0.0,]
+initial_joint_positions = [ 0.25170404978157035, -0.1184279068250914, -0.2555039685382504, -2.5736421069082596, -0.04732516092530855, 2.4584764036614417, -0.7507677830517485, 0.04, 0.04,]
+control_mode = "position"
+arm_stiffness = 6000.0
+arm_damping = 300.0
+finger_stiffness = 1600.0
+finger_damping = 40.0
+finger_max_force = 60.0
+finger_friction = 1.4
+[[robot.cameras]]
+name = "wrist"
+prim_path = "/World/robots/Franka/fr3_link7/wrist_cam"
+pose_relative_to = "/World/robots/Franka/fr3_link7"
+resolution = [ 640, 480,]
+clipping_range = [ 0.002, 20.0,]
+focal_length = 8.0
+horizontal_aperture = 20.955
+
+[robot.cameras.pose]
+position = [ 0.06, 0.0, 0.175,]
+orientation_wxyz = [ 0.2340572529, -0.6672459834, 0.6672459834, -0.2340572529,]
+
+[planner]
+backend = "pickplace_package"
+cloth_solver = "vbd"
+full_surface_contacts = true
+contact_sdf_resolution = 64
+contact_stiffness = 20000.0
+contact_damping = 30.0
+shape_contact_stiffness = 20000.0
+shape_contact_damping = 30.0
+shape_contact_friction = 1.4
+cloth_friction = 1.4
+table_friction = 0.5
+self_contact_buffer = 512
+friction_epsilon_m_s = 0.001
+open_finger_m = 0.04
+closed_finger_m = 0.0025
+grasp_height_m = 0.022
+grasp_offset_m = [ 0.0, 0.0, 0.0,]
+approach_s = 0.8
+descend_s = 1.0
+close_s = 1.5
+lift_s = 3.0
+transfer_s = 2.0
+lower_s = 1.0
+release_s = 1.0
+retract_s = 1.0
+rest_s = 1.0
+lift_height_m = 0.3
+place_offset_m = [ 0.0, -0.12, 0.0,]
+align_place_to_com = true
+place_height_m = 0.2
+minimum_lift_m = 0.08
+minimum_release_drop_m = 0.01
+maximum_table_penetration_m = 0.0015
+maximum_place_error_m = 0.08
+
+[job]
+backend = "pickplace_cloth"
+output_dir = "outputs/physic_solver/mujoco_vbd_package01_center_native"
+max_steps = 6000
+timeout_s = 7200
+inspect_gui = false
+
+[job.recorder]
+save_failed_episodes = true
+format = "lerobot_v3"
+fps = 15
+width = 640
+height = 480
+task = "mujoco_vbd_package01_center_native"

@@ -1,0 +1,89 @@
+# mujoco_hydroelastic_screw01_rotate
+# 统一分类：机器人求解器_接触求解器_物体_工况；采集640×480。
+# 历史工况：mujoco_hydroelastic_screw。物理参数和原验收门限保持。
+[sim_world]
+backend = "isaacsim"
+physics_engine = "newton"
+newton_execution = "direct"
+newton_solver = "mujoco"
+physics_dt = 0.008333333333333333
+newton_substeps = 4
+newton_use_cuda_graph = true
+device = "cuda:0"
+headless = true
+renderer = "RayTracedLighting"
+width = 640
+height = 480
+rt_subframes = 4
+warmup_frames = 2
+
+[scene]
+backend = "screw_assembly"
+object_kind = "screw"
+bolt_mesh_path = "assets/PhysicSolver/Screw/M20/bolt.obj"
+nut_mesh_path = "assets/PhysicSolver/Screw/M20/nut.obj"
+thread_pitch_m = 0.0025
+initial_engagement_m = 0.004
+target_xy = [ 0.1, 0.0,]
+fill_light_intensity = 200
+key_light_intensity = 700
+[[scene.cameras]]
+name = "assembly"
+prim_path = "/World/scene/assembly_cam"
+pose_relative_to = "/World/scene"
+resolution = [ 640, 480,]
+clipping_range = [ 0.001, 10.0,]
+focal_length = 24.0
+
+[scene.cameras.pose]
+position = [ 0.32, -0.3, 0.98,]
+orientation_wxyz = [ 0.8105592224104327, 0.49618166521269963, 0.16243522800156318, 0.26535315859478176,]
+[[scene.cameras]]
+name = "threads"
+prim_path = "/World/scene/threads_cam"
+pose_relative_to = "/World/scene"
+resolution = [ 640, 480,]
+clipping_range = [ 0.001, 10.0,]
+focal_length = 24.0
+
+[scene.cameras.pose]
+position = [ 0.19, -0.12, 0.82,]
+orientation_wxyz = [ 0.7696119117500566, 0.5547048812588754, 0.1849016270862918, 0.2565373039166855,]
+
+[robot]
+backend = "screw_spindle"
+axial_stiffness_n_m = 200.0
+axial_damping_n_s_m = 8.0
+axial_preload_target_m = -0.04
+spindle_damping_nm_s_rad = 0.02
+maximum_torque_nm = 0.3
+carriage_mass_kg = 0.05
+
+[planner]
+backend = "screw_assembly"
+sdf_resolution = 128
+hydroelastic_stiffness = 100000000000.0
+friction = 0.01
+contact_capacity = 40000
+spindle_speed_rad_s = -3.0
+engage_s = 1.0
+screw_s = 7.0
+hold_s = 1.0
+minimum_turns = 2.0
+minimum_advance_m = 0.006
+maximum_pitch_error_fraction = 0.25
+maximum_hold_drift_m = 0.001
+
+[job]
+backend = "screw_assembly"
+output_dir = "outputs/physic_solver/mujoco_hydroelastic_screw01_rotate"
+timeout_s = 7200
+max_steps = 2000
+record_rgb = true
+
+[job.recorder]
+fps = 15
+width = 640
+height = 480
+save_failed_episodes = true
+task = "mujoco_hydroelastic_screw01_rotate"

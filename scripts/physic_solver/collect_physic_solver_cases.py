@@ -26,20 +26,19 @@ from pathlib import Path
 
 from real2sim2real.core.logger import get_logger
 from real2sim2real.utils.lerobot_v3 import validate_dataset
+from real2sim2real.utils.physic_solver_utils import (
+    PHYSIC_SOLVER_CASE_GROUPS,
+    physic_solver_case_name,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIGS = ROOT / "configs/physic_solver"
 OUTPUTS = ROOT / "outputs/physic_solver"
 DEBUG = ROOT / "outputs/debug/physic_solver"
-CASES = (
-    "featherstone_vbd_pickplace_cloth",
-    "mujoco_vbd_pickplace_cloth",
-    "xpbd_vbd_pickplace_cloth",
-    "tgs_vbd_pickplace_cloth",
-    "tgs_tgs_pickplace_rigid",
-    "mujoco_vbd_pickplace_package",
-    "featherstone_vbd_pickplace_package",
-    "xpbd_xpbd_pickplace_cloth",
+CASES = tuple(
+    physic_solver_case_name(key)
+    for group in ("solver", "controls")
+    for key in PHYSIC_SOLVER_CASE_GROUPS[group]
 )
 
 

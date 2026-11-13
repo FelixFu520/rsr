@@ -175,7 +175,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "output",
         nargs="?",
-        default="outputs/physic_solver/mujoco_vbd_pickplace_package",
+        default="outputs/physic_solver/mujoco_vbd_package01_center_native",
         type=Path,
     )
     audit(parser.parse_args().output)

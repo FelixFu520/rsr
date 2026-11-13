@@ -21,9 +21,13 @@ from real2sim2real.planner.base import AutoPlanner
 from real2sim2real.robot.base import AutoRobot
 from real2sim2real.scene.base import AutoScene
 from real2sim2real.simworld.isaacsim import IsaacsimWorldConfig
+from real2sim2real.utils.physic_solver_utils import (
+    PHYSIC_SOLVER_PACKAGE_CASES,
+    physic_solver_case_name,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
-CONFIGS = ROOT / "configs/physic_solver/package_cases"
+CONFIGS = ROOT / "configs/physic_solver"
 
 
 class PackageBatchPhysicsJob(PhysicSolverJob):
@@ -326,7 +330,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--worker", action="store_true")
     args = parser.parse_args()
-    names = args.cases or [path.stem for path in sorted(CONFIGS.glob("*.toml"))]
+    names = [physic_solver_case_name(name) for name in args.cases or PHYSIC_SOLVER_PACKAGE_CASES]
     paths = [CONFIGS / f"{name}.toml" for name in names]
     output = args.output or ROOT / "outputs/debug/physic_solver/package_batches" / datetime.now(
         UTC

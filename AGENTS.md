@@ -50,6 +50,7 @@
 - 资产：每个任务只引用自己资产目录里的文件（含 USD 依赖、MDL 与贴图），可以单独打包发给别人；
   任务之间共用的资产各自复制一份。不属于任何任务的资产放 `assets/bak/`，任务配置和运行代码不引用它
   （资产准备脚本可以从这里复制）。
+- `physic_solver` 配置全部平铺在 `configs/physic_solver/`；文件名为 `<机器人求解器>_<接触求解器>_<物体ID>_<工况>.toml`，输出文件夹与配置文件 stem 一致，不再设置 `package_cases/` 子目录。
 - 任务之间可以继承（分拣复用物理求解器任务的 `PackageScene` / `PackageRuntime` / `PhysicSolverJob`），
   不要复制代码。
 - 包内模块顶层不导入 Kit / pxr / Newton / Warp；Warp kernel 和依赖 Newton 的子类在首次使用时定义
@@ -153,7 +154,7 @@ Entry point 组名以 `pyproject.toml` / `core/registry.py` 为准，勿自创�
 - stub 示例：`./app/python.sh -m real2sim2real.core.cli collect run`
 - 指定配置：`./app/python.sh -m real2sim2real.core.cli collect run -c settings.toml`
 - 任务入口：
-  - 物理求解器验证：`./app/python.sh scripts/physic_solver/collect_physic_solver_cases.py`
+  - 物理求解器验证：`./app/python.sh scripts/physic_solver/recapture_physic_solver.py`
   - 分拣包裹：`./scripts/sorting/run_sorting_showcase.sh outputs/sorting`（内部调用 `rsr collect render-sorting`）
   - 机器狗巡检：`./scripts/rsr collect run -c configs/fire_inspection/x30_physx_warehouse.toml`
 

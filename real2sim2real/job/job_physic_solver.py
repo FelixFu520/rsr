@@ -43,7 +43,7 @@ class PhysicSolverRecorderConfig(BaseModel):
 class PhysicSolverJobConfig(BaseConfig):
     """Finite task execution and accepted dataset destination."""
 
-    output_dir: str = "outputs/physic_solver/featherstone_vbd_pickplace_cloth"
+    output_dir: str = "outputs/physic_solver/featherstone_vbd_cloth01_baseline"
     max_steps: int = Field(default=6000, gt=0)
     timeout_s: float = Field(
         default=1800, gt=0, description="Wall-clock limit for the loop, including RGB capture."
@@ -331,7 +331,7 @@ class ScrewJobConfig(PhysicSolverJobConfig):
     """Screw assembly output and optional physics-only diagnostics."""
 
     backend: str = "screw_assembly"
-    output_dir: str = "outputs/physic_solver/screw_assembly"
+    output_dir: str = "outputs/physic_solver/mujoco_hydroelastic_screw01_rotate"
     record_rgb: bool = True
 
 
@@ -472,7 +472,7 @@ class CartonJobConfig(ScrewJobConfig):
     """Rigid V10 carton demonstration using the same finite assembly recording loop."""
 
     backend: str = "pickplace_carton"
-    output_dir: str = "outputs/physic_solver/v10_box01"
+    output_dir: str = "outputs/physic_solver/mujoco_mujoco_package07_center"
 
 
 class CartonJob(ScrewJob):

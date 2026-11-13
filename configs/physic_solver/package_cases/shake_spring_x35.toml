@@ -1,8 +1,0 @@
-# 与shake_none保持同一X35抓点、动作及求解精度，仅开启外袋有限弹簧辅助。
-inherit = "shake_spring.toml"
-
-[planner]
-grasp_offset_m = "@reset [0.035, 0, 0]"
-
-[job]
-output_dir = "outputs/physic_solver/package_cases/shake_spring_x35"

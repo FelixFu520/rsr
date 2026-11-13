@@ -1,4 +1,0 @@
-inherit = "mujoco_hydroelastic_screw.toml"
-[job]
-output_dir = "outputs/debug/physic_solver/screw_assembly"
-record_rgb = false

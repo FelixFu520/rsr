@@ -16,7 +16,7 @@ backend = "stub"  # 不启动 Kit
 backend = "stub"
 # pickplace_cloth / pickplace_rigid 支持 [[scene.cameras]] 固定相机列表。
 # 每项含 name、prim_path、pose_relative_to、pose、resolution 和可选镜头参数。
-# 示例见 configs/physic_solver/featherstone_vbd_pickplace_cloth.toml。
+# 示例见 configs/physic_solver/featherstone_vbd_cloth01_baseline.toml。
 # newton_cloth_franka 使用 newton_official/unisex_shirt.usd 和未经压扁的官方布局。
 # cloth_base_color=[0.16,0.20,0.65]、cloth_roughness=0.92、cloth_specular=0.02。
 # pickplace 系列场景：fill_light_intensity=650、key_light_intensity=2200。
