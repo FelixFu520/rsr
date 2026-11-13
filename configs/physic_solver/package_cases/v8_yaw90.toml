@@ -1,0 +1,35 @@
+# 源V7长夹垫从Y侧边缘夹取；计划夹垫下缘约4.5mm，有限力双向反馈。
+inherit = "v8_offset_x35.toml"
+
+[sim_world]
+newton_iterations = 40
+
+[robot]
+backend = "franka_package_pads"
+arm_stiffness = 12000
+arm_damping = 450
+finger_stiffness = 6000
+finger_damping = 60
+
+[planner]
+prepare_initial_pose = true
+rigid_soft_coupling = "proxy"
+proxy_mass_scale = 100.0
+grip_preload_n = 0.0
+grasp_offset_m = "@reset [0, 0.175, 0]"
+grasp_yaw_deg = 90
+grasp_height_m = 0.0595
+closed_finger_m = 0.0
+gripper_close_ramp_s = 0.6
+gripper_open_ramp_s = 0.5
+lift_height_m = 0.45
+lift_s = 4.5
+lower_s = 3.0
+place_height_m = 0.50
+align_place_to_com = true
+release_compensation_xy_m = [0.0, -0.20]
+realign_before_release = false
+
+[job]
+output_dir = "outputs/physic_solver/package_cases/v8_yaw90"
+timeout_s = 7200

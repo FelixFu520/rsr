@@ -1,0 +1,22 @@
+# 复用源V10宽夹垫；按当前Franka实测高度关系换算，各款独立验收。
+inherit = "../package_matrix_base.toml"
+
+[scene]
+cloth_usd_path = "assets/PhysicSolver/Package/v10/pink_tshirt/parcel_two_mesh.usd"
+
+[robot]
+backend = "franka_package_pads"
+
+[planner]
+grasp_offset_m = "@reset [0, 0, 0]"
+grasp_height_m = 0.0650  # 源10mm夹垫底高度 + 当前实测约55mm的配置TCP至夹垫底差。
+closed_finger_m = 0.0035  # 7mm净夹缝介于源初始8mm与保持6mm之间，避免过度补夹。
+gripper_close_ramp_s = 0.6
+gripper_open_ramp_s = 0.5  # 宽夹垫候选采用平滑释放，降低薄包裹被开指带出的风险。
+hold_s = 0.0
+transfer_s = 2.0
+lower_s = 1.5
+place_height_m = 0.25
+
+[job]
+output_dir = "outputs/physic_solver/package_cases/v10_pink_tshirt"

@@ -1,0 +1,5 @@
+# 包裹迁移独立工况；质量指内容物，袋膜另计；spring 为显式辅助。
+inherit = "../package_matrix_base.toml"
+
+[job]
+output_dir = "outputs/physic_solver/package_cases/v7_center"

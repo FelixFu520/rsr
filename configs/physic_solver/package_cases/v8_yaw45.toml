@@ -1,0 +1,25 @@
+# 包裹迁移独立工况；质量指内容物，袋膜另计；spring 为显式辅助。
+inherit = "../package_matrix_base.toml"
+
+[sim_world]
+newton_iterations = 40  # 对困难姿态做求解精度加密；其他工况仍为28迭代。
+
+[robot]
+backend = "franka_newton"
+
+[planner]
+prepare_initial_pose = true
+grasp_offset_m = "@reset [0.035, 0, 0]"  # 保持45°；中央抓点提升时反复拉伸超限，沿X优化35mm。
+grasp_yaw_deg = 45
+grasp_pitch_deg = 0
+grasp_height_m = 0.028  # 22mm抓高在45°闭合初段拉伸超限；仅提高6mm复测。
+closed_finger_m = 0.0065  # 保留28mm抓高和平滑闭合；将夹缝由10增至13mm，减小局部挤压。
+gripper_close_ramp_s = 0.6  # 原阶跃在夹紧初段超限；保持28mm抓高，单独检查闭合速度。
+hold_s = 0.0
+transfer_s = 2.0
+lower_s = 1.5  # X35已完成提升与转运，下放减速时拉伸超限；仅放慢下放复测。
+place_height_m = 0.20
+
+[job]
+output_dir = "outputs/physic_solver/package_cases/v8_yaw45"
+timeout_s = 7200.0  # 40迭代的完整物理与双相机采集预算。

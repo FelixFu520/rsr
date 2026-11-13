@@ -1,4 +1,4 @@
-"""物理求解器验证任务的全部 Planner：衣服 / 刚体方块 / V7 包裹抓放与 Newton 运行时。
+"""物理求解器任务的全部 Planner：衣服、方块、包裹、纸箱与螺纹装配运行时。
 
 本文件按依赖顺序包含：
 
@@ -9,6 +9,8 @@
    雅可比伪逆控制。
 4. ``pickplace_package``：``PackagePlanner`` / ``PackageRuntime``，V7 袋膜与衣物双网格抓放；
    分拣任务的 ``SortingRuntime`` 继承 ``PackageRuntime``。
+5. ``screw_assembly``：真实螺纹的 hydroelastic 接触与连续主轴控制。
+6. ``pickplace_carton``：原尺寸 V10 纸箱的双向刚体抓放。
 
 调用流程：Job 绑定 scene/robot → ``begin_episode`` 创建 runtime → ``on_physics_step`` 生成
 阶段目标 → ``runtime.command`` 求 IK/设置关节目标 → ``IsaacsimWorld.step`` 调用 ``runtime.step``
@@ -31,9 +33,16 @@ from real2sim2real.core.config import BaseConfig
 from real2sim2real.planner.base import BasePlanner
 from real2sim2real.utils.asset_utils import resolve_usd_path
 from real2sim2real.utils.physic_solver_utils import (
+    JawSpringAssistance,
     KinematicVBDStepper,
+    VBDSubstepGraph,
     check_package_containment,
+    contact_maximum_kernel,
     moving_frame_vbd_class,
+    package_finger_reference,
+    package_gripper_activation,
+    proxy_pose_maximum_kernel,
+    shake_displacement,
 )
 
 # ================================================================================================
@@ -521,7 +530,7 @@ class NewtonClothRuntime:
         self.target_q[-2:] = finger * self.scale
         self.control.joint_target_q.assign(self.target_q)
 
-    def step(self, frame_dt: float) -> None:
+    def step(self, frame_dt: float, *, publish: bool = True) -> None:
         """Advance all Newton substeps once and publish the resulting visual geometry."""
         substeps = self.config.newton_substeps
         proxy = None if self.pure_newton else self.robot.collider_transforms().copy()
@@ -547,7 +556,8 @@ class NewtonClothRuntime:
             self.state_1 = self.kinematic_stepper.state_1
             self._last_proxy = proxy
             self.sim_time += frame_dt
-            self._publish()
+            if publish:
+                self._publish()
             return
         if self.direct_use_graph and self.direct_warmed:
             if self.direct_graph is None:
@@ -559,7 +569,8 @@ class NewtonClothRuntime:
             self._advance_direct(frame_dt)
             self.direct_warmed = True
         self.sim_time += frame_dt
-        self._publish()
+        if publish:
+            self._publish()
 
     def _advance_direct(self, frame_dt: float) -> None:
         """Run a capture-compatible fixed number of shared-model substeps."""
@@ -1524,6 +1535,11 @@ class PackagePlannerConfig(OfficialClothPlannerConfig):
     """Metre-based V7 materials are read from USD; these fields control the robot."""
 
     backend: str = "pickplace_package"
+    mujoco_cpu: bool = False
+    rigid_soft_coupling: Literal["one_way", "proxy"] = "one_way"
+    proxy_mass_scale: FiniteFloat = Field(default=1.0, gt=0)
+    grip_preload_n: FiniteFloat = Field(default=0.0, ge=0)
+    particle_tile_solve: bool = True
     full_surface_contacts: bool = True
     contact_stiffness: float = Field(default=20000.0, gt=0)
     contact_damping: float = Field(default=30.0, ge=0)
@@ -1543,6 +1559,7 @@ class PackagePlannerConfig(OfficialClothPlannerConfig):
     lift_height_m: float = Field(default=0.18, gt=0)
     place_offset_m: tuple[float, float, float] = (0.0, -0.12, 0.0)
     place_height_m: float = Field(default=0.17, gt=0)
+    soft_contact_capacity: int = Field(default=16384, ge=16384)
     self_contact_buffer: int = Field(default=512, ge=32)
     self_contact_gap_m: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     friction_epsilon_m_s: float = Field(default=0.001, gt=0)
@@ -1557,6 +1574,42 @@ class PackagePlannerConfig(OfficialClothPlannerConfig):
     retract_s: float = Field(default=1.0, gt=0)
     rest_s: float = Field(default=1.5, gt=0)
     align_place_to_com: bool = False
+    release_compensation_xy_m: tuple[FiniteFloat, FiniteFloat] = (0.0, 0.0)
+    hold_s: FiniteFloat = Field(default=0.0, ge=0)
+    post_shake_hold_s: FiniteFloat = Field(default=0.0, ge=0)
+    realign_before_release: bool = False
+    grasp_yaw_deg: FiniteFloat = 0.0
+    grasp_pitch_deg: FiniteFloat = 0.0
+    shake_s: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    shake_frequency_hz: float = Field(default=1.5, gt=0, allow_inf_nan=False)
+    shake_translation_m: tuple[FiniteFloat, FiniteFloat, FiniteFloat] = (0.015, 0.01, 0.008)
+    shake_yaw_deg: FiniteFloat = 12.0
+    shake_pitch_deg: FiniteFloat = 6.0
+    attachment_mode: Literal["none", "spring"] = "none"
+    attachment_vertices_per_group: int = Field(default=8, ge=3, le=32)
+    attachment_capture_distance_m: float = Field(default=0.004, gt=0, le=0.005)
+    attachment_stiffness_n_m: FiniteFloat = Field(default=30.0, gt=0)
+    attachment_damping_n_s_m: FiniteFloat = Field(default=0.015, ge=0)
+    attachment_max_force_n: FiniteFloat = Field(default=0.5, gt=0)
+    gripper_close_ramp_s: FiniteFloat = Field(default=0.0, ge=0)
+    gripper_open_ramp_s: FiniteFloat = Field(default=0.0, ge=0)
+    prepare_initial_pose: bool = False
+
+    @model_validator(mode="after")
+    def _validate_gripper_ramps(self) -> PackagePlannerConfig:
+        if self.gripper_close_ramp_s > self.close_s or self.gripper_open_ramp_s > self.release_s:
+            raise ValueError("Gripper ramps must fit inside their close/release phases")
+        if self.rigid_soft_coupling == "proxy" and (
+            not self.mujoco_cpu or self.attachment_mode != "none"
+        ):
+            raise ValueError("Proxy coupling requires native CPU MuJoCo and no jaw assistance")
+        if self.grip_preload_n and self.rigid_soft_coupling != "proxy":
+            raise ValueError("Closing force preload requires two-way proxy coupling")
+        if any(self.release_compensation_xy_m) and not (
+            self.align_place_to_com or self.realign_before_release
+        ):
+            raise ValueError("Release compensation requires measured COM placement alignment")
+        return self
 
 
 class PackageRuntime(OfficialClothRuntime):
@@ -1572,6 +1625,15 @@ class PackageRuntime(OfficialClothRuntime):
             raise ValueError("Package requires direct Newton Featherstone or MuJoCo")
         if robot.config.control_mode != mode or config.cloth_solver != "vbd":
             raise ValueError(f"Package {solver} requires {mode} control and VBD")
+        if config.mujoco_cpu and solver != "mujoco":
+            raise ValueError("Package native CPU rigid execution requires MuJoCo")
+        if config.grip_preload_n and config.grip_preload_n > robot.config.finger_max_force:
+            raise ValueError("Closing preload must fit inside the finger's real force limit")
+        if (
+            config.rigid_soft_coupling == "proxy"
+            and type(self)._advance_direct is not PackageRuntime._advance_direct
+        ):
+            raise ValueError("Proxy coupling requires the package runtime's own stepper")
         # Preserve authored bending rest angles; the shirt profile flattens them.
         NewtonClothRuntime.__init__(self, robot, scene, config)
         self.model.shape_material_ke.fill_(config.shape_contact_stiffness)
@@ -1584,6 +1646,246 @@ class PackageRuntime(OfficialClothRuntime):
             )
         )
         self.model.shape_margin.fill_(0.0002)
+        self.coupled_solver = None
+        if config.rigid_soft_coupling == "proxy":
+            self._create_proxy_coupling()
+        self._package_cpu_batch = (
+            config.mujoco_cpu
+            and self.coupled_solver is None
+            and type(self)._advance_direct is PackageRuntime._advance_direct
+        )
+        self.jaw_assistance = None
+        if config.attachment_mode == "spring":
+            self.jaw_assistance = JawSpringAssistance(self.model, config)
+            self.cloth_solver.jaw_assistance = self.jaw_assistance
+
+    def _create_proxy_coupling(self) -> None:
+        """Use Newton's native two-way body feedback without VBD articulation proxies."""
+        from newton.solvers import SolverMuJoCo
+        from newton.solvers.experimental.coupled import SolverCoupledProxy
+
+        config = self.config
+
+        def soft_solver(view: Any) -> Any:
+            return moving_frame_vbd_class()(
+                view,
+                iterations=config.solver_iterations,
+                rigid_compliant_alm=True,
+                particle_enable_self_contact=True,
+                particle_enable_tile_solve=config.particle_tile_solve,
+                particle_self_contact_margin=0.0016,
+                particle_self_contact_gap=(
+                    self.scene.package_parameters["self_gap"]
+                    if config.self_contact_gap_m is None
+                    else config.self_contact_gap_m
+                ),
+                particle_topological_contact_filter_threshold=2,
+                particle_vertex_contact_buffer_size=config.self_contact_buffer,
+                particle_edge_contact_buffer_size=config.self_contact_buffer,
+                rigid_body_particle_contact_buffer_size=config.soft_contact_capacity,
+                friction_epsilon=config.friction_epsilon_m_s,
+            )
+
+        def pipeline(view: Any) -> Any:
+            return self.newton.CollisionPipeline(
+                view,
+                soft_contact_gap=0.004,
+                soft_contact_max=config.soft_contact_capacity,
+                enable_rigid_soft_full_surface_contact=True,
+                deterministic=True,
+            )
+
+        bodies = list(range(self.model.body_count))
+        source_properties = {
+            name: getattr(self.model, name).numpy().copy()
+            for name in ("body_mass", "body_inertia", "particle_mass")
+        }
+        self.coupled_solver = SolverCoupledProxy(
+            model=self.model,
+            entries=[
+                SolverCoupledProxy.Entry(
+                    name="mjc",
+                    solver=lambda view: SolverMuJoCo(
+                        view,
+                        solver="newton",
+                        integrator="implicitfast",
+                        iterations=100,
+                        use_mujoco_cpu=True,
+                        use_mujoco_contacts=False,
+                        disable_contacts=True,
+                        update_data_interval=0,
+                    ),
+                    bodies=bodies,
+                    joints=list(range(self.model.joint_count)),
+                ),
+                SolverCoupledProxy.Entry(
+                    name="vbd",
+                    solver=soft_solver,
+                    particles=list(range(self.model.particle_count)),
+                ),
+            ],
+            coupling=SolverCoupledProxy.Config(
+                proxies=[
+                    SolverCoupledProxy.Proxy(
+                        source="mjc",
+                        destination="vbd",
+                        bodies=bodies,
+                        mass_scale=config.proxy_mass_scale,
+                        mode="lagged",
+                        collision_pipeline=pipeline,
+                        collide_interval=1,
+                    )
+                ],
+                iterations=1,
+            ),
+        )
+        self.cloth_solver = self.coupled_solver.solver("vbd")
+        self.rigid_solver = self.coupled_solver.solver("mjc")
+        if config.grip_preload_n:
+            model = self.rigid_solver.mj_model
+            reference = config.closed_finger_m - (
+                config.grip_preload_n / self.robot.config.finger_stiffness
+            )
+            if not np.allclose(model.actuator_gainprm[-2:, 0], self.robot.config.finger_stiffness):
+                raise RuntimeError("Preload requires the configured native finger actuator gains")
+            limited = model.actuator_ctrllimited[-2:]
+            if np.any(limited & (model.actuator_ctrlrange[-2:, 0] > reference)):
+                raise RuntimeError(
+                    "Native actuator input range clips the closing preload reference"
+                )
+        self.coupled_solver.reset(self.state_0)
+        # reset clears transient output buffers; initialize the observable entry input too.
+        self.coupled_solver.sync_entry_states(self.state_0)
+        # Initialize the t=0 actuator observation with the actual initial controller targets.
+        self.rigid_solver._apply_mjc_control(
+            self.rigid_solver.model, self.state_0, self.control, self.rigid_solver.mj_data
+        )
+        self.rigid_solver._mujoco.mj_forward(self.rigid_solver.mj_model, self.rigid_solver.mj_data)
+        for name, original in source_properties.items():
+            if not np.array_equal(getattr(self.model, name).numpy(), original):
+                raise RuntimeError(f"Proxy coupling changed the source {name}")
+        if list(self.coupled_solver.view("vbd").body_label) != list(self.model.body_label):
+            raise RuntimeError("Proxy geometry audit requires identical source/body index order")
+        self.proxy_maximum_errors = self.wp.zeros(2, dtype=float, device=self.model.device)
+        self.maximum_source_efforts = np.abs(self.rigid_solver.mj_data.qfrc_actuator).copy()
+        self.proxy_error_kernel = proxy_pose_maximum_kernel()
+        if config.newton_use_cuda_graph and self.model.device.is_cuda:
+            self.cloth_solver.step = VBDSubstepGraph(self.cloth_solver)
+        # CPU feedback must be consumed at every substep; only VBD can be captured.
+        self.direct_use_graph = False
+
+    def _create_mujoco_solver(self) -> Any:
+        if not self.config.mujoco_cpu:
+            return super()._create_mujoco_solver()
+        from newton.solvers import SolverMuJoCo
+
+        solver = SolverMuJoCo(
+            self.model,
+            solver="newton",
+            integrator="implicitfast",
+            iterations=100,
+            use_mujoco_cpu=True,
+            update_data_interval=0,
+        )
+        solver.reset(self.state_0)
+        return solver
+
+    def prepare_cpu_rigid_frame(self, frame_dt: float) -> None:
+        """Solve the one-way rigid model in native double precision and batch its uploads."""
+        if not self.config.mujoco_cpu or self.coupled_solver is not None:
+            return
+        solver = self.rigid_solver
+        self.state_0.clear_forces()
+        solver._apply_mjc_control(self.model, self.state_0, self.control, solver.mj_data)
+        solver.mj_model.opt.timestep = frame_dt / self.config.newton_substeps
+        positions, velocities, forces = [], [], []
+        for _ in range(self.config.newton_substeps):
+            solver._mujoco.mj_step(solver.mj_model, solver.mj_data)
+            solver._step += 1
+            positions.append(solver.mj_data.qpos.copy())
+            velocities.append(solver.mj_data.qvel.copy())
+            forces.append(solver.mj_data.qfrc_actuator.copy())
+        self._rigid_frame_arrays = [
+            np.asarray(values, np.float32) for values in (positions, velocities, forces)
+        ]
+        if not hasattr(self, "_rigid_frame_buffers"):
+            self._rigid_frame_buffers = [
+                self.wp.empty(values.shape, dtype=float, device=self.model.device)
+                for values in self._rigid_frame_arrays
+            ]
+            q, qd, force = self._rigid_frame_buffers
+            self._rigid_substeps = [
+                SimpleNamespace(
+                    nworld=1, qpos=q[i : i + 1], qvel=qd[i : i + 1], qfrc_actuator=force[i : i + 1]
+                )
+                for i in range(self.config.newton_substeps)
+            ]
+        for buffer, values in zip(self._rigid_frame_buffers, self._rigid_frame_arrays, strict=True):
+            buffer.assign(values)
+        self._rigid_frame_prepared = True
+
+    def _advance_direct(self, frame_dt: float) -> None:
+        if self.coupled_solver is not None:
+            return self._advance_coupled(frame_dt)
+        if not self.config.mujoco_cpu:
+            return super()._advance_direct(frame_dt)
+        dt = frame_dt / self.config.newton_substeps
+        self.cloth_solver.rebuild_bvh(self.state_0)
+        for substep in range(self.config.newton_substeps):
+            self.state_0.clear_forces()
+            self.state_1.clear_forces()
+            count = self.model.particle_count
+            self.model.particle_count = 0
+            try:
+                self.rigid_solver._update_newton_state(
+                    self.model, self.state_1, self._rigid_substeps[substep], state_prev=self.state_0
+                )
+            finally:
+                self.model.particle_count = count
+            self._advance_package_soft(dt)
+            self.state_0, self.state_1 = self.state_1, self.state_0
+
+    def _advance_coupled(self, frame_dt: float) -> None:
+        self.cloth_solver.rebuild_bvh(self.coupled_solver.entry_state("vbd"))
+        for _ in range(self.config.newton_substeps):
+            self.state_0.clear_forces()
+            self.state_1.clear_forces()
+            self.coupled_solver.step(
+                self.state_0,
+                self.state_1,
+                self.control,
+                self.contacts,
+                frame_dt / self.config.newton_substeps,
+            )
+            np.maximum(
+                self.maximum_source_efforts,
+                np.abs(self.rigid_solver.mj_data.qfrc_actuator),
+                out=self.maximum_source_efforts,
+            )
+            self.wp.launch(
+                self.proxy_error_kernel,
+                dim=self.model.body_count,
+                inputs=[
+                    self.state_1.body_q,
+                    self.coupled_solver.entry_state("vbd").body_q,
+                    self.proxy_maximum_errors,
+                ],
+                device=self.model.device,
+            )
+            self.state_0, self.state_1 = self.state_1, self.state_0
+        self.pipeline.collide(self.state_0, self.contacts)
+
+    def step(self, frame_dt: float, *, publish: bool = True) -> None:
+        """Upload native rigid substeps before capturing the complete GPU soft frame."""
+        if self._package_cpu_batch:
+            if not getattr(self, "_rigid_frame_prepared", False):
+                self.prepare_cpu_rigid_frame(frame_dt)
+            self._rigid_frame_prepared = False
+        super().step(frame_dt, publish=publish)
+
+    def _advance_package_soft(self, dt: float) -> None:
+        self.pipeline.collide(self.state_0, self.contacts)
+        self.cloth_solver.step(self.state_0, self.state_1, self.control, self.contacts, dt)
 
     def _create_ik(self) -> None:
         if self.robot.config.control_mode == "position":
@@ -1619,9 +1921,12 @@ class PackageRuntime(OfficialClothRuntime):
     ) -> None:
         """Track the parcel path faster while respecting authored arm velocity limits."""
         if self.robot.config.control_mode == "position":
-            blend = np.clip((activation - 0.1) / 0.7, 0.0, 1.0)
-            opening = self.config.closed_finger_m + blend * (
-                self.config.open_finger_m - self.config.closed_finger_m
+            opening = package_finger_reference(
+                activation,
+                self.config.open_finger_m,
+                self.config.closed_finger_m,
+                self.config.grip_preload_n,
+                self.robot.config.finger_stiffness if self.config.grip_preload_n else 1.0,
             )
             self.command(target_m, quaternion_xyzw[[3, 0, 1, 2]], opening)
             return
@@ -1684,6 +1989,7 @@ class PackageRuntime(OfficialClothRuntime):
             iterations=self.config.solver_iterations,
             integrate_with_external_rigid_solver=True,
             particle_enable_self_contact=True,
+            particle_enable_tile_solve=self.config.particle_tile_solve,
             particle_self_contact_margin=0.0016,
             particle_self_contact_gap=(
                 self.scene.package_parameters["self_gap"]
@@ -1693,7 +1999,7 @@ class PackageRuntime(OfficialClothRuntime):
             particle_topological_contact_filter_threshold=2,
             particle_vertex_contact_buffer_size=self.config.self_contact_buffer,
             particle_edge_contact_buffer_size=self.config.self_contact_buffer,
-            rigid_body_particle_contact_buffer_size=16384,
+            rigid_body_particle_contact_buffer_size=self.config.soft_contact_capacity,
             friction_epsilon=self.config.friction_epsilon_m_s,
         )
 
@@ -1701,7 +2007,7 @@ class PackageRuntime(OfficialClothRuntime):
         return self.newton.CollisionPipeline(
             self.model,
             soft_contact_gap=0.004,
-            soft_contact_max=16384,
+            soft_contact_max=self.config.soft_contact_capacity,
             enable_rigid_soft_full_surface_contact=True,
             deterministic=True,
         )
@@ -1713,22 +2019,48 @@ class PackagePlanner(OfficialClothPlanner):
     config_cls = PackagePlannerConfig
     runtime_cls = PackageRuntime
 
+    def prepare_initial_joints(self, robot: Any, scene: Any) -> None:
+        """Optionally align the pregrasp before robot placement, including rotated grasps."""
+        if not self.config.prepare_initial_pose:
+            return
+        from real2sim2real.utils.physic_solver_utils import package_grasp_quaternion
+
+        target = np.array([*scene.config.target_xy, scene.table_top_z + 0.2])
+        target += self.config.grasp_offset_m
+        quaternion = package_grasp_quaternion(
+            self.config.grasp_yaw_deg, self.config.grasp_pitch_deg
+        )
+        ik = _URDFHandIK(robot)
+        q = ik.solve(target, quaternion[[3, 0, 1, 2]], 256)
+        pose, _ = ik._fk(q)
+        if (
+            np.linalg.norm(pose[:3, 3] - target) > 0.001
+            or np.linalg.norm(pose[:3, :3] - _rotation_wxyz(quaternion[[3, 0, 1, 2]])) > 0.01
+        ):
+            raise ValueError("Rotated package pregrasp IK is unreachable")
+        robot.config.initial_joint_positions = tuple(q) + (self.config.open_finger_m,) * 2
+
     @property
     def expected_duration_s(self) -> float:
         """Return the duration of the complete approach, grasp and placement."""
-        return sum(
-            getattr(self.config, name)
-            for name in (
-                "approach_s",
-                "descend_s",
-                "close_s",
-                "lift_s",
-                "transfer_s",
-                "lower_s",
-                "release_s",
-                "retract_s",
-                "rest_s",
+        return (
+            sum(
+                getattr(self.config, name)
+                for name in (
+                    "approach_s",
+                    "descend_s",
+                    "close_s",
+                    "lift_s",
+                    "transfer_s",
+                    "lower_s",
+                    "release_s",
+                    "retract_s",
+                    "rest_s",
+                )
             )
+            + self.config.shake_s
+            + self.config.hold_s
+            + (self.config.post_shake_hold_s if self.config.shake_s else 0.0)
         )
 
     @property
@@ -1761,6 +2093,14 @@ class PackagePlanner(OfficialClothPlanner):
             ("retract", self.config.retract_s, lower + [0, 0, 0.15], False),
             ("settle", self.config.rest_s, lower + [0, 0, 0.15], False),
         ]
+        if self.config.shake_s:
+            self._schedule.insert(5, ("shake", self.config.shake_s, destination.copy(), True))
+            if self.config.post_shake_hold_s:
+                self._schedule.insert(
+                    6, ("hold_shake", self.config.post_shake_hold_s, destination.copy(), True)
+                )
+        if self.config.hold_s:
+            self._schedule.insert(4, ("hold_lift", self.config.hold_s, raised.copy(), True))
         self._ends = np.cumsum([row[1] for row in self._schedule])
         self._start_tcp = self.runtime.tcp_position().copy()
         self._baseline: np.ndarray | None = None
@@ -1772,19 +2112,30 @@ class PackagePlanner(OfficialClothPlanner):
         self._particle_samples: list[np.ndarray] = []
         self._sample_times: list[float] = []
         self._placement_correction: np.ndarray | None = None
+        self._release_correction: np.ndarray | None = None
+        self._minimum_shake_lifts = np.full(2, np.inf)
 
     def _align_placement(self, garment_com: np.ndarray) -> None:
         """Translate the remaining robot path so the hanging parcel COM reaches its goal."""
-        goal = np.asarray(self.scene.config.target_xy) + np.asarray(self.config.place_offset_m[:2])
-        destination = self._schedule[4][2]
+        goal = self._placement_command_goal()
+        transfer_index = next(i for i, row in enumerate(self._schedule) if row[0] == "transfer")
+        destination = self._schedule[transfer_index][2]
         correction = np.zeros(3)
         correction[:2] = (
             goal - garment_com[:2] - (destination[:2] - self.runtime.tcp_position()[:2])
         )
-        for index in range(4, len(self._schedule)):
+        for index in range(transfer_index, len(self._schedule)):
             phase, duration, target, closed = self._schedule[index]
             self._schedule[index] = (phase, duration, target + correction, closed)
         self._placement_correction = correction
+
+    def _placement_command_goal(self) -> np.ndarray:
+        """Apply landing compensation to robot targets; leave the acceptance goal unchanged."""
+        return (
+            np.asarray(self.scene.config.target_xy)
+            + np.asarray(self.config.place_offset_m[:2])
+            + np.asarray(self.config.release_compensation_xy_m)
+        )
 
     def on_physics_step(self, robot: Any) -> bool:
         """Command only robot joints and measure the unconstrained bag and garment."""
@@ -1821,10 +2172,37 @@ class PackagePlanner(OfficialClothPlanner):
             and self._placement_correction is None
         ):
             self._align_placement(coms[0])
+        if (
+            self._schedule[index][0] == "lower"
+            and self.config.realign_before_release
+            and self._release_correction is None
+        ):
+            goal = self._placement_command_goal()
+            correction = np.zeros(3)
+            correction[:2] = (
+                goal
+                - coms[0, :2]
+                - (self._schedule[index][2][:2] - self.runtime.tcp_position()[:2])
+            )
+            for remaining in range(index, len(self._schedule)):
+                name, seconds, waypoint, is_closed = self._schedule[remaining]
+                self._schedule[remaining] = (name, seconds, waypoint + correction, is_closed)
+            self._release_correction = correction
         phase, duration, target, closed = self._schedule[index]
+        assistance = getattr(self.runtime, "jaw_assistance", None)
+        if assistance is not None:
+            if phase == "lift" and not assistance.was_bound:
+                assistance.bind(self.runtime)
+            if phase == "release" and assistance.active:
+                assistance.release()
         contacts = self.runtime.last_contact_counts
         self.state["progress"] = dict(
             com_lifts_m=self._peak_lifts.tolist(),
+            current_com_lifts_m=(
+                (coms[:, 2] - self._baseline[:, 2]).tolist()
+                if self._baseline is not None
+                else [0.0, 0.0]
+            ),
             finger_contacts=[contacts["left"], contacts["right"]],
             maximum_edge_stretch=float(self._stretch),
             maximum_table_penetration_m=float(self._penetration),
@@ -1833,9 +2211,13 @@ class PackagePlanner(OfficialClothPlanner):
         bilateral = contacts["left"] > 0 and contacts["right"] > 0
         if closed and bilateral:
             self._bilateral = True
-        if phase == "transfer":
+        if phase in ("transfer", "shake"):
             self._transfer_count += 1
             self._transfer_contacts += int(bilateral)
+        if phase == "shake" and self._baseline is not None:
+            self._minimum_shake_lifts = np.minimum(
+                self._minimum_shake_lifts, coms[:, 2] - self._baseline[:, 2]
+            )
         if phase == "release" and self._release_z is None:
             self._release_z = float(coms[:, 2].mean())
         if self._release_z is not None:
@@ -1845,9 +2227,34 @@ class PackagePlanner(OfficialClothPlanner):
         blend = np.clip((self.elapsed - start_time) / (duration * 0.6), 0, 1)
         blend = blend * blend * (3 - 2 * blend)
         command = previous * (1 - blend) + target * blend
-        self.runtime.track_keyframe(
-            command, np.array([2**-0.5, 2**-0.5, 0, 0]), 0.1 if closed else 0.8
+        yaw, pitch = self.config.grasp_yaw_deg, self.config.grasp_pitch_deg
+        if phase == "shake":
+            motion = shake_displacement(
+                self.elapsed - start_time,
+                duration,
+                self.config.shake_frequency_hz,
+                np.array(
+                    [
+                        *self.config.shake_translation_m,
+                        self.config.shake_yaw_deg,
+                        self.config.shake_pitch_deg,
+                    ]
+                ),
+            )
+            command += motion[:3]
+            yaw += motion[3]
+            pitch += motion[4]
+        from real2sim2real.utils.physic_solver_utils import package_grasp_quaternion
+
+        ramp = (
+            self.config.gripper_close_ramp_s
+            if phase == "close"
+            else self.config.gripper_open_ramp_s
+            if phase == "release"
+            else 0.0
         )
+        activation = package_gripper_activation(self.elapsed - start_time, ramp, closed=closed)
+        self.runtime.track_keyframe(command, package_grasp_quaternion(yaw, pitch), activation)
         self.state["phase"] = phase
         self.rows.append(
             dict(
@@ -1859,6 +2266,10 @@ class PackagePlanner(OfficialClothPlanner):
                 contacts_left=contacts["left"],
                 contacts_right=contacts["right"],
                 minimum_z_m=float(vertices[:, 2].min()),
+                attachment_active=bool(assistance is not None and assistance.active),
+                commanded_tcp_m=command.tolist(),
+                commanded_gripper_activation=activation,
+                commanded_orientation_xyzw=package_grasp_quaternion(yaw, pitch).tolist(),
             )
         )
         self.elapsed += self.robot.sim_world.config.physics_dt
@@ -1910,14 +2321,39 @@ class PackagePlanner(OfficialClothPlanner):
             garment_contained_at_checkpoints=containment["passed"],
             no_contact_buffer_overflow=(
                 max(capacity[:2]) < self.config.self_contact_buffer
-                and capacity[2] < min(16384, self.runtime.contacts.soft_contact_max)
+                and capacity[2]
+                < min(self.config.soft_contact_capacity, self.runtime.contacts.soft_contact_max)
             ),
         )
         checks = {name: bool(value) for name, value in checks.items()}
+        proxy_errors = None
+        if self.config.rigid_soft_coupling == "proxy":
+            proxy_errors = self.runtime.proxy_maximum_errors.numpy().astype(float).tolist()
+            checks["proxy_geometry_consistent"] = bool(
+                np.isfinite(proxy_errors).all()
+                and proxy_errors[0] <= 0.0015
+                and proxy_errors[1] <= np.deg2rad(1.0)
+            )
+            checks["finger_force_limit_respected"] = bool(
+                np.isfinite(self.runtime.maximum_source_efforts).all()
+                and max(self.runtime.maximum_source_efforts[-2:])
+                <= self.robot.config.finger_max_force + 1e-5
+            )
+        assistance = getattr(self.runtime, "jaw_assistance", None)
+        if self.config.shake_s:
+            checks["both_surfaces_held_through_shake"] = bool(
+                np.isfinite(self._minimum_shake_lifts).all()
+                and np.all(self._minimum_shake_lifts >= self.config.minimum_lift_m)
+            )
+        if self.config.attachment_mode != "none":
+            checks["assistance_bound_and_released"] = bool(
+                assistance is not None and assistance.was_bound and not assistance.active
+            )
         return dict(
             success=all(checks.values()),
             checks=checks,
-            object="V7_two_mesh_package",
+            object="two_mesh_garment_package",
+            package_variant=Path(self.scene.config.cloth_usd_path).parent.name,
             maximum_com_lift_m=self._peak_lifts.tolist(),
             release_drop_m=self._release_drop,
             place_error_m=place_error,
@@ -1930,9 +2366,45 @@ class PackagePlanner(OfficialClothPlanner):
             garment_particles=n,
             bag_particles=len(vertices) - n,
             internal_loft_springs=len(self.scene.loft_springs),
-            attachments_used=False,
+            attachments_used=self.config.attachment_mode != "none",
+            attachment_mode=self.config.attachment_mode,
+            attachment_groups=assistance.records if assistance is not None else [],
+            minimum_shake_com_lift_m=(
+                self._minimum_shake_lifts.tolist()
+                if self.config.shake_s and np.isfinite(self._minimum_shake_lifts).all()
+                else None
+            ),
             pinned_vertex_count=self.runtime.pinned_vertex_count,
-            coupling="one_way_rigid_to_deformable",
+            coupling=(
+                "two_way_lagged_body_proxy"
+                if self.config.rigid_soft_coupling == "proxy"
+                else "one_way_rigid_to_deformable"
+            ),
+            maximum_substep_proxy_position_rotation_error=proxy_errors,
+            proxy_mass_scale=(
+                self.config.proxy_mass_scale if self.config.rigid_soft_coupling == "proxy" else None
+            ),
+            grip_preload_n=self.config.grip_preload_n,
+            maximum_source_joint_actuator_efforts=(
+                self.runtime.maximum_source_efforts.tolist() if proxy_errors is not None else None
+            ),
+            source_joint_effort_units=(
+                ["N*m"] * 7 + ["N"] * 2 if proxy_errors is not None else None
+            ),
+            native_body_to_newton=(
+                self.runtime.rigid_solver.mjc_body_to_newton.numpy().tolist()
+                if proxy_errors is not None
+                else None
+            ),
+            source_body_mass_kg=(
+                self.runtime.model.body_mass.numpy().tolist() if proxy_errors is not None else None
+            ),
+            virtual_proxy_body_mass_kg=(
+                self.runtime.coupled_solver.view("vbd").body_mass.numpy().tolist()
+                if proxy_errors is not None
+                else None
+            ),
+            rigid_execution="native_cpu" if self.config.mujoco_cpu else "warp_gpu",
             physics_duration_s=self.elapsed,
             maximum_substep_contacts=capacity,
             containment=containment,
@@ -1943,13 +2415,631 @@ class PackagePlanner(OfficialClothPlanner):
             ).hexdigest(),
             robot_backend=self.robot.config.backend,
             gripper_geometry=(
-                "V7_14x60x84mm_parallel_pads"
+                (
+                    "V7_14x60x84mm_parallel_pads"
+                    if np.allclose(self.robot.config.pad_half_extents_m, (0.03, 0.007, 0.042))
+                    else "explicit_parallel_pads"
+                )
                 if hasattr(self.robot, "package_pad_shapes")
                 else "native_Franka_fingers"
+            ),
+            gripper_pad_dimensions_m=(
+                (2 * np.array(self.robot.config.pad_half_extents_m)).tolist()
+                if hasattr(self.robot, "package_pad_shapes")
+                else None
             ),
             placement_correction_m=(
                 self._placement_correction.tolist()
                 if getattr(self, "_placement_correction", None) is not None
                 else None
             ),
+            release_compensation_xy_m=self.config.release_compensation_xy_m,
+        )
+
+
+# ================================================================================================
+# Real threaded contact: fixed nut + guided axial arm with continuous rotary spindle.
+# No helix joint and no commanded axial trajectory are used.
+# ================================================================================================
+
+
+class ScrewPlannerConfig(BaseConfig):
+    """Contact and measurable assembly requirements for the Factory M20 loose pair."""
+
+    backend: str = "screw_assembly"
+    sdf_resolution: int = Field(default=128, ge=64, le=256)
+    hydroelastic_stiffness: FiniteFloat = Field(default=1e11, gt=0)
+    friction: FiniteFloat = Field(default=0.01, ge=0)
+    contact_capacity: int = Field(default=40000, ge=2000)
+    spindle_speed_rad_s: FiniteFloat = -4.0
+    engage_s: FiniteFloat = Field(default=0.5, ge=0)
+    screw_s: FiniteFloat = Field(default=5.0, gt=0)
+    hold_s: FiniteFloat = Field(default=1.0, gt=0)
+    minimum_turns: FiniteFloat = Field(default=2.0, gt=0)
+    minimum_advance_m: FiniteFloat = Field(default=0.006, gt=0)
+    maximum_pitch_error_fraction: FiniteFloat = Field(default=0.25, gt=0, lt=1)
+    maximum_hold_drift_m: FiniteFloat = Field(default=0.001, gt=0)
+    maximum_unthreaded_advance_m: FiniteFloat = Field(default=0.002, gt=0, lt=0.0025)
+    initial_yaw_deg: FiniteFloat = 22.5
+
+
+class ScrewRuntime:
+    """MuJoCo rigid dynamics with Newton hydroelastic collision on actual helical meshes."""
+
+    def __init__(self, robot: Any, scene: Any, config: ScrewPlannerConfig) -> None:
+        import newton
+        import warp as wp
+        from newton.geometry import HydroelasticSDF
+        from newton.solvers import SolverMuJoCo
+
+        self.newton, self.wp = newton, wp
+        self.robot, self.scene, self.config = robot, scene, config
+        builder = newton.ModelBuilder(gravity=tuple(robot.sim_world.config.gravity))
+        SolverMuJoCo.register_custom_attributes(builder)
+        shape_cfg = newton.ModelBuilder.ShapeConfig(
+            is_hydroelastic=True,
+            kh=config.hydroelastic_stiffness,
+            ke=1e7,
+            kd=1e4,
+            mu=config.friction,
+            margin=0,
+            gap=0,
+            mu_torsional=0,
+            mu_rolling=0,
+            density=8000,
+        )
+        meshes = {}
+        for name, (points, triangles) in scene.fastener_meshes.items():
+            mesh = newton.Mesh(points, triangles.ravel())
+            mesh.build_sdf(
+                max_resolution=config.sdf_resolution,
+                narrow_band_range=(-0.005, 0.005),
+                margin=0.005,
+                cache_dir=str(Path("outputs/debug/physic_solver/sdf_cache").resolve()),
+            )
+            meshes[name] = mesh
+        nut_pose = wp.transform((0, 0, scene.nut_height_m), wp.quat(1, 0, 0, 0))
+        builder.add_shape_mesh(
+            -1, mesh=meshes["nut"], xform=nut_pose, cfg=shape_cfg, label="fixed_nut"
+        )
+        spindle = robot.add_newton_robot(
+            builder,
+            mount_z_m=scene.initial_bolt_z_m,
+            bolt_mesh=meshes["bolt"],
+            shape_config=shape_cfg,
+        )
+        builder.joint_q[1] = np.deg2rad(config.initial_yaw_deg)
+        self.spindle_body = spindle
+        self.model = builder.finalize(device=robot.sim_world.config.device)
+        self.state_0, self.state_1 = self.model.state(), self.model.state()
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
+        self.control = self.model.control()
+        self.solver = SolverMuJoCo(
+            self.model,
+            use_mujoco_contacts=False,
+            disable_sensors=True,
+            solver="newton",
+            integrator="implicitfast",
+            cone="elliptic",
+            njmax=config.contact_capacity,
+            nconmax=config.contact_capacity,
+            iterations=30,
+        )
+        self.pipeline = newton.CollisionPipeline(
+            self.model,
+            rigid_contact_max=config.contact_capacity,
+            reduce_contacts=True,
+            sdf_hydroelastic_config=HydroelasticSDF.Config(mc_edge_clamp_min=0, buffer_mult_iso=2),
+        )
+        self.contacts = self.pipeline.contacts()
+        self.graph = None
+        self.warmed = False
+        self.maximum_contacts = 0
+        self.contact_peak = wp.zeros(1, dtype=int, device=self.model.device)
+        self.target_q = np.array([robot.config.axial_preload_target_m, 0.0])
+        self.publish()
+
+    def command(self, speed: float, *, hold: bool = False) -> None:
+        """Set spindle speed and a constant axial spring preload; never prescribe thread lead."""
+        axial = (
+            float(self.state_0.joint_q.numpy()[0])
+            if hold
+            else self.robot.config.axial_preload_target_m
+        )
+        self.control.joint_target_q.assign([axial, 0])
+        self.control.joint_target_qd.assign([0, speed])
+        self.target_q = np.array([axial, speed])
+
+    def step(self, dt: float) -> None:
+        """Advance every contact substep and publish actual solved body transforms."""
+        substeps = self.robot.sim_world.config.newton_substeps
+
+        def advance() -> None:
+            for _ in range(substeps):
+                self.state_0.clear_forces()
+                self.state_1.clear_forces()
+                self.pipeline.collide(self.state_0, self.contacts)
+                self.wp.launch(
+                    contact_maximum_kernel(),
+                    1,
+                    inputs=[self.contacts.rigid_contact_count, self.contact_peak],
+                    device=self.model.device,
+                )
+                self.solver.step(
+                    self.state_0, self.state_1, self.control, self.contacts, dt / substeps
+                )
+                self.state_0, self.state_1 = self.state_1, self.state_0
+
+        if self.warmed and self.robot.sim_world.config.newton_use_cuda_graph:
+            if self.graph is None:
+                with self.wp.ScopedCapture(device=self.model.device) as capture:
+                    advance()
+                self.graph = capture.graph
+            self.wp.capture_launch(self.graph)
+        else:
+            advance()
+            self.warmed = True
+        self.maximum_contacts = max(self.maximum_contacts, int(self.contact_peak.numpy()[0]))
+        self.publish()
+
+    def publish(self) -> None:
+        """Show the rigid chuck and bolt at the actual spindle pose."""
+        from pxr import Gf
+
+        pose = self.state_0.body_q.numpy()[self.spindle_body]
+        transform = self.wp.transform(pose[:3], pose[3:])
+        bolt = transform * self.wp.transform((0, 0, 0), self.wp.quat(1, 0, 0, 0))
+        self.scene.publish_fastener("bolt", np.array(bolt, dtype=float))
+        matrix = Gf.Matrix4d().SetRotate(Gf.Quatd(float(pose[6]), Gf.Vec3d(*pose[3:6].tolist())))
+        matrix.SetTranslateOnly(Gf.Vec3d(*pose[:3].tolist()))
+        self.robot.tool_transform.Set(matrix)
+        tool_pose = (
+            pose[:3].astype(float) + self.robot.config.base_position,
+            pose[[6, 3, 4, 5]].copy(),
+        )
+        self.robot.poses_realtime["tool"] = tool_pose
+        self.robot.poses.setdefault("tool", (tool_pose[0].copy(), tool_pose[1].copy()))
+
+    def recording_coordinates(self) -> tuple[np.ndarray, np.ndarray]:
+        """Read axial displacement/continuous spindle angle and actual control targets."""
+        return self.state_0.joint_q.numpy().astype(float), self.target_q.copy()
+
+
+class ScrewPlanner(BasePlanner):
+    """Turn a real bolt through a fixed nut and validate measured pitch and retained engagement."""
+
+    config_cls = ScrewPlannerConfig
+    action_names = ["axial_spring_target_m", "spindle_velocity_target_rad_s"]
+
+    def __init__(self, config: ScrewPlannerConfig | None = None) -> None:
+        super().__init__()
+        self.config = config or self.config_cls.from_settings("planner")
+        self.runtime = None
+        self.rows: list[dict[str, Any]] = []
+        self.elapsed = 0.0
+
+    def init_planner(self, robot: Any) -> None:
+        """Bind the assembly arm; allocate physics only when starting the episode."""
+        self.robot = robot
+
+    @property
+    def expected_duration_s(self) -> float:
+        """Return engage, screw and stationary hold duration."""
+        return self.config.engage_s + self.config.screw_s + self.config.hold_s
+
+    def begin_episode(self, scene: Any) -> None:
+        """Build an independent model for this fixed-nut assembly."""
+        self.scene = scene
+        self.runtime = ScrewRuntime(self.robot, scene, self.config)
+        self.elapsed = 0.0
+        self.rows.clear()
+        self.state.update(done=False, phase="engage")
+
+    def on_physics_step(self, robot: Any) -> bool:
+        """Set motor controls and save measurements before the next physical step."""
+        del robot
+        state, _ = self.runtime.recording_coordinates()
+        phase = (
+            "engage"
+            if self.elapsed < self.config.engage_s
+            else "screw"
+            if self.elapsed < self.config.engage_s + self.config.screw_s
+            else "hold"
+        )
+        done = self.elapsed >= self.expected_duration_s
+        self.runtime.command(
+            self.config.spindle_speed_rad_s if phase == "screw" else 0, hold=phase == "hold"
+        )
+        self.rows.append(
+            dict(
+                time_s=self.elapsed,
+                phase=phase,
+                axial_displacement_m=float(state[0]),
+                spindle_angle_rad=float(state[1]),
+                contacts=int(self.runtime.contacts.rigid_contact_count.numpy()[0]),
+            )
+        )
+        self.state.update(done=done, phase="done" if done else phase)
+        if not done:
+            self.elapsed += self.robot.sim_world.config.physics_dt
+        return done
+
+    def result(self) -> dict[str, Any]:
+        """Require coupled rotation/advance, real contacts and a stable final engagement."""
+        q = np.array([[r["axial_displacement_m"], r["spindle_angle_rad"]] for r in self.rows])
+        screw = [i for i, row in enumerate(self.rows) if row["phase"] == "screw"]
+        hold = [i for i, row in enumerate(self.rows) if row["phase"] == "hold"]
+        if not len(q) or not screw or not hold:
+            return dict(success=False, checks=dict(sequence_completed=False))
+        start, end = q[screw[0]], q[hold[0]]
+        turns = abs(end[1] - start[1]) / (2 * np.pi)
+        advance = start[0] - end[0]
+        expected = turns * self.scene.config.thread_pitch_m
+        pitch_error = abs(advance - expected) / max(expected, 1e-12)
+        drift = float(np.ptp(q[hold, 0]))
+        lead_residual = (
+            q[:, 0]
+            - q[0, 0]
+            - ((q[:, 1] - q[0, 1]) * self.scene.config.thread_pitch_m / (2 * np.pi))
+        )
+        maximum_unthreaded = float(np.max(np.abs(lead_residual)))
+        contacts = [self.rows[i]["contacts"] for i in screw]
+        checks = dict(
+            sequence_completed=bool(self.state["done"]),
+            finite_state=bool(np.isfinite(q).all()),
+            spindle_rotated=bool(turns >= self.config.minimum_turns),
+            bolt_advanced=bool(advance >= self.config.minimum_advance_m),
+            thread_lead_matches=bool(pitch_error <= self.config.maximum_pitch_error_fraction),
+            helical_contact_observed=bool(np.mean(np.array(contacts) > 0) >= 0.95),
+            retained_during_hold=drift <= self.config.maximum_hold_drift_m,
+            no_unthreaded_push_through=maximum_unthreaded
+            <= self.config.maximum_unthreaded_advance_m,
+            no_contact_overflow=self.runtime.maximum_contacts < self.config.contact_capacity,
+        )
+        return dict(
+            success=all(checks.values()),
+            checks=checks,
+            turns=float(turns),
+            axial_advance_m=float(advance),
+            expected_thread_advance_m=float(expected),
+            pitch_error_fraction=float(pitch_error),
+            hold_drift_m=drift,
+            maximum_unthreaded_advance_m=maximum_unthreaded,
+            maximum_contacts=self.runtime.maximum_contacts,
+            thread_contact_fraction=float(np.mean(np.array(contacts) > 0)),
+            contact_model="Newton hydroelastic SDF",
+            axial_feed="constant spring target, no commanded helix",
+            fixture="fixed nut; guided rotary tool",
+            tool_clamp="bolt head rigidly held by spindle chuck; tool remains engaged",
+            newton_version=self.runtime.newton.__version__,
+        )
+
+
+class CartonPlannerConfig(PickPlaceClothPlannerConfig):
+    """Rigid carton grasp with a declared gripper stroke and unchanged grasp outcome gates."""
+
+    backend: str = "pickplace_carton"
+    mujoco_cpu: bool = False
+    rigid_contact_stiffness_n_m: FiniteFloat = Field(default=1e6, gt=0)
+    rigid_contact_damping_n_s_m: FiniteFloat = Field(default=1000, ge=0)
+    grasp_vertical_offset_m: FiniteFloat = Field(default=-0.02, ge=-0.04, le=0.04)
+    open_finger_m: float = Field(default=0.125, gt=0, le=0.15)
+    closed_finger_m: float = Field(default=0.09, ge=0, le=0.15)
+    approach_s: float = Field(default=1.0, gt=0)
+    descend_s: float = Field(default=1.0, gt=0)
+    close_s: float = Field(default=1.0, gt=0)
+    lift_s: float = Field(default=2.0, gt=0)
+    transfer_s: float = Field(default=2.0, gt=0)
+    lower_s: float = Field(default=1.0, gt=0)
+    release_s: float = Field(default=1.0, gt=0)
+    retract_s: float = Field(default=1.0, gt=0)
+    rest_s: float = Field(default=1.0, gt=0)
+    lift_height_m: float = Field(default=0.22, gt=0)
+    place_height_m: float = Field(default=0.12, gt=0)
+    place_offset_m: tuple[FiniteFloat, FiniteFloat, FiniteFloat] = (0, -0.12, 0)
+    tcp_orientation_wxyz: tuple[float, float, float, float] = (0, 2**-0.5, 2**-0.5, 0)
+    maximum_table_penetration_m: float = Field(default=0.0015, ge=0)
+    minimum_release_drop_m: float = Field(default=0.01, ge=0)
+
+
+class _LongJawIK(_URDFHandIK):
+    """Keep the tool frame on the actual longer jaw, including its Cartesian Jacobian."""
+
+    def __init__(self, robot: Any) -> None:
+        super().__init__(robot)
+        self.extension_m = robot.config.tcp_extension_m
+
+    def _fk(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        transform, jacobian = super()._fk(q)
+        extension = transform[:3, :3] @ np.array([0, 0, self.extension_m])
+        transform[:3, 3] += extension
+        jacobian[:3] += np.cross(jacobian[3:].T, extension).T
+        return transform, jacobian
+
+
+class CartonRuntime(PackageRuntime):
+    """Two-way MuJoCo rigid-body contacts; no deformable model or grasp attachments."""
+
+    scale = 1.0
+
+    def __init__(self, robot: Any, scene: Any, config: Any) -> None:
+        import newton
+        import warp as wp
+        from newton.solvers import SolverMuJoCo
+
+        self.newton, self.wp, self.robot, self.scene, self.config = newton, wp, robot, scene, config
+        self.pure_newton, self.solver_name = True, "mujoco"
+        builder = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        robot.add_newton_robot(builder, scale=1)
+        self.robot_body_count, self.robot_shape_count = builder.body_count, builder.shape_count
+        self._add_table(builder)
+        self.carton_body = builder.add_body(
+            xform=wp.transform(scene.carton_position, wp.quat_identity()), label="rigid_carton"
+        )
+        half = scene.carton_dimensions / 2
+        builder.add_shape_box(
+            self.carton_body,
+            hx=float(half[0]),
+            hy=float(half[1]),
+            hz=float(half[2]),
+            cfg=newton.ModelBuilder.ShapeConfig(
+                density=float(scene.config.carton_mass_kg / np.prod(2 * half)), mu=1.4, margin=0.0
+            ),
+        )
+        self.model = builder.finalize(
+            device="cpu" if config.mujoco_cpu else robot.sim_world.config.device
+        )
+        from newton._src.solvers.mujoco.constants import SOLREF_MODE_FORCE_SPACE
+
+        self.model.shape_material_ke.fill_(config.rigid_contact_stiffness_n_m)
+        self.model.shape_material_kd.fill_(config.rigid_contact_damping_n_s_m)
+        self.model.shape_material_mu.assign(
+            np.where(
+                self.model.shape_body.numpy() < 0,
+                config.table_friction,
+                robot.config.finger_friction,
+            )
+        )
+        self.model.mujoco.solref_mode.fill_(SOLREF_MODE_FORCE_SPACE)
+        self.state_0, self.state_1 = self.model.state(), self.model.state()
+        for state in (self.state_0, self.state_1):
+            newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, state)
+        self.control = self.model.control()
+        self.solver = SolverMuJoCo(
+            self.model,
+            solver="newton",
+            integrator="implicitfast",
+            cone="elliptic",
+            iterations=50,
+            use_mujoco_cpu=config.mujoco_cpu,
+        )
+        self.target_q = self.control.joint_target_q.numpy().copy()
+        self._visual_bodies = []
+        self._create_ik()
+        self.ik = _LongJawIK(robot)
+        self.tcp_offset_cm = 0.2104 + robot.config.tcp_extension_m
+        self._create_robot_visuals()
+        from pxr import Gf, UsdGeom
+
+        rail = UsdGeom.Cube.Define(
+            robot.sim_world.stage, f"{robot.config.prim_path}/fr3_link7/long_stroke_rail"
+        )
+        rail.CreateSizeAttr(2)
+        rail.AddTranslateOp().Set(Gf.Vec3d(0, 0, 0.13))
+        rail.AddScaleOp().Set(Gf.Vec3f(0.025, 0.155, 0.01))
+        rail.CreateDisplayColorAttr([Gf.Vec3f(0.18, 0.18, 0.2)])
+        self.graph = None
+        self.warmed = False
+        self.sim_time = 0.0
+
+    def command(self, position: np.ndarray, quaternion_wxyz: np.ndarray, finger: float) -> None:
+        """Drive only the nine robot coordinates; leave all carton free-joint coordinates alone."""
+        self.target_q[:7] = self.ik.solve(position, quaternion_wxyz, 64)
+        self.target_q[7:9] = finger
+        self.control.joint_target_q.assign(self.target_q)
+
+    def recording_coordinates(self) -> tuple[np.ndarray, np.ndarray]:
+        """Record robot joints independently of the free carton coordinates."""
+        return self.state_0.joint_q.numpy()[:9].astype(float), self.target_q[:9].copy()
+
+    def step(self, frame_dt: float) -> None:
+        """Integrate all rigid joints and carton contacts without kinematic carton control."""
+        substeps = self.robot.sim_world.config.newton_substeps
+
+        def advance() -> None:
+            for _ in range(substeps):
+                self.state_0.clear_forces()
+                self.state_1.clear_forces()
+                self.solver.step(
+                    self.state_0, self.state_1, self.control, None, frame_dt / substeps
+                )
+                self.state_0, self.state_1 = self.state_1, self.state_0
+
+        if (
+            self.warmed
+            and self.robot.sim_world.config.newton_use_cuda_graph
+            and not self.config.mujoco_cpu
+        ):
+            if self.graph is None:
+                with self.wp.ScopedCapture(device=self.model.device) as capture:
+                    advance()
+                self.graph = capture.graph
+            self.wp.capture_launch(self.graph)
+        else:
+            advance()
+            self.warmed = True
+        self._publish_robot_visuals()
+        self.scene.publish_carton(self.state_0.body_q.numpy()[self.carton_body])
+        self.sim_time += frame_dt
+
+
+class CartonPlanner(BasePlanner):
+    """Grasp original-size V10 cartons with a long-stroke gripper and measure rigid outcomes."""
+
+    config_cls = CartonPlannerConfig
+    action_names = [f"fr3_joint{i}_target_rad" for i in range(1, 8)] + [
+        "left_finger_target_m",
+        "right_finger_target_m",
+    ]
+    recording_task = "Grasp the full-size V10 carton, lift, transfer and release it on the table."
+
+    def __init__(self, config: CartonPlannerConfig | None = None) -> None:
+        super().__init__()
+        self.config = config or self.config_cls.from_settings("planner")
+        self.elapsed = 0.0
+        self.rows: list[dict[str, Any]] = []
+        self.runtime = None
+
+    def init_planner(self, robot: Any) -> None:
+        """Bind the prearranged Franka and declared replacement gripper."""
+        self.robot = robot
+
+    def prepare_initial_joints(self, robot: Any, scene: Any) -> None:
+        """Solve the declared pregrasp before placing the robot, avoiding an initial tool sweep."""
+        target = scene.carton_position + [0, 0, self.config.grasp_vertical_offset_m + 0.2]
+        ik = _LongJawIK(robot)
+        q = ik.solve(target, np.array(self.config.tcp_orientation_wxyz), 256)
+        pose, _ = ik._fk(q)
+        if np.linalg.norm(pose[:3, 3] - target) > 0.001:
+            raise ValueError("Carton pregrasp IK is unreachable")
+        robot.config.initial_joint_positions = tuple(q) + (self.config.open_finger_m,) * 2
+
+    @property
+    def expected_duration_s(self) -> float:
+        """Return the complete grasp/transfer/release schedule duration."""
+        return sum(
+            getattr(self.config, f"{name}_s")
+            for name in (
+                "approach",
+                "descend",
+                "close",
+                "lift",
+                "transfer",
+                "lower",
+                "release",
+                "retract",
+                "rest",
+            )
+        )
+
+    def begin_episode(self, scene: Any) -> None:
+        """Build the free rigid carton and drive only actual robot joint targets."""
+        self.scene = scene
+        self.runtime = CartonRuntime(self.robot, scene, self.config)
+        grasp = scene.carton_position.copy()
+        grasp[2] += self.config.grasp_vertical_offset_m
+        raised = grasp + [0, 0, self.config.lift_height_m]
+        lower = (
+            scene.carton_position
+            + np.array(self.config.place_offset_m)
+            + [0, 0, self.config.place_height_m]
+        )
+        self.schedule = [
+            ("approach", grasp + [0, 0, 0.2], False),
+            ("descend", grasp, False),
+            ("close", grasp, True),
+            ("lift", raised, True),
+            ("transfer", raised + self.config.place_offset_m, True),
+            ("lower", lower, True),
+            ("release", lower, False),
+            ("retract", lower + [0, 0, 0.2], False),
+            ("rest", lower + [0, 0, 0.2], False),
+        ]
+        self.ends = np.cumsum([getattr(self.config, f"{name}_s") for name, _, _ in self.schedule])
+        self.start_tcp = self.runtime.tcp_position()
+        self.initial = scene.carton_position.copy()
+        self.elapsed = 0.0
+        self.rows.clear()
+        self.state.update(done=False, phase="approach")
+
+    def on_physics_step(self, robot: Any) -> bool:
+        """Command the arm and save physical carton/TCP measurements at every frame."""
+        del robot
+        index = int(np.searchsorted(self.ends, self.elapsed, side="right"))
+        if index == len(self.schedule):
+            self.state.update(done=True, phase="done")
+            return True
+        phase, target, closed = self.schedule[index]
+        start = 0 if index == 0 else self.ends[index - 1]
+        previous = self.start_tcp if index == 0 else self.schedule[index - 1][1]
+        blend = np.clip((self.elapsed - start) / (self.ends[index] - start) * 1.5, 0, 1)
+        blend = blend * blend * (3 - 2 * blend)
+        self.runtime.command(
+            previous * (1 - blend) + target * blend,
+            np.array(self.config.tcp_orientation_wxyz),
+            self.config.closed_finger_m if closed else self.config.open_finger_m,
+        )
+        position = self.scene.target_position
+        pose = self.runtime.state_0.body_q.numpy()[self.runtime.carton_body]
+        half = self.scene.carton_dimensions / 2
+        corners = np.array(
+            [
+                [x, y, z]
+                for x in [-half[0], half[0]]
+                for y in [-half[1], half[1]]
+                for z in [-half[2], half[2]]
+            ]
+        )
+        corners = corners @ _rotation_wxyz(pose[[6, 3, 4, 5]]).T + pose[:3]
+        self.rows.append(
+            dict(
+                time_s=self.elapsed,
+                phase=phase,
+                target_xyz_m=position.tolist(),
+                tcp_xyz_m=self.runtime.tcp_position().tolist(),
+                minimum_z_m=float(corners[:, 2].min()),
+                quaternion_xyzw=pose[3:].tolist(),
+                robot_state=self.runtime.recording_coordinates()[0].tolist(),
+                robot_target=self.runtime.recording_coordinates()[1].tolist(),
+            )
+        )
+        self.state["phase"] = phase
+        self.elapsed += self.robot.sim_world.config.physics_dt
+        return False
+
+    def result(self) -> dict[str, Any]:
+        """Require sustained lift, gripper proximity, release, support and accurate placement."""
+        if not self.rows:
+            return dict(success=False, checks=dict(sequence_completed=False))
+        held = [r for r in self.rows if r["phase"] == "transfer"]
+        release = [r for r in self.rows if r["phase"] in ("release", "retract", "rest")]
+        lift = min((r["target_xyz_m"][2] - self.initial[2] for r in held), default=0)
+        distance = max(
+            (np.linalg.norm(np.array(r["target_xyz_m"]) - r["tcp_xyz_m"]) for r in held), default=1
+        )
+        drop = (
+            release[0]["target_xyz_m"][2] - min(r["target_xyz_m"][2] for r in release)
+            if release
+            else 0
+        )
+        goal = self.initial[:2] + self.config.place_offset_m[:2]
+        error = float(np.linalg.norm(self.scene.target_position[:2] - goal))
+        minimum = min(row["minimum_z_m"] for row in self.rows)
+        checks = dict(
+            sequence_completed=bool(self.state["done"]),
+            finite_state=bool(all(np.isfinite(row["target_xyz_m"]).all() for row in self.rows)),
+            sustained_lift=lift >= self.config.minimum_lift_m,
+            held_near_gripper=distance < 0.04,
+            released_and_dropped=drop >= self.config.minimum_release_drop_m,
+            placed_near_goal=error <= self.config.maximum_place_error_m,
+            supported_on_table=abs(self.rows[-1]["minimum_z_m"] - self.scene.table_top_z) < 0.002,
+            table_penetration_bounded=minimum
+            >= self.scene.table_top_z - self.config.maximum_table_penetration_m,
+        )
+        checks = {name: bool(value) for name, value in checks.items()}
+        return dict(
+            success=all(checks.values()),
+            checks=checks,
+            minimum_transfer_lift_m=float(lift),
+            maximum_transfer_tcp_distance_m=float(distance),
+            release_drop_m=float(drop),
+            place_error_m=error,
+            attachments_used=False,
+            rigid_solver="mujoco_cpu" if self.config.mujoco_cpu else "mujoco_warp",
+            coupling="two_way_rigid_contacts",
+            carton_dimensions_m=self.scene.carton_dimensions.tolist(),
+            carton_mass_kg=self.scene.config.carton_mass_kg,
+            gripper="explicit 260mm-stroke parallel gripper with 90mm jaws",
         )

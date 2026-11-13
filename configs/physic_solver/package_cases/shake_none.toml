@@ -1,0 +1,10 @@
+# 包裹迁移独立工况；质量指内容物，袋膜另计；spring 为显式辅助。
+inherit = "../package_matrix_base.toml"
+
+[planner]
+grasp_offset_m = "@reset [0.035, 0, 0]"  # 中央抓点摇晃失持；X35完整验收通过，与shake_spring_x35配对。
+shake_s = 2.0
+attachment_mode = "none"
+
+[job]
+output_dir = "outputs/physic_solver/package_cases/shake_none"

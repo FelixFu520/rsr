@@ -1,0 +1,19 @@
+# 包裹迁移独立工况；质量指内容物，袋膜另计；spring 为显式辅助。
+inherit = "../package_matrix_base.toml"
+
+[robot]
+backend = "franka_newton"
+
+[planner]
+grasp_offset_m = "@reset [0, 0.055, 0]"
+grasp_yaw_deg = 0
+grasp_pitch_deg = 0
+grasp_height_m = 0.022
+closed_finger_m = 0.005  # 保留Y55mm与抓高；减小原装指垫对局部袋膜的挤压。
+hold_s = 0.0
+transfer_s = 2.0
+lower_s = 1.0
+place_height_m = 0.20
+
+[job]
+output_dir = "outputs/physic_solver/package_cases/v8_offset_y55"

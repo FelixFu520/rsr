@@ -11,12 +11,13 @@ from pathlib import Path
 from real2sim2real.core.logger import get_logger
 
 
-def prepare(source: Path, target: Path) -> None:
+def prepare(source: Path, target: Path, *, rigid: bool = False) -> None:
     """Make an independent copy and record hashes; refuse to overwrite different files."""
-    if not (source / "parcel_two_mesh.usd").is_file():
-        raise FileNotFoundError(source / "parcel_two_mesh.usd")
+    asset_name = "source.usd" if rigid else "parcel_two_mesh.usd"
+    if not (source / asset_name).is_file():
+        raise FileNotFoundError(source / asset_name)
     files = [
-        source / "parcel_two_mesh.usd",
+        source / asset_name,
         source / "source_configuration.json",
         source / "README.md",
         source / "usd_rerun_validation.json",
@@ -40,15 +41,14 @@ def prepare(source: Path, target: Path) -> None:
                 "source": str(source.resolve()),
                 "sha256": manifest,
                 "geometry_modified": False,
-                "source_acceptance": "USD rerun incomplete; see source README",
+                "source_acceptance": "Source outcomes are not inherited; new runs need validation.",
+                "license": "Source project terms apply; no new license granted.",
             },
             indent=2,
         )
         + "\n"
     )
-    get_logger(__name__).info(
-        "Independent V7 parcel ready", target=str(target), files=len(manifest)
-    )
+    get_logger(__name__).info("Independent parcel ready", target=str(target), files=len(manifest))
 
 
 if __name__ == "__main__":
@@ -57,5 +57,6 @@ if __name__ == "__main__":
         "--source", type=Path, default=Path("/home/fufa/Projects/package/output/simulation_v7")
     )
     parser.add_argument("--target", type=Path, default=Path("assets/PhysicSolver/Package/v7"))
+    parser.add_argument("--rigid", action="store_true", help="Copy a V10 local_sources carton")
     args = parser.parse_args()
-    prepare(args.source, args.target)
+    prepare(args.source, args.target, rigid=args.rigid)

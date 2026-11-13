@@ -419,3 +419,157 @@ class PackagePadRobot(FrankaNewtonRobot):
                 label="V7_package_pad",
             )
             self.package_pad_shapes.append(shape)
+
+
+# ================================================================================================
+# Guided axial assembly arm with a continuously rotating tool spindle.
+# ================================================================================================
+
+
+class ScrewSpindleRobotConfig(_RobotCameraConfig):
+    """A vertical assembly arm, axial spring feed, and unlimited rotary tool joint."""
+
+    backend: str = "screw_spindle"
+    prim_path: str = "/World/robots/ScrewSpindle"
+    base_position: tuple[FiniteFloat, FiniteFloat, FiniteFloat] = (0.1, 0, 0.732389)
+    axial_stiffness_n_m: float = Field(default=100.0, gt=0)
+    axial_damping_n_s_m: float = Field(default=5.0, ge=0)
+    axial_preload_target_m: float = Field(default=-0.04, lt=0, ge=-0.06)
+    spindle_damping_nm_s_rad: float = Field(default=0.02, gt=0)
+    maximum_torque_nm: float = Field(default=0.3, gt=0)
+    carriage_mass_kg: float = Field(default=0.05, gt=0)
+
+
+class ScrewSpindleRobot(BaseRobot):
+    """Represent the bolt head held by a declared rigid tool chuck on a guided spindle."""
+
+    config_cls = ScrewSpindleRobotConfig
+    pure_newton = True
+    recording_robot_type = "guided_continuous_screw_spindle"
+    recording_joint_names = ["axial_displacement_m", "spindle_angle_rad"]
+
+    def __init__(self, config: ScrewSpindleRobotConfig | None = None) -> None:
+        super().__init__()
+        self.config = config or self.config_cls.from_settings("robot")
+
+    def add_newton_robot(
+        self, builder: Any, *, mount_z_m: float, bolt_mesh: Any, shape_config: Any
+    ) -> int:
+        """Define the guided axial articulation and unlimited tool; return its spindle body."""
+        import warp as wp
+
+        mount = wp.transform((0, 0, mount_z_m), wp.quat_identity())
+        carriage = builder.add_link(
+            xform=mount,
+            mass=self.config.carriage_mass_kg,
+            inertia=wp.mat33(np.eye(3) * 1e-4),
+            label="axial_carriage",
+        )
+        spindle = builder.add_link(xform=mount, label="continuous_spindle")
+        builder.add_shape_mesh(
+            spindle,
+            mesh=bolt_mesh,
+            xform=wp.transform((0, 0, 0), wp.quat(1, 0, 0, 0)),
+            cfg=shape_config,
+            label="chucked_bolt",
+        )
+        axial = builder.add_joint_prismatic(
+            -1,
+            carriage,
+            parent_xform=mount,
+            axis=wp.vec3(0, 0, 1),
+            target_ke=self.config.axial_stiffness_n_m,
+            target_kd=self.config.axial_damping_n_s_m,
+            target_pos=self.config.axial_preload_target_m,
+            limit_lower=-0.04,
+            limit_upper=0.005,
+            effort_limit=10,
+            label="axial_spring_feed",
+        )
+        rotary = builder.add_joint_revolute(
+            carriage,
+            spindle,
+            axis=wp.vec3(0, 0, 1),
+            target_ke=0,
+            target_kd=self.config.spindle_damping_nm_s_rad,
+            target_vel=0,
+            effort_limit=self.config.maximum_torque_nm,
+            label="unlimited_rotary_spindle",
+        )
+        builder.add_articulation([axial, rotary])
+        return spindle
+
+    def init_robot(self, sim_world: Any) -> None:
+        """Author the visible support, rail, carriage and spindle without creating physics."""
+        from pxr import Gf, UsdGeom
+
+        if not sim_world.uses_direct_newton:
+            raise ValueError("Screw spindle requires direct Newton")
+        self.sim_world = sim_world
+        root = UsdGeom.Xform.Define(sim_world.stage, self.config.prim_path)
+        root.AddTranslateOp().Set(Gf.Vec3d(*self.config.base_position))
+        for name, center, scale in (
+            ("column", (-0.12, 0, 0.14), (0.025, 0.035, 0.14)),
+            ("arm", (-0.06, 0, 0.24), (0.085, 0.035, 0.025)),
+            ("guide", (0, 0.03, 0.15), (0.02, 0.01, 0.09)),
+        ):
+            cube = UsdGeom.Cube.Define(sim_world.stage, f"{root.GetPath()}/{name}")
+            cube.CreateSizeAttr(2)
+            cube.AddTranslateOp().Set(Gf.Vec3d(*center))
+            cube.AddScaleOp().Set(Gf.Vec3f(*scale))
+            cube.CreateDisplayColorAttr([Gf.Vec3f(0.14, 0.3, 0.5)])
+        tool = UsdGeom.Xform.Define(sim_world.stage, f"{root.GetPath()}/tool")
+        self.tool_transform = tool.AddTransformOp()
+        cylinder = UsdGeom.Cylinder.Define(sim_world.stage, f"{tool.GetPath()}/chuck")
+        cylinder.CreateRadiusAttr(0.018)
+        cylinder.CreateHeightAttr(0.04)
+        cylinder.AddTranslateOp().Set(Gf.Vec3d(0, 0, 0.025))
+        cylinder.CreateDisplayColorAttr([Gf.Vec3f(0.13, 0.14, 0.16)])
+        stripe = UsdGeom.Cube.Define(sim_world.stage, f"{tool.GetPath()}/rotation_marker")
+        stripe.CreateSizeAttr(2)
+        stripe.AddTranslateOp().Set(Gf.Vec3d(0.0175, 0, 0.025))
+        stripe.AddScaleOp().Set(Gf.Vec3f(0.001, 0.003, 0.019))
+        stripe.CreateDisplayColorAttr([Gf.Vec3f(0.95, 0.25, 0.03)])
+        self.sensors.update(create_cameras(sim_world.stage, self.config.cameras))
+
+    def arrange(self) -> None:
+        """Keep the explicitly mounted assembly arm pose."""
+        position = np.array(self.config.base_position)
+        self.poses["base"] = (position, np.array([1, 0, 0, 0]))
+        self.poses_realtime.update(self.poses)
+
+    def adjust(self) -> None:
+        """The fixture uses a deterministic alignment."""
+
+
+class CartonGripperRobotConfig(PackagePadRobotConfig):
+    """Franka arm with an explicitly simulated 260mm-stroke parallel gripper."""
+
+    backend: str = "franka_carton_gripper"
+    pad_half_extents_m: tuple[PositiveFloat, PositiveFloat, PositiveFloat] = (
+        0.00875,
+        0.0076,
+        0.045,
+    )
+    pad_center_m: tuple[FiniteFloat, FiniteFloat, FiniteFloat] = (0, 0.00758, 0.075)
+    tcp_extension_m: FiniteFloat = Field(default=0.06, gt=0, le=0.08)
+    maximum_finger_opening_m: float = Field(default=0.13, gt=0.105, le=0.15)
+
+
+class CartonGripperRobot(PackagePadRobot):
+    """Widen the visible finger carriage range; retain actual moving finger collisions."""
+
+    config_cls = CartonGripperRobotConfig
+    recording_robot_type = "franka_long_stroke_parallel_gripper"
+    recording_joint_names = [f"fr3_joint{i}" for i in range(1, 8)] + [
+        "left_finger_m",
+        "right_finger_m",
+    ]
+
+    def add_newton_robot(self, builder: Any, *, scale: float = 1.0) -> None:
+        """Declare the replacement gripper stroke in actual joint limits before finalization."""
+        super().add_newton_robot(builder, scale=scale)
+        for joint, label in enumerate(builder.joint_label):
+            if "finger_joint" in label:
+                axis = builder.joint_qd_start[joint]
+                builder.joint_limit_upper[axis] = self.config.maximum_finger_opening_m * scale

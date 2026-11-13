@@ -227,3 +227,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+!tests/test_physic_solver_migration.py

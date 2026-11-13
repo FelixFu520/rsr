@@ -23,6 +23,9 @@ backend = "stub"
 
 # pickplace_package：cloth_usd_path="assets/PhysicSolver/Package/v7/parcel_two_mesh.usd"。
 # target_xy=[0.10,0]、robot_base_xy=[-0.42,0]；保持两个网格及原始 UV/材质。
+# pickplace_package：garment_mass_kg=None、bag_mass_kg=None，按原逐点比例覆盖各部分总质量。
+# screw_assembly：bolt_mesh_path/nut_mesh_path 位于 assets/PhysicSolver/Screw/M20/。
+# thread_pitch_m=0.0025、initial_engagement_m=0.004；固定螺母、真实螺纹网格。
 # sorting_package：station_usd_path 指向旧分拣工位，cloth_usd_path 默认 v7_sorting 快照（正式配置用 v10_station）。
 # infeed_path/platform_path/outfeed_path 读取各自 USD 支撑面；support_depth_m=0.04。
 # garment_mass_kg=0.2；bag_mass_kg 默认不覆盖袋膜质量。可显式设置两者并保持各自质量分布。
@@ -44,6 +47,8 @@ backend = "stub"
 # 官方 cloth_franka 场景使用 franka_newton 的 control_mode="velocity"。
 # franka_package_pads：V7 长夹块，pad_half_extents_m=[0.03,0.007,0.042]，
 # pad_center_m=[0,0.007,0.055]；pad_density_kg_m3=1000 为未硬件标定的仿真密度。
+# screw_spindle：axial_stiffness_n_m=100、axial_damping_n_s_m=5、axial_preload_target_m=-0.04。
+# spindle_damping_nm_s_rad=0.02、maximum_torque_nm=0.3、carriage_mass_kg=0.05；无限旋转。
 # pro_m6_newton：保留原 USD 世界位姿、惯量与原生 Robotiq 碰撞近似。
 # arm_stiffness/arm_damping=6000/300、finger_stiffness/finger_damping=40/1。
 # finger_friction=1.4；cameras 支持头部及左右腕部挂载。
@@ -64,7 +69,28 @@ backend = "stub"
 # keyframe_offset_m=[0,0,0]：以米平移官方末端路径，厚度变化时需重新验证抓放。
 # finger_velocity_gain=1.0：夹指开合响应增益（1/s），速度受 URDF 限制。
 
+# newton_diagnostic：只用Isaac内置Newton/USD SDK跑物理；check_package_matrix.py负责SDK环境。
 # pickplace_package 参数与默认值见 PackagePlannerConfig 和包裹示例 TOML。
+# pickplace_package：grasp_yaw_deg/grasp_pitch_deg=0、shake_s=0，保留旧动作。
+# shake_frequency_hz=1.5、shake_translation_m=[0.015,0.01,0.008]、shake_yaw_deg=12、shake_pitch_deg=6。
+# attachment_mode="none"/"spring"；spring 为显式有限刚度辅助，不代表纯摩擦抓取。
+# spring 仅连接外袋膜与两侧指垫；内容物没有直接附着。
+# attachment_vertices_per_group=8、attachment_capture_distance_m=0.004、attachment_stiffness_n_m=30。
+# attachment_damping_n_s_m=0.015、attachment_max_force_n=0.5；释放时只关闭力，不改节点状态。
+# screw_assembly：sdf_resolution=128、hydroelastic_stiffness=1e11、friction=0.01、contact_capacity=40000。
+# spindle_speed_rad_s=-4、engage_s/screw_s/hold_s=0.5/5/1、minimum_turns=2、minimum_advance_m=0.006。
+# maximum_pitch_error_fraction=0.25、maximum_hold_drift_m=0.001、initial_yaw_deg=22.5。
+# hold_s/post_shake_hold_s=0、realign_before_release=false；新矩阵统一延长保持并重算下放航点。
+# soft_contact_capacity=16384；长夹块矩阵用32768，验收要求逐子步未溢出。
+# pickplace_package：mujoco_cpu=false；新矩阵设true，原生CPU解刚体，CUDA VBD解包裹。
+# rigid_soft_coupling="one_way"；可选"proxy"使用逐子步双向刚体代理反馈，须CPU MuJoCo、无附着。
+# proxy_mass_scale=1：仅调整目标代理的虚拟惯量，源机器人／包裹质量不变。
+# grip_preload_n=0：proxy模式可通过PD参考偏移加入闭合预紧，真实关节行程与总力限不变。
+# particle_tile_solve=true：Newton VBD 的弹性核实现选择，迭代数与验收门限不变。
+# gripper_close_ramp_s/gripper_open_ramp_s=0：保持原阶跃目标；非零值平滑闭合/释放且不得长于对应阶段。
+# prepare_initial_pose=false；旋转包裹抓点可设true，在before_place_robot_hook中先对齐预抓姿态。
+# pickplace_carton：mujoco_cpu=false、rigid_contact_stiffness_n_m=1e6、rigid_contact_damping_n_s_m=1000。
+# maximum_unthreaded_advance_m=0.002：拧螺丝全程位移必须符合真实导程。
 # V7 材料、质量和内部弹簧从 USD 的 parcel:runtimeParameters / physics:masses 读取。
 # self_contact_buffer=512、friction_epsilon_m_s=0.001、grasp_height_m=0.0704（V7 长夹块）。
 # closed_finger_m=0.00625、lift_height_m=0.18、place_offset_m=[0,-0.12,0]。
@@ -75,6 +101,7 @@ backend = "stub"
 # approach_s/descend_s/close_s/lift_s/transfer_s/lower_s/release_s/retract_s/rest_s
 # 默认依次为 2/1.5/1.5/2/1.5/1/1/1/1.5 秒；原装短指示例使用较慢抬升/转运。
 # align_place_to_com=false：开启后在转运开始时，按实测衣物质心平移剩余路径对齐落点。
+# release_compensation_xy_m=[0,0]：按释放后漂移修正机器人XY目标，验收目标不变；需质心对齐。
 # sorting_package：mujoco_cpu=true、mujoco_iterations=100；VBD 仍由 CUDA 执行。
 # tcp_orientation_wxyz=[0,0.70710678,0.70710678,0]：世界 X 闭合；预抓取和全程 IK 统一配置。
 # gripper_package_friction=None：可单独指定四个原生内指与包裹的有效接触摩擦系数。
@@ -127,6 +154,7 @@ backend = "stub"
 # 拍照后 detect_hold_s=4 原地停留，再报警 alarm_s=3；全程警示灯 alarm_flash_hz=2 爆闪，途中不停留。
 
 [job]
+# screw_assembly：record_rgb=true；物理诊断设 false，仍走完整 BaseJob 生命周期。
 backend = "stub"  # StubJob 只串工厂,不采集
 # pickplace_cloth 的 timeout_s=1800：包含采集与渲染的墙钟时限；运行中约每 30 秒记录进度。
 # sorting_package：timeout_s=14400，output_dir 使用独立的分拣目录，LeRobot v3 记录 16 维关节角。

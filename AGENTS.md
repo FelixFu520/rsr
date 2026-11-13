@@ -37,11 +37,9 @@
 
 每个任务在 scene / robot / planner / job / utils 中**各只有一个文件**，文件名后缀即任务名：
 
-| 任务 | 后缀 | 后端名（scene / robot / planner / job） |
-|------|------|------------------------------------------|
 | 任务 | 后缀 | 资产目录 | 后端名（scene / robot / planner / job） |
 |------|------|----------|------------------------------------------|
-| 物理求解器验证 | `physic_solver` | `assets/PhysicSolver/` | `pickplace_cloth`、`pickplace_rigid`、`newton_cloth_franka`、`pickplace_package` / `franka_newton`、`franka_physx`、`franka_package_pads` / `pickplace_cloth`、`newton_cloth_franka`、`pickplace_package` / `pickplace_cloth` |
+| 物理求解器验证（含包裹矩阵／螺纹装配） | `physic_solver` | `assets/PhysicSolver/` | `pickplace_cloth`、`pickplace_rigid`、`newton_cloth_franka`、`pickplace_package`、`pickplace_carton`、`screw_assembly` / `screw_spindle`、`franka_carton_gripper`、`franka_newton`、`franka_physx`、`franka_package_pads` / `pickplace_cloth`、`newton_cloth_franka`、`pickplace_package`、`pickplace_carton`、`screw_assembly` / `pickplace_cloth`、`pickplace_carton`、`screw_assembly` |
 | 分拣包裹 | `sorting` | `assets/SortingPackage/` | `sorting_package` / `pro_m6_newton` / `sorting_package`、`sorting_stream` / `sorting_package` |
 | 机器狗巡检 | `fire_inspection` | `assets/FireInspection/` | `fire_warehouse` / `x30_kinematic` / `fire_patrol` / `fire_inspection` |
 

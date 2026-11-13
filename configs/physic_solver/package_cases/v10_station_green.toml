@@ -1,0 +1,22 @@
+# 复用源V10宽夹垫；按当前Franka实测高度关系换算，各款独立验收。
+inherit = "../package_matrix_base.toml"
+
+[scene]
+cloth_usd_path = "assets/PhysicSolver/Package/v10/station_green/parcel_two_mesh.usd"
+
+[robot]
+backend = "franka_package_pads"
+
+[planner]
+grasp_offset_m = "@reset [0, 0, 0]"
+grasp_height_m = 0.07835  # 源23.35mm夹垫底高度 + 当前实测约55mm的有效高度差。
+closed_finger_m = 0.005
+gripper_close_ramp_s = 0.6
+gripper_open_ramp_s = 0.5  # 上轮释放前已对准，阶跃张开后横移超标；仅平滑张开复测。
+hold_s = 0.0
+transfer_s = 2.0
+lower_s = 1.5
+place_height_m = 0.25
+
+[job]
+output_dir = "outputs/physic_solver/package_cases/v10_station_green"

@@ -38,10 +38,13 @@ select = ["E", "F", "I", "UP", "B"]
 # 后端名 = 配置里的 backend 字符串。实现按任务分文件：
 # *_physic_solver（物理求解器验证）、*_sorting（分拣包裹）、*_fire_inspection（机器狗巡检）。
 [project.entry-points."real2sim2real.simworld.backends"]
+newton_diagnostic = "real2sim2real.simworld.simworld_physic_solver:NewtonDiagnosticWorld"
 stub = "real2sim2real.simworld.stub:StubSimWorld"
 isaacsim = "real2sim2real.simworld.isaacsim:IsaacsimWorld"
 
 [project.entry-points."real2sim2real.scene.backends"]
+pickplace_carton = "real2sim2real.scene.scene_physic_solver:CartonScene"
+screw_assembly = "real2sim2real.scene.scene_physic_solver:ScrewScene"
 stub = "real2sim2real.scene.scene_stub:StubScene"
 pickplace_cloth = "real2sim2real.scene.scene_physic_solver:PickPlaceClothScene"
 pickplace_rigid = "real2sim2real.scene.scene_physic_solver:PickPlaceRigidScene"
@@ -51,6 +54,8 @@ sorting_package = "real2sim2real.scene.scene_sorting:SortingScene"
 fire_warehouse = "real2sim2real.scene.scene_fire_inspection:FireWarehouseScene"
 
 [project.entry-points."real2sim2real.robot.backends"]
+franka_carton_gripper = "real2sim2real.robot.robot_physic_solver:CartonGripperRobot"
+screw_spindle = "real2sim2real.robot.robot_physic_solver:ScrewSpindleRobot"
 stub = "real2sim2real.robot.robot_stub:StubRobot"
 franka_newton = "real2sim2real.robot.robot_physic_solver:FrankaNewtonRobot"
 franka_physx = "real2sim2real.robot.robot_physic_solver:FrankaPhysxRobot"
@@ -59,6 +64,8 @@ pro_m6_newton = "real2sim2real.robot.robot_sorting:SortingRobot"
 x30_kinematic = "real2sim2real.robot.robot_fire_inspection:X30Robot"
 
 [project.entry-points."real2sim2real.planner.backends"]
+pickplace_carton = "real2sim2real.planner.planner_physic_solver:CartonPlanner"
+screw_assembly = "real2sim2real.planner.planner_physic_solver:ScrewPlanner"
 stub = "real2sim2real.planner.planner_stub:StubPlanner"
 pickplace_cloth = "real2sim2real.planner.planner_physic_solver:PickPlaceClothPlanner"
 newton_cloth_franka = "real2sim2real.planner.planner_physic_solver:OfficialClothPlanner"
@@ -68,6 +75,8 @@ sorting_stream = "real2sim2real.planner.planner_sorting:SortingStreamPlanner"
 fire_patrol = "real2sim2real.planner.planner_fire_inspection:FirePatrolPlanner"
 
 [project.entry-points."real2sim2real.job.backends"]
+pickplace_carton = "real2sim2real.job.job_physic_solver:CartonJob"
+screw_assembly = "real2sim2real.job.job_physic_solver:ScrewJob"
 stub = "real2sim2real.job.job_stub:StubJob"
 pickplace_cloth = "real2sim2real.job.job_physic_solver:PhysicSolverJob"
 sorting_package = "real2sim2real.job.job_sorting:SortingJob"

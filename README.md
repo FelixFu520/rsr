@@ -12,7 +12,7 @@ Job 都是独立注册的后端，复用同一个 `IsaacsimWorld` 和固定的 J
 
 | 任务 | 内容 | 物理 | 配置 | 文档 |
 |---|---|---|---|---|
-| 求解器验证 | 桌面 Franka 抓放衣服 / 刚体方块 / 自定义柔性包裹，8 个“机器人求解器 + 接触求解器”组合 | Newton（Featherstone、MuJoCo、XPBD、VBD）、PhysX、hybrid | [configs/physic_solver/](configs/physic_solver/) | [docs/physic_solver.md](docs/physic_solver.md) |
+| 求解器验证 | Franka 抓放衣服／方块；V7–V10 包裹的位置、重量、种类与摇晃／附着矩阵；连续主轴螺纹装配 | Newton（Featherstone、MuJoCo、XPBD、VBD）、PhysX、hybrid、hydroelastic接触 | [configs/physic_solver/](configs/physic_solver/) | [docs/physic_solver.md](docs/physic_solver.md) |
 | 分拣包裹 | Pro-M6 双臂把软包和纸箱依次从入料带经平台送到出料带，四路 1K 视频 | MuJoCo（CPU）+ VBD（CUDA） | [configs/sorting/](configs/sorting/) | [docs/sorting.md](docs/sorting.md) |
 | 机器狗巡检 | X30 一句话指令巡航仓库，发现火点、拍照、警示灯报警 | PhysX（CPU）+ Flow 火焰 | [configs/fire_inspection/](configs/fire_inspection/) | [docs/fire_inspection.md](docs/fire_inspection.md) |
 
@@ -78,7 +78,7 @@ rsr/
 │   └── utils/                  # 共用：asset_utils、cameras、kit_process、lerobot_v3
 │                               # 任务：{physic_solver,sorting,fire_inspection}_utils.py
 ├── configs/
-│   ├── physic_solver/          # 8 个求解器组合
+│   ├── physic_solver/          # 原求解器组合、包裹矩阵、纸箱与螺纹装配
 │   ├── sorting/                # mujoco_vbd_sorting.toml + render_profile.json
 │   └── fire_inspection/        # 正式 + 调试
 ├── scripts/
@@ -187,3 +187,5 @@ uv build                                                        # 产物：dist/
 ```
 
 相对路径的 USD 按工作区根解析（源码树、`RSR_REPO_ROOT`，或当前目录上的 `assets/` + `configs/`）。
+
+物理求解器任务新增 [包裹 V7–V10 矩阵、摇晃／附着对照及螺纹装配](docs/physic_solver.md#9-package-v7v10-迁移矩阵与摇晃附着对照)。求解器图表整理见 [物理引擎与求解器](docs/physics_engines.md)。

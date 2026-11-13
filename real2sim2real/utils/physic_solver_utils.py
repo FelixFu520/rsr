@@ -2,6 +2,7 @@
 
 - ``KinematicVBDStepper``：hybrid 世界中由外部给定刚体位姿驱动 VBD 的缓冲步进。
 - ``MovingFrameVBD`` 等：平移不变的 VBD 自接触界限坐标系与接触容量审计。
+- ``VBDSubstepGraph`` / ``proxy_pose_*``：CPU/GPU 双向耦合的局部图捕获与代理几何核对。
 - ``check_package_containment`` 等：闭合袋膜的 NumPy 射线奇偶与点到三角形距离检查。
 """
 
@@ -11,6 +12,75 @@ from functools import cache
 from typing import Any
 
 import numpy as np
+
+
+def proxy_pose_errors(source: np.ndarray, proxy: np.ndarray) -> tuple[float, float]:
+    """Measure maximum proxy position/rotation error, accepting antipodal quaternions."""
+    source, proxy = np.asarray(source, dtype=float), np.asarray(proxy, dtype=float)
+    if source.ndim < 1 or source.shape != proxy.shape or source.shape[-1] != 7 or source.size == 0:
+        raise ValueError("Source and proxy poses must have matching nonempty (..., 7) shapes")
+    if not np.isfinite(source).all() or not np.isfinite(proxy).all():
+        raise ValueError("Proxy poses must be finite")
+    qs, qp = source[..., 3:], proxy[..., 3:]
+    ns, np_ = np.linalg.norm(qs, axis=-1), np.linalg.norm(qp, axis=-1)
+    if np.any(ns <= 0) or np.any(np_ <= 0):
+        raise ValueError("Proxy quaternion norms must be positive")
+    qs, qp = qs / ns[..., None], qp / np_[..., None]
+    dot = np.sum(qs * qp, axis=-1)
+    chord = np.linalg.norm(qs - np.where(dot[..., None] < 0, -qp, qp), axis=-1)
+    angle = 4 * np.arcsin(np.clip(chord * 0.5, 0, 1))
+    return float(np.linalg.norm(source[..., :3] - proxy[..., :3], axis=-1).max()), float(
+        angle.max()
+    )
+
+
+@cache
+def proxy_pose_maximum_kernel() -> Any:
+    """Return the all-substep body proxy geometry audit without importing Warp at module load."""
+    import warp as wp
+
+    @wp.kernel
+    def maximum(
+        source: wp.array[wp.transform], proxy: wp.array[wp.transform], errors: wp.array[float]
+    ):
+        i = wp.tid()
+        position = wp.length(
+            wp.transform_get_translation(source[i]) - wp.transform_get_translation(proxy[i])
+        )
+        a, b = wp.transform_get_rotation(source[i]), wp.transform_get_rotation(proxy[i])
+        qa = wp.normalize(wp.vec4(a[0], a[1], a[2], a[3]))
+        qb = wp.normalize(wp.vec4(b[0], b[1], b[2], b[3]))
+        if wp.dot(qa, qb) < 0.0:
+            qb = -qb
+        angle = 4.0 * wp.asin(wp.min(1.0, 0.5 * wp.length(qa - qb)))
+        wp.atomic_max(errors, 0, position)
+        wp.atomic_max(errors, 1, angle)
+
+    return maximum
+
+
+class VBDSubstepGraph:
+    """Capture only the GPU VBD step when a coupled CPU solver must run between substeps."""
+
+    def __init__(self, solver: Any) -> None:
+        import warp as wp
+
+        self.wp, self.model, self.original = wp, solver.model, solver.step
+        self.graphs: dict[tuple, Any] = {}
+        self.warmed: set[tuple] = set()
+
+    def __call__(self, state_in: Any, state_out: Any, control: Any, contacts: Any, dt: float):
+        key = (id(state_in), id(state_out), id(control), id(contacts), dt)
+        if key not in self.warmed:
+            self.original(state_in, state_out, control, contacts, dt)
+            self.warmed.add(key)
+            return
+        if key not in self.graphs:
+            with self.wp.ScopedCapture(device=self.model.device) as capture:
+                self.original(state_in, state_out, control, contacts, dt)
+            self.graphs[key] = capture.graph
+        self.wp.capture_launch(self.graphs[key])
+
 
 # ================================================================================================
 # Buffered Newton VBD stepping for externally prescribed kinematic colliders.
@@ -156,6 +226,9 @@ def moving_frame_vbd_class() -> type:
             self, state_in: Any, state_out: Any, control: Any, contacts: Any, dt: float
         ) -> None:
             """Advance VBD and keep maxima so a transient overflow cannot pass validation."""
+            assistance = getattr(self, "jaw_assistance", None)
+            if assistance is not None:
+                assistance.apply(state_in, state_out, dt)
             super().step(state_in, state_out, control, contacts, dt)
             info = self.trimesh_collision_detector.collision_info
             for slot, counts in enumerate(
@@ -358,3 +431,280 @@ def check_package_containment(
         checkpoints=rows,
         method="oblique_ray_parity_and_exact_point_triangle_distance",
     )
+
+
+# ================================================================================================
+# Explicit, finite-compliance jaw assistance and smooth shake trajectories.
+# ================================================================================================
+
+
+def shake_displacement(
+    elapsed_s: float, duration_s: float, frequency_hz: float, amplitudes: np.ndarray
+) -> np.ndarray:
+    """Return a sinusoid with zero displacement and velocity at both endpoints."""
+    if duration_s <= 0 or elapsed_s <= 0 or elapsed_s >= duration_s:
+        return np.zeros_like(amplitudes, dtype=float)
+    envelope = np.sin(np.pi * elapsed_s / duration_s) ** 2
+    return np.asarray(amplitudes) * envelope * np.sin(2 * np.pi * frequency_hz * elapsed_s)
+
+
+def package_gripper_activation(elapsed_s: float, ramp_s: float, *, closed: bool) -> float:
+    """Smooth an optional jaw command without changing the final physical finger opening."""
+    if ramp_s <= 0:
+        return 0.1 if closed else 0.8
+    u = float(np.clip(elapsed_s / ramp_s, 0, 1))
+    blend = u * u * (3 - 2 * u)
+    return 0.8 - 0.7 * blend if closed else 0.1 + 0.7 * blend
+
+
+def package_finger_reference(
+    activation: float, open_m: float, closed_m: float, preload_n: float, stiffness_n_m: float
+) -> float:
+    """Express a bounded actuator's closing preload as a PD equilibrium offset, not a pose."""
+    if preload_n < 0 or stiffness_n_m <= 0:
+        raise ValueError("Closing preload must be nonnegative and finger stiffness positive")
+    blend = float(np.clip((activation - 0.1) / 0.7, 0.0, 1.0))
+    return closed_m + blend * (open_m - closed_m) - (1 - blend) * preload_n / stiffness_n_m
+
+
+@cache
+def _jaw_spring_kernel() -> Any:
+    import warp as wp
+
+    @wp.kernel
+    def apply(
+        points: wp.array[wp.vec3],
+        velocities: wp.array[wp.vec3],
+        old_bodies: wp.array[wp.transform],
+        new_bodies: wp.array[wp.transform],
+        ids: wp.array[int],
+        bodies: wp.array[int],
+        local: wp.array[wp.vec3],
+        enabled: wp.array[float],
+        stiffness: float,
+        damping: float,
+        maximum_force: float,
+        dt: float,
+        forces: wp.array[wp.vec3],
+    ):
+        slot = wp.tid()
+        particle = ids[slot]
+        if enabled[0] > 0.0 and particle >= 0:
+            body = bodies[slot]
+            old = wp.transform_point(old_bodies[body], local[slot])
+            target = wp.transform_point(new_bodies[body], local[slot])
+            force = stiffness * (target - points[particle])
+            force += damping * ((target - old) / dt - velocities[particle])
+            magnitude = wp.length(force)
+            if magnitude > maximum_force:
+                force *= maximum_force / magnitude
+            forces[particle] += force
+
+    return apply
+
+
+class JawSpringAssistance:
+    """Releasable local particle/body springs; never change positions, masses or flags."""
+
+    def __init__(self, model: Any, config: Any) -> None:
+        import warp as wp
+
+        self.model, self.config, self.wp = model, config, wp
+        capacity = 2 * config.attachment_vertices_per_group
+        self.ids = wp.array(np.full(capacity, -1, np.int32), dtype=int, device=model.device)
+        self.bodies = wp.zeros(capacity, dtype=int, device=model.device)
+        self.local = wp.zeros(capacity, dtype=wp.vec3, device=model.device)
+        self.enabled = wp.zeros(1, dtype=float, device=model.device)
+        self.records: list[dict[str, Any]] = []
+        self.active = False
+        self.was_bound = False
+
+    def bind(self, runtime: Any) -> None:
+        """Select distinct local points only near the measured native finger pad boxes."""
+        points = runtime.vertices()
+        poses = runtime.state_0.body_q.numpy()
+        shape_bodies = self.model.shape_body.numpy()
+        shape_types = self.model.shape_type.numpy()
+        transforms = self.model.shape_transform.numpy()
+        extents = self.model.shape_scale.numpy()
+        shape_flags = self.model.shape_flags.numpy()
+        used: set[int] = set()
+        selected, owners, local_points = [], [], []
+        split = runtime.scene.garment_count
+        for side in ("left", "right"):
+            body = runtime.contact_body_ids[side]
+            pose = poses[body]
+            # quat xyzw to matrix; importing the planner here would introduce a cycle.
+            x, y, z, w = pose[3:]
+            rotation = np.array(
+                [
+                    [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                    [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                    [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+                ]
+            )
+            local = (points - pose[:3]) @ rotation
+            distance = np.full(len(points), np.inf)
+            boxes = [
+                int(shape)
+                for shape in np.flatnonzero(shape_bodies == body)
+                if int(shape_types[shape]) == int(runtime.newton.GeoType.BOX)
+                and shape_flags[shape] & int(runtime.newton.ShapeFlags.COLLIDE_PARTICLES)
+                and np.allclose(transforms[shape, 3:6], 0, atol=1e-5)
+            ]
+            if not boxes:
+                raise ValueError(f"No active local finger-pad box for {side}")
+            # The distal axis-aligned box is the native rubber tip or the declared V7 pad.
+            for shape in [max(boxes, key=lambda i: transforms[i, 2])]:
+                delta = np.abs(local - transforms[shape, :3]) - extents[shape]
+                signed = np.linalg.norm(np.maximum(delta, 0), axis=1) + np.minimum(delta.max(1), 0)
+                distance = np.minimum(distance, np.abs(signed))
+            # Adhesion acts on the exterior film; contents remain supported by bag contacts.
+            for material, start, end in (("bag", split, len(points)),):
+                candidates = np.arange(start, end)
+                candidates = candidates[
+                    distance[candidates] <= self.config.attachment_capture_distance_m
+                ]
+                candidates = [
+                    int(i)
+                    for i in candidates[np.argsort(distance[candidates])]
+                    if int(i) not in used
+                ]
+                chosen = candidates[: self.config.attachment_vertices_per_group]
+                if len(chosen) < 3:
+                    raise RuntimeError(
+                        f"Insufficient local {material} points at {side} pad: {len(chosen)}"
+                    )
+                used.update(chosen)
+                selected.extend(chosen)
+                owners.extend([body] * len(chosen))
+                local_points.extend(local[chosen])
+                self.records.append(
+                    dict(
+                        side=side,
+                        body_id=body,
+                        capture_time_s=float(runtime.sim_time),
+                        material=material,
+                        ids=chosen,
+                        local_points_m=local[chosen].tolist(),
+                        distances_m=distance[chosen].tolist(),
+                    )
+                )
+        for destination, values in (
+            (self.ids, selected),
+            (self.bodies, owners),
+            (self.local, local_points),
+        ):
+            self.wp.copy(
+                destination,
+                self.wp.array(values, dtype=destination.dtype, device=self.model.device),
+                count=len(selected),
+            )
+        self.enabled.fill_(1.0)
+        self.active = self.was_bound = True
+        self.capture_points = points.copy()
+        self.capture_bodies = poses.copy()
+
+    def release(self) -> None:
+        """Disable spring forces; all dynamic particle state remains untouched."""
+        self.enabled.zero_()
+        self.active = False
+
+    def apply(self, state_in: Any, state_out: Any, dt: float) -> None:
+        """Apply finite spring forces using the actual solved finger motion each substep."""
+        self.wp.launch(
+            _jaw_spring_kernel(),
+            len(self.ids),
+            inputs=[
+                state_in.particle_q,
+                state_in.particle_qd,
+                state_in.body_q,
+                state_out.body_q,
+                self.ids,
+                self.bodies,
+                self.local,
+                self.enabled,
+                self.config.attachment_stiffness_n_m,
+                self.config.attachment_damping_n_s_m,
+                self.config.attachment_max_force_n,
+                dt,
+                state_in.particle_f,
+            ],
+            device=self.model.device,
+        )
+
+
+def package_grasp_quaternion(yaw_deg: float = 0, pitch_deg: float = 0) -> np.ndarray:
+    """Compose world yaw/pitch with the existing downward parcel grasp, returning xyzw."""
+    yaw, pitch = np.deg2rad([yaw_deg, pitch_deg]) / 2
+
+    def multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        return np.r_[
+            a[3] * b[:3] + b[3] * a[:3] + np.cross(a[:3], b[:3]), a[3] * b[3] - np.dot(a[:3], b[:3])
+        ]
+
+    return multiply(
+        multiply(
+            np.array([0, 0, np.sin(yaw), np.cos(yaw)]),
+            np.array([0, np.sin(pitch), 0, np.cos(pitch)]),
+        ),
+        np.array([2**-0.5, 2**-0.5, 0, 0]),
+    )
+
+
+def read_obj_triangles(path: str | Any) -> tuple[np.ndarray, np.ndarray]:
+    """Read vertices and triangulate OBJ faces without an optional mesh dependency."""
+    vertices, triangles = [], []
+    with open(path) as stream:
+        for line in stream:
+            words = line.split()
+            if not words:
+                continue
+            if words[0] == "v":
+                vertices.append([float(value) for value in words[1:4]])
+            elif words[0] == "f":
+                ids = [int(value.split("/")[0]) for value in words[1:]]
+                ids = [i - 1 if i > 0 else len(vertices) + i for i in ids]
+                triangles.extend([[ids[0], ids[i], ids[i + 1]] for i in range(1, len(ids) - 1)])
+    points, faces = np.asarray(vertices, np.float32), np.asarray(triangles, np.int32)
+    if points.ndim != 2 or faces.ndim != 2 or not np.isfinite(points).all():
+        raise ValueError(f"Invalid triangle OBJ: {path}")
+    if faces.min() < 0 or faces.max() >= len(points):
+        raise ValueError(f"OBJ face index outside vertex array: {path}")
+    return points, faces
+
+
+@cache
+def contact_maximum_kernel() -> Any:
+    """Return a capture-safe counter audit for every rigid contact substep."""
+    import warp as wp
+
+    @wp.kernel
+    def audit(count: wp.array[int], maximum: wp.array[int]):
+        wp.atomic_max(maximum, 0, count[0])
+
+    return audit
+
+
+def isaac_newton_sdk_environment() -> dict[str, str]:
+    """Find Newton/Warp/USD shipped with the running Isaac Python, without starting Kit."""
+    import os
+    import sys
+    from pathlib import Path
+
+    isaac = Path(sys.executable).resolve().parents[3]
+    usd = next((isaac / "extscache").glob("omni.usd.libs-*/pxr/Gf")).parent.parent.resolve()
+    warp = next((isaac / "extscache").glob("omni.warp.core-1.17.0*"))
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(warp),
+            str(isaac / "exts/isaacsim.pip.newton/pip_prebundle"),
+            str(usd),
+            environment.get("PYTHONPATH", ""),
+        ]
+    )
+    environment["LD_LIBRARY_PATH"] = (
+        str(usd / "bin") + os.pathsep + environment.get("LD_LIBRARY_PATH", "")
+    )
+    return environment
