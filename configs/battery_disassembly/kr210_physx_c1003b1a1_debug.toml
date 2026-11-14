@@ -1,6 +1,67 @@
-# kr210_physx_c1003b1a1_debug — 调试：同一物理与相机，输出到 outputs/debug，允许覆盖并保存失败集。
-# 只跑物理（不录 RGB）：RSR_JOB__RECORDER__RECORD_RGB=false ./scripts/rsr collect run -c <本文件>
+# 调试：640×480 / 15 fps / RTX Minimal 纹理预览（不是纯非光追）。
+# 只跑物理：RSR_JOB__RECORDER__RECORD_RGB=false ./scripts/rsr collect run -c <本文件>
 inherit = "kr210_physx_c1003b1a1.toml"
+
+[sim_world]
+renderer = "MinimalRendering"
+minimal_shading_mode = 2
+minimal_ambient_intensity = 0.5
+width = 640
+height = 480
+rendering_dt = 0.06666666666666667
+rt_subframes = 1
+synchronous_capture = false
+
+[scene]
+dynaconf_merge = false  # 替换相机列表，避免继承时追加同名相机
+backend = "battery_workcell"
+usd_path = "assets/BatteryDisassembly/Scene/Battery/Battery.usd"
+prim_path = "/World/scene"
+position_m = [0.5102575125032827, 0.4987062452981176, 0.0]
+yaw_deg = 0.0
+battery_yaw_deg = -90.0
+
+# -Y 侧抬高约 44° 俯视（源配置 overview_cam，D455 彩色相机内参 f=1.93 mm / 3.896 mm，水平视场 90.6°）
+[[scene.cameras]]
+name = "overview"
+prim_path = "/World/scene/rsr_cameras/overview"
+pose_relative_to = "/World/scene"
+resolution = [640, 480]
+clipping_range = [0.1, 80.0]
+focal_length = 1.93
+horizontal_aperture = 3.896
+pose = { position = [0.13, -3.77, 3.50], orientation_wxyz = [0.913685, 0.386895, -0.048533, -0.114615] }
+
+[robot]
+dynaconf_merge = false
+backend = "kr210_dual"
+usd_path = "assets/BatteryDisassembly/Robot/KR210_L150/kr210_l150.usd"
+urdf_path = "assets/BatteryDisassembly/Robot/KR210_L150/kr210.urdf"
+pose_relative_to = "/World/scene"
+screwdriver_arm = { prim_path = "/World/robots/kr210_01", position_m = [-2.05, 0.0, 0.0], yaw_deg = 90.0 }
+gripper_arm = { prim_path = "/World/robots/kr210_02", position_m = [2.05, 0.0, 0.0], yaw_deg = -90.0 }
+
+# 螺丝刀腕部相机：tool0 下方 0.12 m、侧向 0.26 m，从侧面看批头与螺丝头（画面上方朝机器人）
+[[robot.cameras]]
+name = "screwdriver"
+prim_path = "/World/robots/kr210_01/tool0/rsr_screwdriver_cam"
+pose_relative_to = "/World/robots/kr210_01/tool0"
+resolution = [640, 480]
+clipping_range = [0.02, 20.0]
+focal_length = 1.93
+horizontal_aperture = 3.896
+pose = { position = [0.12, 0.26, 0.0], orientation_wxyz = [0.328173, -0.626341, 0.328173, 0.626341] }
+
+# 夹爪相机：tool0 下 0.24 m（横梁下沿以下）、沿夹爪 x 外移 0.6 m，从盖板一端看两指夹持（源配置位置被腕部遮挡）
+[[robot.cameras]]
+name = "gripper"
+prim_path = "/World/robots/kr210_02/tool0/rsr_gripper_cam"
+pose_relative_to = "/World/robots/kr210_02/tool0"
+resolution = [640, 480]
+clipping_range = [0.02, 20.0]
+focal_length = 1.93
+horizontal_aperture = 3.896
+pose = { position = [0.24, 0.0, 0.60], orientation_wxyz = [0.703666, -0.069677, -0.069677, 0.703666] }
 
 [job]
 output_dir = "outputs/debug/battery_disassembly/kr210_physx_c1003b1a1_debug"
@@ -8,4 +69,5 @@ overwrite_dataset = true
 timeout_s = 7200.0
 
 [job.recorder]
+fps = 15
 save_failed_episodes = true

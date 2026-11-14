@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import math
+import os
+import platform
+import shutil
+import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -11,6 +19,7 @@ import pytest
 from real2sim2real.core.config import apply_settings_file, reset_settings
 from real2sim2real.job.job_battery_disassembly import (
     BatteryAcceptanceConfig,
+    BatteryDisassemblyJob,
     BatteryDisassemblyJobConfig,
     evaluate_battery,
 )
@@ -23,8 +32,9 @@ from real2sim2real.planner.planner_battery_disassembly import (
 )
 from real2sim2real.robot.robot_battery_disassembly import GRIPPER_IN_TOOL0, Kr210DualRobotConfig
 from real2sim2real.scene.scene_battery_disassembly import BatteryWorkcellSceneConfig
-from real2sim2real.simworld.isaacsim import IsaacsimWorldConfig
+from real2sim2real.simworld.isaacsim import IsaacsimWorld, IsaacsimWorldConfig
 from real2sim2real.utils import battery_disassembly_utils as bu
+from scripts.battery_disassembly import collect_battery_disassembly as collector
 
 ROOT = Path(__file__).resolve().parents[1]
 URDF = ROOT / "assets/BatteryDisassembly/Robot/KR210_L150/kr210.urdf"
@@ -244,7 +254,7 @@ def test_evaluate_battery_passes_and_detects_a_lost_screw():
     }
 
 
-@pytest.mark.parametrize("name", ["kr210_physx_c1003b1a1.toml", "kr210_physx_c1003b1a1_debug.toml"])
+@pytest.mark.parametrize("name", [p.name for p in sorted(CONFIGS.glob("*.toml"))])
 def test_configs_route_and_keep_capture(name):
     try:
         apply_settings_file(CONFIGS / name)
@@ -257,11 +267,245 @@ def test_configs_route_and_keep_capture(name):
         assert (240 / job.recorder.fps).is_integer()
         cameras = [*scene.cameras, *robot.cameras]
         assert [c.name for c in cameras] == ["overview", "screwdriver", "gripper"]
-        assert all(c.resolution == (640, 480) for c in cameras)
         debug = name.endswith("_debug.toml")
+        resolution = (640, 480) if debug else ((1024, 768) if "_1k" in name else (2048, 1536))
+        assert all(c.resolution == resolution for c in cameras)
+        assert (world.width, world.height) == resolution
+        assert job.recorder.fps == (15 if debug else 30)
+        assert world.renderer == ("MinimalRendering" if debug else "PathTracing")
+        if "_1k" in name:
+            assert world.multi_gpu is True and world.active_gpu is None
+            assert world.renderer_multithreading is False
+            assert job.monotonic_render_budget_clock
+            assert job.recorder.capture_mode == "parallel_cameras"
+        else:
+            assert world.multi_gpu is False and world.active_gpu == 0
+            assert world.renderer_multithreading is None
+            assert not job.monotonic_render_budget_clock
+            assert job.recorder.capture_mode == "viewport"
+        if debug:
+            assert world.minimal_shading_mode == 2
+        else:
+            assert world.synchronous_capture and world.pathtracing_denoiser
+            assert not world.pathtracing_cached and not world.pathtracing_temporal_denoising
         assert job.output_dir.startswith(
             "outputs/debug/" if debug else "outputs/battery_disassembly/"
         )
         assert job.overwrite_dataset is debug and job.recorder.save_failed_episodes is debug
+    finally:
+        reset_settings()
+
+
+@pytest.mark.parametrize("enabled", [None, False, True])
+def test_renderer_threading_override_preserves_gpu_selection(enabled):
+    """Command recording can be changed without disabling multi-GPU or other backends' defaults."""
+    world = IsaacsimWorld(IsaacsimWorldConfig(renderer_multithreading=enabled, multi_gpu=True))
+    world._settings = Mock()
+    world._settings.get.return_value = world.config.renderer
+    world._configure_rendering()
+    values = {call.args[0]: call.args[1] for call in world._settings.set_bool.call_args_list}
+    if enabled is None:
+        assert "/rtx/multiThreading/enabled" not in values
+    else:
+        assert values["/rtx/multiThreading/enabled"] is enabled
+    assert not any("multiGpu" in key or "/mgpu/" in key for key in values)
+
+
+def test_native_budget_clock_survives_realtime_reversal_and_preserves_other_callers(tmp_path):
+    """A backwards wall clock must not make the GPU budget's elapsed time negative."""
+    if platform.system() != "Linux" or platform.machine() != "x86_64" or not shutil.which("cc"):
+        pytest.skip("native clock regression requires Linux x86_64 and cc")
+    fake = tmp_path / "fake_clock.c"
+    fake.write_text("""
+#define _GNU_SOURCE
+#include <stdint.h>
+#include <time.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+static int64_t fake_ns = 1794658305000000000LL;
+void rewind_clock(void) { fake_ns -= 1000000000LL; }
+int clock_gettime(clockid_t id, struct timespec *t) {
+    if (id != CLOCK_REALTIME) return syscall(SYS_clock_gettime, id, t);
+    t->tv_sec = fake_ns / 1000000000LL; t->tv_nsec = fake_ns % 1000000000LL;
+    return 0;
+}
+""")
+    gpu = tmp_path / "gpu.c"
+    gpu.write_text("""
+#include <stdint.h>
+int64_t now(void) __asm__("_ZNSt6chrono3_V212system_clock3nowEv");
+int64_t sample(void) { volatile int64_t value = now(); return value; }
+""")
+    fake_lib = tmp_path / "fake_clock.so"
+    gpu_lib = tmp_path / "libgpu.foundation.plugin.so"
+    for source, library in ((fake, fake_lib), (gpu, gpu_lib)):
+        subprocess.run(["cc", "-shared", "-fPIC", str(source), "-o", str(library)], check=True)
+    environment = os.environ.copy()
+    environment["LD_PRELOAD"] = str(fake_lib) + ":" + environment.get("LD_PRELOAD", "")
+    script = """
+import ctypes, json, sys
+ctypes.CDLL("libstdc++.so.6", mode=ctypes.RTLD_GLOBAL)
+lib = ctypes.CDLL(None)
+wall = getattr(lib, "_ZNSt6chrono3_V212system_clock3nowEv")
+wall.restype = ctypes.c_int64
+gpu = ctypes.CDLL(sys.argv[1]); gpu.sample.restype = ctypes.c_int64
+first, real = gpu.sample(), wall()
+lib.rewind_clock()
+print(json.dumps({"budget_delta": gpu.sample() - first, "other_delta": wall() - real}))
+"""
+
+    def sample():
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(gpu_lib)],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return json.loads(result.stdout)
+
+    baseline = sample()
+    assert baseline["budget_delta"] == baseline["other_delta"] == -1_000_000_000
+    report = collector._prepare_budget_clock(tmp_path, environment)
+    corrected = sample()
+    assert corrected["budget_delta"] >= 0
+    assert corrected["other_delta"] == -1_000_000_000
+    assert report["mode"] == "monotonic_epoch"
+
+
+def test_requested_native_clock_cannot_silently_run_without_bootstrap(monkeypatch):
+    monkeypatch.setattr("ctypes.CDLL", lambda *args: SimpleNamespace())
+    job = object.__new__(BatteryDisassemblyJob)
+    job.config = BatteryDisassemblyJobConfig(monotonic_render_budget_clock=True)
+    with pytest.raises(RuntimeError, match="collect_battery_disassembly.py"):
+        job.before_init_world_hook()
+
+
+@pytest.mark.parametrize(
+    "failure", ["native_physics_step", "stale_camera", "empty_rgb", "reduced_pt_samples"]
+)
+def test_parallel_capture_rejects_unsynchronized_frames_and_restores_physics(
+    tmp_path, monkeypatch, failure
+):
+    """A renderer must not silently advance PhysX or write a stale camera frame."""
+    matrix = np.eye(4)
+    usd = SimpleNamespace(
+        XformCache=lambda: SimpleNamespace(
+            GetLocalToWorldTransform=lambda prim: SimpleNamespace(GetInverse=lambda: matrix)
+        )
+    )
+    monkeypatch.setitem(sys.modules, "pxr", SimpleNamespace(UsdGeom=usd))
+    values = {"/app/player/playSimulations": True, "/rtx/pathtracing/totalSpp": 32}
+    native_steps = [10]
+    world = SimpleNamespace(
+        physics_steps=10,
+        _settings=SimpleNamespace(
+            get=values.get, set=values.__setitem__, set_bool=values.__setitem__
+        ),
+        _manager=SimpleNamespace(get_num_physics_steps=lambda: native_steps[0]),
+        config=SimpleNamespace(
+            rt_subframes=4,
+            renderer="PathTracing" if failure == "reduced_pt_samples" else "RayTracedLighting",
+            samples_per_pixel_per_frame=64,
+        ),
+        update=lambda: None,
+        is_playing=lambda: True,
+        stage=SimpleNamespace(GetPrimAtPath=lambda path: path),
+    )
+
+    def render(**kwargs):
+        if failure == "native_physics_step":
+            native_steps[0] += 1
+
+    capture = object.__new__(bu.BatteryCameraCapture)
+    capture.world = world
+    capture.rep = SimpleNamespace(orchestrator=SimpleNamespace(step=render))
+    capture.cameras = [SimpleNamespace(name="overview", prim_path="/Camera", resolution=(8, 6))]
+    actual = matrix.copy()
+    actual[3, 0] = 1.0 if failure == "stale_camera" else 0.0
+    rgb = np.empty(0) if failure == "empty_rgb" else np.zeros((6, 8, 4), dtype=np.uint8)
+    capture.annotators = [
+        (
+            SimpleNamespace(get_data=lambda: rgb),
+            SimpleNamespace(get_data=lambda: {"cameraViewTransform": actual}),
+        )
+    ]
+    path = tmp_path / "frame.png"
+    with pytest.raises(RuntimeError):
+        capture.capture({"overview": path})
+    assert values["/app/player/playSimulations"] is True
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("physical_ok,video_ok", [(False, True), (True, False), (True, True)])
+def test_collector_publishes_only_after_both_acceptance_gates(
+    tmp_path, monkeypatch, physical_ok, video_ok
+):
+    """A zero Kit exit code cannot publish a failed task or an invalid video."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    output = root / "outputs/battery_disassembly/episode"
+    run = root / "outputs/debug/battery_disassembly/run"
+    config = root / "formal.toml"
+    config.write_text(
+        f'inherit = "{CONFIGS / "kr210_physx_c1003b1a1.toml"}"\n[job]\noutput_dir = "{output}"\n'
+    )
+    monkeypatch.setattr(collector, "ROOT", root)
+
+    class FinishedKit:
+        pid = 12345
+        returncode = 0
+
+        def __init__(self, *args, env, **kwargs):
+            staging = Path(env["RSR_JOB__OUTPUT_DIR"])
+            meta = staging / "lerobot_v3/meta"
+            physics = meta / "physics/episode_000000"
+            physics.mkdir(parents=True)
+            result = dict(
+                success=physical_ok, completed=True, dataset_use="demonstration", images=2
+            )
+            (staging / "result.json").write_text(json.dumps(result))
+            (meta / "task_outcome.json").write_text(json.dumps({"result": result}))
+            (meta / "info.json").write_text(json.dumps({
+                "fps": 30, "features": {"observation.images.overview": {
+                    "dtype": "video", "shape": [1536, 2048, 3],
+                }}, "video_path": (
+                    "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+                ),
+            }))  # fmt: skip
+            (physics / "configuration.json").write_text(json.dumps({
+                "sim_world": IsaacsimWorldConfig.from_settings("sim_world").model_dump(mode="json"),
+            }))  # fmt: skip
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(collector.subprocess, "Popen", FinishedKit)
+    validated = []
+
+    def independent_validation(staging):
+        assert not output.exists()
+        validated.append(staging)
+        video = staging / "lerobot_v3/videos/observation.images.overview/chunk-000/file-000.mp4"
+        video.parent.mkdir(parents=True)
+        video.write_bytes(b"fake video; decoding is the independent validator's responsibility")
+        return {"passed": video_ok, "videos": {"overview": str(video)}}
+
+    monkeypatch.setattr(collector, "validate", independent_validation)
+    try:
+        if physical_ok and video_ok:
+            assert collector.collect(config, run) == output
+            assert (output / "overview.mp4").is_file()
+            assert not (run / "capture").exists()
+            report = json.loads((output / "validation.json").read_text())
+            assert all(str(output) in path for path in report["videos"].values())
+        else:
+            with pytest.raises(RuntimeError):
+                collector.collect(config, run)
+            assert not output.exists()
+            assert (run / "capture/result.json").exists()
+        assert bool(validated) is physical_ok
+        status = json.loads((run / "status.json").read_text())
+        assert status["state"] == ("complete" if physical_ok and video_ok else "failed")
     finally:
         reset_settings()

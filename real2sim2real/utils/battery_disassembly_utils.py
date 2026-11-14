@@ -1,4 +1,4 @@
-"""Pure numpy helpers of the dual-KR210 battery disassembly task (no Kit / pxr imports).
+"""Helpers of the dual-KR210 battery disassembly task (Kit / pxr imports are lazy).
 
 Sections:
 
@@ -8,6 +8,7 @@ Sections:
 4. Collision proxy layouts in the Battery.usd asset frame (boxes only).
 5. Physical laws used by the controller (magnetic bit holding force).
 6. Acceptance helpers shared by the Job and ``scripts/battery_disassembly/validate_*.py``.
+7. Fixed-camera RGB capture with explicit GPU allocation (runtime imports only).
 """
 
 from __future__ import annotations
@@ -550,3 +551,110 @@ def thread_report(rows: list[dict[str, Any]], pitch_m: float) -> dict[str, float
 def tilt_deg(quat: Any) -> float:
     """Angle between a body's +Z axis and world +Z."""
     return math.degrees(math.acos(np.clip(quat_to_matrix(quat)[2, 2], -1.0, 1.0)))
+
+
+# ================================================================================================
+# 7. Parallel camera rendering: fixed products avoid switching one viewport between all cameras.
+# ================================================================================================
+
+
+class BatteryCameraCapture:
+    """Capture all cameras together without advancing physics; pin products across active GPUs."""
+
+    def __init__(self, world: Any, cameras: list[Any]) -> None:
+        import omni.replicator.core as rep
+        from isaacsim.core.rendering_manager import ViewportManager
+        from omni.kit.viewport.utility import get_active_viewport
+
+        self.world, self.cameras, self.rep = world, cameras, rep
+        self.products: list[Any] = []
+        self.annotators: list[tuple[Any, Any]] = []
+        self.viewport = get_active_viewport()
+        self.viewport_enabled = self.viewport.updates_enabled if self.viewport else None
+        self.capture_on_play = world._settings.get("/omni/replicator/captureOnPlay")
+        try:
+            rep.orchestrator.set_capture_on_play(False)
+            for camera in cameras:
+                product = rep.create.render_product(
+                    camera.prim_path, camera.resolution, name=f"rsr_{camera.name}"
+                )
+                self.products.append(product)
+                rgb = rep.AnnotatorRegistry.get_annotator("rgb")
+                params = rep.AnnotatorRegistry.get_annotator("camera_params")
+                self.annotators.append((rgb, params))
+                rgb.attach(product)
+                params.attach(product)
+            self.assignments = (
+                ViewportManager.optimize_render_products(root="/Render")
+                if world.config.multi_gpu
+                else {}
+            )
+            if self.viewport:
+                self.viewport.updates_enabled = False
+        except BaseException:
+            self.close()
+            raise
+
+    def capture(self, paths: dict[str, Path]) -> None:
+        """Write synchronized RGB and verify camera matrices and the native physics counter."""
+        from PIL import Image
+        from pxr import UsdGeom
+
+        if set(paths) != {camera.name for camera in self.cameras}:
+            raise ValueError("Capture paths must match every configured camera")
+        world = self.world
+        key = "/app/player/playSimulations"
+        previous = world._settings.get(key)
+        before = (world.physics_steps, world._manager.get_num_physics_steps())
+        world._settings.set_bool(key, False)
+        try:
+            # Publish new physical transforms before resetting PT accumulation. All
+            # products keep their camera, so there is no per-camera settling barrier.
+            world.update()
+            self.rep.orchestrator.step(
+                rt_subframes=world.config.rt_subframes,
+                pause_timeline=False,
+                delta_time=0.0,
+                wait_for_render=True,
+            )
+            if (
+                world.config.renderer == "PathTracing"
+                and world._settings.get("/rtx/pathtracing/totalSpp")
+                != world.config.samples_per_pixel_per_frame
+            ):
+                raise RuntimeError(
+                    "Parallel capture changed the requested PathTracing sample count"
+                )
+            if (world.physics_steps, world._manager.get_num_physics_steps()) != before:
+                raise RuntimeError("Parallel camera capture advanced physics")
+            if not world.is_playing():
+                raise RuntimeError("Parallel camera capture paused the physics timeline")
+            for camera, (annotator, params) in zip(self.cameras, self.annotators, strict=True):
+                data = np.asarray(annotator.get_data())
+                if data.shape != (camera.resolution[1], camera.resolution[0], 4):
+                    raise RuntimeError(f"Invalid RGB shape for {camera.name}: {data.shape}")
+                actual = np.asarray(params.get_data()["cameraViewTransform"]).reshape(4, 4)
+                expected = np.asarray(
+                    UsdGeom.XformCache()
+                    .GetLocalToWorldTransform(world.stage.GetPrimAtPath(camera.prim_path))
+                    .GetInverse()
+                )
+                if not np.allclose(actual, expected, rtol=0, atol=1e-5):
+                    raise RuntimeError(f"Stale camera pose in captured RGB: {camera.name}")
+                Image.fromarray(data[:, :, :3]).save(paths[camera.name])
+        finally:
+            world._settings.set(key, previous if previous is not None else True)
+
+    def close(self) -> None:
+        """Release camera products before Kit closes and restore the existing viewport."""
+        for annotators in self.annotators:
+            for annotator in annotators:
+                annotator.detach()
+        self.annotators.clear()
+        for product in self.products:
+            product.destroy()
+        self.products.clear()
+        if self.viewport is not None:
+            self.viewport.updates_enabled = self.viewport_enabled
+            self.viewport = None
+        self.world._settings.set("/omni/replicator/captureOnPlay", self.capture_on_play)

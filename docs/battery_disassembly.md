@@ -33,7 +33,7 @@ place_robot     两台 KR210 引用、基座固定到配置位姿；螺丝刀与
 start_simulation
   before hook   reset → play → 张量视图 → 两臂回零 → 订阅接触报告
   simulate      每个物理步：读关节传感器 → 规划器下发驱动目标与磁力 → 螺纹走完则断开保持关节
-                → 每 16 步三路相机各采一张 → PhysX 一步
+                → 正式每 8 步（30 fps）、调试每 16 步（15 fps）三路相机各采一张 → PhysX 一步
                 → 结束后在完整状态记录上验收 → 导出 LeRobot v3 + meta/physics
 finally: close
 ```
@@ -55,7 +55,39 @@ finally: close
 
 ## 2. 当前结果
 
-正式采集 2026-11-14 08:29–08:52 UTC，单个 Kit 进程。物理与 08:05 UTC 的调试运行 `rgb4` 逐位相同
+### 当前：1K 双 GPU 采集，单调时钟补丁长测中
+
+当前采集三路 **1024×768、30 fps**，保留 PathTracing 64 spp、6 次反弹、OptiX 降噪和
+PhysX CPU TGS 240 Hz。单个 Kit 进程使用双 GPU；三路固定 RenderProduct 并行采集。
+多卡利用率骤降已定位到墙钟回跳引发的显存预算计时异常，进程内单调时钟补丁正在连续验证。
+原因、证据、使用方法和未通过的方案集中见[第 11.1 节](#render-budget-clock)。
+
+本轮运行目录为 `outputs/debug/battery_disassembly/clock_1k_20261114T1233Z/`；实时进度见
+[status.json](../outputs/debug/battery_disassembly/clock_1k_20261114T1233Z/status.json)，
+持续验证见 [verification.json](../outputs/debug/battery_disassembly/clock_1k_20261114T1233Z/verification.json)。
+已越过先前第 36 / 50 / 60 / 124 组的退化位置，并在实际墙钟回跳时继续渲染。
+这属于在途验证；完整 1K 视频、整段物理验收和最终视频关键帧复核仍待完成。
+
+通过物理及独立视频校验后，采集器才发布至
+`outputs/battery_disassembly/kr210_physx_c1003b1a1_1k/`，提供
+`overview.mp4`、`screwdriver.mp4`、`gripper.mp4`。最终关键帧视觉复核状态记录在
+`capture_manifest.json`，未查看前明确标为 pending；已有 640 正式结果保留。
+
+### 已停止：2K 单卡 PathTracing 采集
+
+2026-11-14 09:29 UTC 按用户“PathTracing 优先最高画质、接受长时间渲染”的选择启动新采集。
+三路 2048×1536、30 fps、64 spp、6 次反弹、OptiX 降噪；原估计 40–60 h，超时 72 h。
+第 49 组开始发生渲染调度等待，每组三路从约 43 s 增至约 446 s，原估计失效。
+最后完成 50 组（约 1.64 s 仿真时间），用户改为 1K 多卡后停止；原帧、日志与线程栈保留，不作为正式结果。
+运行记录以
+[status.json](../outputs/debug/battery_disassembly/pathtracing_2k_20261114T0929Z/status.json) 为准，
+[capture.log](../outputs/debug/battery_disassembly/pathtracing_2k_20261114T0929Z/capture.log) 留存完整日志。
+采集脚本自动重算物理验收、核对帧数/分辨率/fps、完整解码并生成关键帧拼图；
+未通过和被取消的结果保留在 debug，已有 640 正式结果不覆盖。直接视频入口指向 LeRobot 原视频，无二次压缩。
+
+### 历史 640 采集
+
+历史 640 采集 2026-11-14 08:29–08:52 UTC，单个 Kit 进程。物理与 08:05 UTC 的调试运行 `rgb4` 逐位相同
 （状态记录逐项最大差 0），PhysX CPU 在本机可复现。
 
 | 项目 | 结果 |
@@ -138,16 +170,40 @@ PhysX CPU TGS，240 Hz。理由：
 
 ### 3.6 相机
 
-三路 640×480、15 fps、RTX 实时渲染（`RayTracedLighting`），D455 彩色相机内参（f 1.93 mm / 孔径 3.896 mm，
-水平视场 90.6°）。俯视相机沿用源配置位姿；源配置的夹爪相机在 tool0 后上方 0.5 m，被机器人腕部遮挡，
+三路相机保持 4:3 宽高比，D455 彩色相机内参（f 1.93 mm / 孔径 3.896 mm，水平视场 90.6°）。
+俯视相机沿用源配置位姿；源配置的夹爪相机在 tool0 后上方 0.5 m，被机器人腕部遮挡，
 改到 tool0 下 0.24 m（夹爪横梁下沿以下）、沿夹爪 x 外移 0.6 m，从盖板一端平视两指夹持；螺丝刀相机改到
 批头侧面 0.26 m。录制前每路相机先渲染 3 张不记录的图（RTX 第一帧明显偏暗，调试运行 rgb3 的第 0 帧平均亮度 7/255）。
+
+#### 调试与正式渲染规范
+
+| 用途 | 分辨率 / 输出帧率 | 渲染设置 | 配置 |
+|---|---|---|---|
+| 调试 | 640×480 / 15 fps | `MinimalRendering`、纹理漫反射模式 2、环境补光 0.5、无间接光照 | `kr210_physx_c1003b1a1_debug.toml` |
+| 正式 2K | 2048×1536 / 30 fps | `PathTracing`、64 spp、6 次反弹、OptiX 降噪、同步采集 | `kr210_physx_c1003b1a1.toml` |
+| 正式 1K（当前默认） | 1024×768 / 30 fps | 与 2K 相同画质参数，单进程双 GPU | `kr210_physx_c1003b1a1_1k.toml` |
+
+调试优先非光线追踪渲染，但当前安装的 Isaac Sim 6.2 受支持渲染入口均为 RTX；
+`MinimalRendering` 是简化预览，**仍属于 RTX，不能当作纯非光追**。本机实现
+`app/exts/isaacsim.simulation_app/isaacsim/simulation_app/simulation_app.py` 与
+[6.2 官方渲染模式说明](https://docs.isaacsim.omniverse.nvidia.com/6.2.0/reference_material/rendering_modes.html)
+均确认支持 Minimal 模式。只调物理可设 `record_rgb=false`，完全跳过 RGB 采集。
+
+正式采集保留材质、间接光照、反射和阴影；关闭跨相机光照缓存、时域降噪及 DLSS，避免切换相机时残留旧画面。
+同步采集屏障等待实际渲染完成，每次拍摄前后核对物理步数不变。30 fps 是仿真时间采样率，离线渲染可以慢于实时。
+调试与正式配置的物理参数、轨迹与验收门限相同。历史 640 数据保留，新结果分别写入 `_2k` / `_1k` 目录。
+
+本机 2K 短测：64 spp PathTracing 每路预热采集约 11–15 s，完整三路视频估算超过 40 h；
+实时光追 5 帧的采集耗时 14.79 s，完整 4822 帧约 4 h。用户明确选择 PathTracing，接受长时间渲染；
+因此停止实时光追完整试跑，保留 64 spp PathTracing 正式设置，超时设为 72 h。
+短测留在 `outputs/debug/battery_disassembly/render_profiles/`，两次有限步长试跑的物理验收因未完成任务而失败，
+不能作为演示数据；被停止的完整实时光追采集留在 `outputs/debug/battery_disassembly/capture_2k_rtx/`。
 
 ## 4. 组成
 
 | 能力域 | 后端 | 实现 | 迁移对照（源项目） |
 |---|---|---|---|
-| SimWorld | `isaacsim` | [simworld/isaacsim.py](../real2sim2real/simworld/isaacsim.py)（未改动） | `IsaacsimSimWorld` |
+| SimWorld | `isaacsim` | [simworld/isaacsim.py](../real2sim2real/simworld/isaacsim.py)（新增可选 Minimal 预览，保留原默认行为） | `IsaacsimSimWorld` |
 | Scene | `battery_workcell` | [scene_battery_disassembly.py](../real2sim2real/scene/scene_battery_disassembly.py) | `BatteryKr210Scene` |
 | Robot | `kr210_dual` | [robot_battery_disassembly.py](../real2sim2real/robot/robot_battery_disassembly.py) | `Kr210Robot` |
 | Planner | `battery_unscrew` | [planner_battery_disassembly.py](../real2sim2real/planner/planner_battery_disassembly.py) | `Kr210Planner` + `kr210_ik.py` |
@@ -168,7 +224,9 @@ PhysX CPU TGS，240 Hz。理由：
 | 脚本 | 用途 |
 |---|---|
 | [prepare_battery_disassembly_assets.py](../scripts/battery_disassembly/prepare_battery_disassembly_assets.py) | 复制资产及其依赖闭包，写 `provenance.json` |
+| [collect_battery_disassembly.py](../scripts/battery_disassembly/collect_battery_disassembly.py) | 独立 Kit 子进程采集、保存进度、独立校验、通过后发布；不覆盖旧结果 |
 | [validate_battery_disassembly.py](../scripts/battery_disassembly/validate_battery_disassembly.py) | 独立校验数据集、数据行与物理记录一致、重算验收、关键帧 |
+| [gpu_budget_clock.c](../scripts/battery_disassembly/gpu_budget_clock.c) | GPU 库专用单调时钟补丁，由采集器编译并仅加载到 Kit 子进程 |
 
 ## 5. 资产
 
@@ -213,12 +271,14 @@ assets/BatteryDisassembly/
 
 | 文件 | 用途 | 输出 |
 |---|---|---|
-| [kr210_physx_c1003b1a1.toml](../configs/battery_disassembly/kr210_physx_c1003b1a1.toml) | 正式采集 | `outputs/battery_disassembly/kr210_physx_c1003b1a1/` |
+| [kr210_physx_c1003b1a1.toml](../configs/battery_disassembly/kr210_physx_c1003b1a1.toml) | 正式 2K / 30 fps | `outputs/battery_disassembly/kr210_physx_c1003b1a1_2k/` |
+| [kr210_physx_c1003b1a1_1k.toml](../configs/battery_disassembly/kr210_physx_c1003b1a1_1k.toml) | 正式 1K / 30 fps / 双 GPU（当前默认） | `outputs/battery_disassembly/kr210_physx_c1003b1a1_1k/` |
 | [kr210_physx_c1003b1a1_debug.toml](../configs/battery_disassembly/kr210_physx_c1003b1a1_debug.toml) | 调试：允许覆盖、保存失败集 | `outputs/debug/battery_disassembly/kr210_physx_c1003b1a1_debug/` |
 
 主要字段：`scene.position_m`（源配置工位位姿）、`scene.battery_yaw_deg=-90`、`scene.screw.*`（螺纹、尺寸）、
 `scene.cover.*`（代理、12 kg）、`robot.screwdriver.*` / `robot.gripper.*`、`planner.*`（速度、高度、阶段参数）、
 `job.acceptance.*`（门限）、`job.recorder.record_rgb`（false 只跑物理）。
+`job.monotonic_render_budget_clock` 默认 false，当前 1K 配置启用；其启动要求见[第 11.1 节](#render-budget-clock)。
 
 ## 8. 运行
 
@@ -227,17 +287,20 @@ assets/BatteryDisassembly/
 ./app/python.sh -m pip install -e ".[dev]"
 # 只跑物理（约 6 min）
 RSR_JOB__RECORDER__RECORD_RGB=false ./scripts/rsr collect run -c configs/battery_disassembly/kr210_physx_c1003b1a1_debug.toml
-# 正式采集（约 23 min，其中三路 RTX 采集约 16 min）+ 独立校验
-./scripts/rsr collect run -c configs/battery_disassembly/kr210_physx_c1003b1a1.toml
-./app/python.sh scripts/battery_disassembly/validate_battery_disassembly.py outputs/battery_disassembly/kr210_physx_c1003b1a1
+# 当前默认：正式 1K / 30 fps / 双 GPU PathTracing + 独立校验
+./app/python.sh scripts/battery_disassembly/collect_battery_disassembly.py
+# 保留的 2K 单卡备选，同样自动独立验收
+./app/python.sh scripts/battery_disassembly/collect_battery_disassembly.py --config configs/battery_disassembly/kr210_physx_c1003b1a1.toml
 ```
 
 GUI：`RSR_SIM_WORLD__HEADLESS=false`，`RSR_JOB__INSPECT_GUI=true` 在各阶段停下等 Enter。
+当前 1K 采集还需要 Linux x86_64 的 C 编译器 `cc`（Debian/Ubuntu：`build-essential`）；
+须通过上述采集脚本加载时钟补丁，直接执行 `rsr collect run -c ..._1k.toml` 会因缺少补丁而报错。
 
 ## 9. 输出与数据格式
 
 ```text
-outputs/battery_disassembly/kr210_physx_c1003b1a1/
+outputs/battery_disassembly/kr210_physx_c1003b1a1_2k/
 ├── result.json, validation.json, qa/keyframes.jpg
 ├── diagnostics/<UTC>/           # configuration、state_log.npz、layout、contacts、trajectory.jsonl、result
 └── lerobot_v3/                  # meta/info.json、data/、videos/observation.images.{overview,screwdriver,gripper}/
@@ -281,6 +344,143 @@ Job 在完整状态记录（60 Hz）和接触报告上检查，`scripts/battery_
 
 ## 11. 问题与解决方案
 
+<a id="render-budget-clock"></a>
+
+### 11.1 墙钟回跳导致 GPU 渲染停滞
+
+#### 现象与适用环境
+
+本机环境为 Isaac Sim 6.2 rc.14 / Kit 110.4（构建 `187cf21b`）、Linux x86_64，
+两张 NVIDIA RTX 5880 Ada 48Q vGPU，驱动 570.172.18。
+1K 三路 PathTracing 正常约 6 s/组，运行一段后骤降至约 81 s/组；一条 `carb.tasking` 线程
+占满一个 CPU 核，GPU 0 / GPU 1 利用率约 4% / 0%，主线程在渲染更新中等待。
+更早的视口采集还出现过约 452.6 s/组，记录见
+[render_slowdown.json](../outputs/debug/battery_disassembly/pathtracing_1k_multigpu_20261114T102315Z/render_slowdown.json)。
+这里一“组”指同一采集时刻三路相机各一帧。
+
+#### 已确认的故障链与证据
+
+1. 只读 GDB 栈、寄存器和反汇编将忙线程定位到 `libgpu.foundation.plugin.so` 的显存预算历史更新循环，
+   栈偏移为 `+0x193bf6`、`+0x19609b`，底层反复执行 `memmove`。
+2. 当场捕获“当前时间 − 上次时间”为 **−277,478,771 ns（约 −277.48 ms）**。
+   负差值转换为无符号微秒后回绕，单精度累计秒数达到约 **1.8446744e13 s**。
+3. 历史循环每次减去 0.5 s，在这个量级已无法改变 float32 的值，因此反复删除、搬移、追加历史样本，
+   任务无法完成；主线程等不到预算任务，GPU 随之空闲。
+4. 后续补丁在锁内直接审计 `CLOCK_REALTIME`，实际记录到约 42.7 ms、103.8 ms、43.3 ms 的回退读数，
+   说明本机确实存在墙钟回跳。墙钟尚未追上之前可能连续记录多行，日志行数不能当作独立回跳次数。
+
+原生分析见 [native_finding.json](../outputs/debug/battery_disassembly/mgpu_investigation/native_finding.json)、
+[stalled_native_02.txt](../outputs/debug/battery_disassembly/mgpu_investigation/stalled_native_02.txt) 和
+[hot_function.asm](../outputs/debug/battery_disassembly/mgpu_investigation/hot_function.asm)。
+实际回退读数保存在本轮 `capture.log` 和
+[verification.json](../outputs/debug/battery_disassembly/clock_1k_20261114T1233Z/verification.json)。
+
+**已确认的是墙钟异常和预算循环的数值处理故障；主机墙钟为何回跳仍待系统层定位。**
+没有证据将其归因于桌面最小化、远程连接、某个时间同步服务或驱动；用户确认桌面与终端始终开启。
+本项目没有调整系统时钟、时间同步服务或 NVIDIA SDK 二进制文件。
+
+#### 解决方案：只为 GPU 库提供单调计时
+
+项目补丁 [gpu_budget_clock.c](../scripts/battery_disassembly/gpu_budget_clock.c) 通过 `LD_PRELOAD`
+拦截 C++ `std::chrono::system_clock::now()`，按返回地址识别调用方：
+
+- 来自 `libgpu.foundation.plugin.so` 的调用返回“首次墙钟值 + `CLOCK_MONOTONIC` 增量”；
+  初始化与状态更新受锁保护，生成的时间值严格递增，避免预算统计得到负时间差。
+- 其它调用方仍返回原始 `CLOCK_REALTIME`。补丁作用于该 GPU 库被拦截的计时调用，
+  不修改 PhysX 240 Hz 步长、视频 30 fps、PathTracing 采样和反弹次数。
+- 采集器仅在 Kit 子进程的环境中追加此预加载库，并保留已有 `LD_PRELOAD`；
+  父进程的独立验收流程不加载它。
+
+这是本项目针对当前 SDK 的进程内规避方案，主机墙钟回跳的来源仍需另行排查。
+实现依赖 Linux x86_64 下 libstdc++ 的符号与 64 位返回值 ABI；更换 SDK、平台或标准库后须重新验证，
+不能仅凭配置开关认定拦截仍然生效。
+
+#### 启用方法与归档
+
+当前 [1K 配置](../configs/battery_disassembly/kr210_physx_c1003b1a1_1k.toml) 已设置：
+
+```toml
+[job]
+monotonic_render_budget_clock = true
+```
+
+其它配置默认关闭。系统需要 `cc`；Debian/Ubuntu 可安装 `build-essential`。
+在仓库根目录通过采集器启动：
+
+```bash
+./app/python.sh scripts/battery_disassembly/collect_battery_disassembly.py \
+  --config configs/battery_disassembly/kr210_physx_c1003b1a1_1k.toml
+```
+
+采集器在启动 Kit 前用 `cc -std=c11 -O2 -Wall -Wextra -Werror -fPIC -shared` 编译共享库，
+链接 `dl`、`pthread`，随后设置该子进程的 `LD_PRELOAD`。
+Job 在初始化 Kit 前检查 `rsr_budget_clock_version() == 1`；开启此选项但未加载补丁时立即报错，
+因此不能绕过采集器直接用 `rsr collect run` 启动该配置。
+
+每次运行的审计位置如下（`<run>` 位于 `outputs/debug/battery_disassembly/`）：
+
+| 文件 / 日志 | 用途 |
+|---|---|
+| `<run>/capture/native/gpu_budget_clock.c` | 本次实际使用的源码副本 |
+| `<run>/capture/native/libgpu_budget_clock.so` | 本次编译、预加载的共享库 |
+| `<run>/capture/native/clock.json` | 补丁模式、作用范围、源码与共享库 SHA-256、执行库路径 |
+| `<run>/status.json`、发布后的 `capture_manifest.json` | 进度及 `render_budget_clock` 记录 |
+| `<run>/capture.log` 的 `[rsr-budget-clock] active` | 首次命中目标库的证据；同时含进程和调用库路径 |
+| 同日志的 `[rsr-budget-clock] realtime reversal ... ns=...` | 原墙钟低于此前最大读数超过 1 ms 的审计；预算计时仍使用单调值 |
+
+验收发布时，`<run>/capture/` 整体移动到正式输出目录，补丁文件随之位于 `<output>/native/`；
+`clock.json` 的 `execution_library` 保留原执行路径，源码和共享库的相对路径及 SHA-256 用于发布后核对。
+`status.json` 与 `capture.log` 留在原调试运行目录。
+
+本次 `clock_1k_20261114T1233Z` 长测在正式开关与版本检查加入前，已用同一计时算法的原型启动；
+实际运行的原型源码和共享库已单独归档，原执行配置保持原样。后续新采集使用上述正式入口。
+
+#### 验证结果与完成边界
+
+原生回归测试在无 Kit 的独立子进程中模拟墙钟回退 **1 s**：未加补丁的目标库计时回退 1 s；
+加补丁后目标库计时继续递增，而其它库调用方仍观察到原回退。另有测试确认请求补丁但未加载时，
+Job 在 Kit 初始化前拒绝启动。此前实现的检查结果为 `ruff check` 通过、无 Kit 测试
+**317 通过 / 3 跳过**，三个电池任务配置与后端发现检查通过。
+时钟专项回归位于 [test_battery_disassembly.py](../tests/test_battery_disassembly.py)，可单独运行：
+
+```bash
+./app/python.sh -m pytest -q tests/test_battery_disassembly.py \
+  -k 'native_budget_clock or requested_native_clock'
+```
+
+2026-11-14 **08:00 EST（13:00 UTC）附近**的长测快照：三路各完成 269 帧，近期约 6.60 s/组，
+最慢进度窗口 6.68 s/组；326 次 GPU 采样平均 **82.1% / 44.3%**，峰值 **99% / 94%**，
+显存峰值 7428 / 4689 MiB。实际捕获上述墙钟回退后仍继续采集，未检测到先前的单核空转。
+三路第 100 帧已实际查看，视角和画面正常。持续数据见本轮 `utilization.jsonl` 与 `verification.json`。
+
+这些结果验证了异常输入下的处理及此前退化位置之后的持续运行；完整 episode 尚未完成。
+整段物理验收、三路视频完整解码与最终关键帧复核仍待完成，不能据此将完整 1K 数据记为已验收。
+
+#### 先前对照与排除结果
+
+| 尝试 | 实测与结论 | 最终处理 |
+|---|---|---|
+| 关闭 `/rtx/multiThreading/enabled` | 121 组短测约 11.5 s/组，但后续正式运行仍在第 36 / 124 组附近退化；不能解决计时故障 | 1K 保留 `renderer_multithreading=false`，仅控制 CPU 命令录制，不关闭多 GPU |
+| 三路固定 RenderProduct 并行采集 | 121 组短测平均 5.80 s/组、最慢窗口 6.26 s/组，两卡平均 80.4% / 46.1%；提高吞吐，但不能防止墙钟下溢 | 保留 `capture_mode="parallel_cameras"`，配合单调时钟补丁 |
+| 关闭贴图流送、贴图常驻 | 初始化预算子系统为 0，之后仍注册 `GeometryStreaming...`，约第 50 组复现同一循环；原故障子系统为 `TextureStreaming` | 已撤回启动开关，恢复默认贴图流送 |
+| Carb 只用一个工作线程 | PhysX 初始化时持续等待；首次写入 `extra_args` 的覆盖又被 SDK 后追加的默认 16 线程冲掉，该次试验无效 | 已撤回线程数覆盖，恢复默认 CPU 线程池 |
+
+并行采集使用本机 Isaac Sim 6.2 的 `ViewportManager.optimize_render_products()` 分配 GPU，
+当前 GPU 0 处理 screwdriver / gripper，GPU 1 处理 overview，关闭闲置预览视口渲染；
+两卡负载不要求相等。1K 配置设置 `active_gpu="@none"` 清除父配置主卡选择、`multi_gpu=true`，
+不并行启动多个 Kit。每次采集 `delta_time=0`，并核对 PhysX 步数、相机矩阵、分辨率和 PT 采样。
+接口依据见[Isaac Sim 6.2 多 GPU 相机分配](https://docs.isaacsim.omniverse.nvidia.com/6.2.0/py/source/extensions/isaacsim.core.rendering_manager/docs/index.html#multi-gpu-camera-allocation)。
+
+两个 121 组对照各有 241 条物理记录、25 类字段与已验收 640 轨迹对应前缀逐位相同（最大差 0），
+并行对照三路第 120 帧已查看。但后续回归推翻了“短测已解决长期停滞”的结论，不能用这些部分轨迹替代完整验收。
+详细记录见 [threading_comparison.json](../outputs/debug/battery_disassembly/mgpu_investigation/threading_comparison.json)、
+[parallel_comparison.json](../outputs/debug/battery_disassembly/mgpu_investigation/parallel_comparison.json)、
+[regression.json](../outputs/debug/battery_disassembly/pathtracing_1k_parallel_20261114T113928Z/regression.json) 和
+[resident_native.txt](../outputs/debug/battery_disassembly/mgpu_investigation/resident_native.txt)。
+所有失败、对照和未完成轨迹均保留在 `outputs/debug/battery_disassembly/`。
+
+### 11.2 物理与早期采集问题
+
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | 螺纹探针每圈复位 | rack-and-pinion 关节用包裹转角 | 改为 articulation mimic 螺旋约束 |
@@ -289,7 +489,7 @@ Job 在完整状态记录（60 Hz）和接触报告上检查，`scripts/battery_
 | 拧松阶段超时（测得上升 13 mm） | 螺纹脱开后浮动弹簧把批头和螺丝压回 11 mm，上升量按当前值计算 | 用阶段内最大上升量判定 |
 | 抬升时螺丝掉到桌上 | 磁力参考点是螺丝头顶，叶片插入槽底时反而向下拉，螺丝悬在叶片外 | 参考点改为槽底，贴合时沿工具轴向上拉，叶片留在槽内限位 |
 | 篮子里螺丝永不停（质心 1.3 cm/s，位置不变） | PhysX 默认没有扭转摩擦，躺倒的螺丝绕竖轴一直转 | 螺丝碰撞体 `torsionalPatchRadius` 3 mm、角阻尼 0.2；静止判据改为最后 1.5 s 位移 ≤ 2 mm（速度读数在接触中有 6 mm/s 抖动） |
-| RGB 调试运行变慢到每张图约 170 s（rgb1 在 t=80 s，rgb2 在 t=104 s） | 主线程停在 `SimulationApp.update`（`stall_tracebacks.txt`），一个 `carb.tasking` 线程占满一核、GPU 空闲，与 `docs/halo.md` 第 11 节现象相同；两次都在运行中把 `hold` 的 `physics:jointEnabled` 设为 false 之后（PhysX 日志报 `CreateJoint ... disjointed body transforms`），只跑物理的运行从未变慢 | 终止两次运行（各自 `run_note.json`）；改为 PhysX 可断裂关节，运行中不再改 USD；Job 加 `stall_dump_s` 看门狗 |
+| RGB 调试运行变慢到每张图约 170 s（rgb1 在 t=80 s，rgb2 在 t=104 s） | 主线程停在 `SimulationApp.update`（`stall_tracebacks.txt`），一个 `carb.tasking` 线程占满一核、GPU 空闲；当时均发生在运行中将 `hold` 的 `physics:jointEnabled` 设为 false 之后，PhysX 报 `CreateJoint ... disjointed body transforms`，只跑物理未变慢；缺少当时的原生预算栈，不能据此确认 USD 修改是原因，也不能确认与第 11.1 节同因 | 终止两次运行（各自 `run_note.json`）；当时改为 PhysX 可断裂关节，运行中不再改 USD；Job 加 `stall_dump_s` 看门狗 |
 | 只用断裂扭矩时螺丝不脱出 | 行程上限 + mimic 的止挡太软（角度方向刚度按 gearing² 缩小），转角越过止挡 176° 仍只有不到 0.5 N·m | `turn` 加 5760° 硬上限，`slide` 上限放宽 0.5 mm |
 
 ## 12. 局限

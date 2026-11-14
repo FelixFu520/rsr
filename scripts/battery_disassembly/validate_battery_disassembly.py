@@ -6,8 +6,8 @@ Checks, from the published files only:
 
 1. LeRobot v3 layout, H.264 videos of all three cameras (frame count, fps, size, full decode)
    via ``utils.lerobot_v3.validate_dataset``; no black frames in the sampled images;
-2. every data row equals the archived physics state log at its physics step (``16 i`` at 240 Hz
-   and 15 fps), and the extra columns (screw positions, thread slide, cover pose) match too;
+2. every data row equals the archived physics state log at its physics step (``8 i`` at 240 Hz
+   and 30 fps; ``16 i`` for 15 fps debug), including screw positions, thread slide and cover pose;
 3. the physical acceptance recomputed from ``meta/physics/episode_000000`` equals ``result.json``.
 
 Writes ``validation.json`` and ``qa/keyframes.jpg`` next to ``result.json``; exits non-zero when

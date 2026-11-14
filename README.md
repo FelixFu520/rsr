@@ -31,9 +31,8 @@ Job 都是独立注册的后端，复用同一个 `IsaacsimWorld` 和固定的 J
 # HALO G1：crawl / crouch / sit 各一个正式配置（1024×576/30fps，PathTracing），*_debug.toml 为 640×360/15fps 实时 RTX
 ./scripts/rsr collect run -c configs/halo/g1_physx_crawl.toml
 ./app/python.sh scripts/halo/validate_halo.py outputs/halo/crawl
-# 电池拆解：c1003b1a1 场景，三路 640×480/15fps
-./scripts/rsr collect run -c configs/battery_disassembly/kr210_physx_c1003b1a1.toml
-./app/python.sh scripts/battery_disassembly/validate_battery_disassembly.py outputs/battery_disassembly/kr210_physx_c1003b1a1
+# 电池拆解：c1003b1a1 场景，三路 1024×768/30fps、双卡 PathTracing（另保留 2K 配置）
+./app/python.sh scripts/battery_disassembly/collect_battery_disassembly.py  # 自动采集、独立校验、发布
 ```
 
 ### 输出约定
@@ -94,7 +93,7 @@ rsr/
 │   ├── sorting/                # mujoco_vbd_sorting.toml + render_profile.json
 │   ├── fire_inspection/        # 正式 + 调试
 │   ├── halo/                   # crawl / crouch / sit 正式 + 调试
-│   └── battery_disassembly/    # c1003b1a1 正式 + 调试
+│   └── battery_disassembly/    # c1003b1a1 正式 2K / 1K + 调试 640
 ├── scripts/
 │   ├── rsr                     # 用 Isaac python.sh 启动 CLI
 │   ├── physic_solver/          # 资产准备、批量采集、包裹物理检查与校验、世界模式冒烟测试

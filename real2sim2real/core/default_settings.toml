@@ -6,12 +6,17 @@ console = true  # 文本控制台输出
 [sim_world]
 backend = "stub"  # 不启动 Kit
 # Featherstone 双相机采集示例：renderer="RayTracedLighting"、rt_subframes=4。
+# 渲染规格：调试宽 640 / 15 fps，优先非光追；本机仅支持 RTX，简化预览用
+# renderer="MinimalRendering"、minimal_shading_mode=2、minimal_ambient_intensity=0.5（仍是 RTX）。
+# 正式宽 2048（2K）或 1024（1K）/ 30 fps，PathTracing + 采样/反弹/降噪，保持相机宽高比。
 # samples_per_pixel_per_frame=64 仅 PathTracing 生效；采集核对真实渲染帧及相机矩阵。
 # IsaacsimWorld：pathtracing_max_bounces=4、pathtracing_denoiser=true。
 # pathtracing_temporal_denoising=false；pathtracing_cached/pathtracing_many_light_sampling=true。
 # synchronous_capture=false；高清同步采集示例将其设为 true，并关闭两项光照缓存。
 # background_light_scale=1.0；引用背景子树的灯光强度倍率，官方衣服示例设为 0.25。
 # active_gpu=None、multi_gpu=None：沿用 SimulationApp 默认；halo 设 active_gpu=0/1、multi_gpu=false 单卡渲染。
+# battery_disassembly 的 1K 正式配置：active_gpu=None、multi_gpu=true，单个 Kit 进程使用本机双卡。
+# renderer_multithreading=None：沿用 RTX 的 CPU 命令录制线程设置；false 不关闭多 GPU 或改变画质。
 
 [scene]
 backend = "stub"
@@ -179,4 +184,7 @@ backend = "stub"  # StubJob 只串工厂,不采集
 # halo：50 Hz 控制、图像取最近控制帧；调试 640×360/15 fps 实时 RTX，正式 1024×576/30 fps PathTracing。
 # acceptance.episode="crawl"/"crouch"/"sit"、max_penetration_m=0.005。
 # startup_app_updates=1：写起始状态前的 Kit 更新次数（复现 HALO 轨迹）；max_control_frames=None 可提前结束冒烟测试。
-# battery_disassembly：PhysX 240 Hz、recorder.fps=15、record_rgb=true（false 只跑物理）；max_physics_steps=None。
+# battery_disassembly：PhysX 240 Hz；正式 2048×1536/30 fps PathTracing 64 spp（另有 1K 配置），
+# recorder.capture_mode="viewport"；1K 正式配置使用 "parallel_cameras" 固定三路产品并按相机分配 GPU。
+# monotonic_render_budget_clock=false；1K 采集器在 Linux x86_64 为 GPU 预算计时加载单调时钟补丁。
+# 调试 640×480/15 fps MinimalRendering；record_rgb=true（false 只跑物理）；max_physics_steps=None。

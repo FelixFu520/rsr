@@ -60,7 +60,9 @@ class IsaacsimWorldConfig(BaseConfig):
 
     # 应用与渲染参数：rendering_dt 不决定一次 step 内的物理步数。
     headless: bool = True
-    renderer: Literal["RayTracedLighting", "PathTracing"] = "RayTracedLighting"
+    renderer: Literal["RayTracedLighting", "PathTracing", "MinimalRendering"] = "RayTracedLighting"
+    minimal_shading_mode: int = Field(default=2, ge=0, le=4)
+    minimal_ambient_intensity: FiniteFloat = Field(default=0.5, ge=0)
     width: int = Field(default=1280, gt=0)
     height: int = Field(default=720, gt=0)
     rt_subframes: int = Field(default=1, ge=1)
@@ -76,10 +78,13 @@ class IsaacsimWorldConfig(BaseConfig):
     auto_exposure: bool = False
     fast_shutdown: bool = True
     extensions: list[str] = Field(default_factory=list)
-    # 渲染 GPU：None 沿用 SimulationApp 默认（全部 GPU、多卡渲染）。指定 active_gpu 时
-    # 只用该物理 GPU 渲染；multi_gpu=false 关闭多卡分摊，便于两个采集进程各占一张卡。
+    # 渲染 GPU：None 沿用 SimulationApp 默认；multi_gpu=true 允许全部可用 GPU 协同渲染。
+    # active_gpu 选择主 GPU；multi_gpu=false 时仅用该卡，便于两个采集进程各占一张卡。
     active_gpu: int | None = Field(default=None, ge=0)
     multi_gpu: bool | None = None
+    renderer_multithreading: bool | None = Field(
+        default=None, description="CPU render command recording; independent of multi_gpu"
+    )
 
     # 环境加载二选一：整份打开 stage，或在新建 stage 中引用背景。
     # 桌面物体与机器人由其他组件添加，不能借背景挂载覆盖它们的根路径。
@@ -273,6 +278,8 @@ class IsaacsimWorld(BaseSimWorld):
                     "--/exts/isaacsim.physics.newton/auto_switch_on_startup=false",
                 ],
             }
+            if self.config.renderer == "MinimalRendering":
+                launch["minimal_shading_mode"] = self.config.minimal_shading_mode
             if self.config.active_gpu is not None:
                 launch["active_gpu"] = self.config.active_gpu
             if self.config.multi_gpu is not None:
@@ -331,6 +338,15 @@ class IsaacsimWorld(BaseSimWorld):
         # DLSS is disabled, avoiding incompatible temporal history across cameras.
         self._settings.set_int("/rtx/post/aa/op", 3 if self.config.dlss else 2)
         self._settings.set_bool("/rtx/post/tonemap/autoExposure/enabled", self.config.auto_exposure)
+        if self.config.renderer_multithreading is not None:
+            self._settings.set_bool(
+                "/rtx/multiThreading/enabled", self.config.renderer_multithreading
+            )
+        if self.config.renderer == "MinimalRendering":
+            self._settings.set_int("/rtx/minimal/mode", self.config.minimal_shading_mode)
+            self._settings.set_float(
+                "/rtx/sceneDb/ambientLightIntensity", self.config.minimal_ambient_intensity
+            )
         if self.config.renderer == "PathTracing":
             samples = self.config.samples_per_pixel_per_frame
             self._settings.set_int("/rtx/pathtracing/spp", min(32, samples))

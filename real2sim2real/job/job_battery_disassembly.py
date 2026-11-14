@@ -23,14 +23,14 @@ import shutil
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
 
 from real2sim2real.core.config import BaseConfig
 from real2sim2real.job.base import BaseJob
-from real2sim2real.utils.battery_disassembly_utils import inside_box, tilt_deg
+from real2sim2real.utils.battery_disassembly_utils import BatteryCameraCapture, inside_box, tilt_deg
 from real2sim2real.utils.cameras import validate_camera_list
 from real2sim2real.utils.lerobot_v3 import LeRobotV3Recorder, capture_viewport_frame
 
@@ -44,6 +44,9 @@ class BatteryRecorderConfig(BaseModel):
     save_failed_episodes: bool = False
     log_stride: int = Field(default=4, ge=1, description="physics steps per state-log row")
     warmup_captures: int = Field(default=3, ge=0, description="unrecorded renders per camera")
+    capture_mode: Literal["viewport", "parallel_cameras"] = Field(
+        default="viewport", description="Fixed parallel camera products or the existing viewport"
+    )
 
 
 class BatteryAcceptanceConfig(BaseModel):
@@ -76,6 +79,7 @@ class BatteryDisassemblyJobConfig(BaseConfig):
     timeout_s: FiniteFloat = Field(default=14400.0, gt=0)
     max_physics_steps: int | None = Field(default=None, gt=0, description="smoke tests")
     inspect_gui: bool = False
+    monotonic_render_budget_clock: bool = False
     stall_dump_s: FiniteFloat = Field(
         default=120.0,
         ge=0,
@@ -152,8 +156,24 @@ class BatteryDisassemblyJob(BaseJob):
             shutil.rmtree(dataset)
         self.contacts: _ContactFeed | None = None
         self._stall_file: Any = None
+        self._camera_capture: BatteryCameraCapture | None = None
 
     # --- hooks ---------------------------------------------------------------------------------
+    def before_init_world_hook(self) -> None:
+        """Require the requested native clock to be loaded before Kit starts."""
+        if self.config.monotonic_render_budget_clock:
+            import ctypes
+
+            try:
+                version = ctypes.CDLL(None).rsr_budget_clock_version()
+            except AttributeError as exc:
+                raise RuntimeError(
+                    "monotonic_render_budget_clock requires "
+                    "scripts/battery_disassembly/collect_battery_disassembly.py"
+                ) from exc
+            if version != 1:
+                raise RuntimeError(f"Unsupported GPU budget clock version: {version}")
+
     def after_place_robot_hook(self) -> None:
         """Solve the nominal IK programs; unreachable layouts fail here."""
         self.planner.build(self.scene, self.robot)
@@ -179,10 +199,17 @@ class BatteryDisassemblyJob(BaseJob):
                 viewport.camera_path = self.config.viewport_camera
 
     def close(self) -> None:
-        if self.contacts is not None:
-            self.contacts.close()
-            self.contacts = None
-        super().close()
+        try:
+            if self._camera_capture is not None:
+                self._camera_capture.close()
+                self._camera_capture = None
+        finally:
+            try:
+                if self.contacts is not None:
+                    self.contacts.close()
+                    self.contacts = None
+            finally:
+                super().close()
 
     # --- main loop -----------------------------------------------------------------------------
     def simulate(self) -> None:
@@ -381,6 +408,16 @@ class BatteryDisassemblyJob(BaseJob):
         """Render every camera a few times before frame 0 (the first RTX frame is underexposed)."""
         warm = run / "camera_warmup"
         warm.mkdir()
+        if self.config.recorder.capture_mode == "parallel_cameras":
+            self._camera_capture = BatteryCameraCapture(self.sim_world, self.cameras)
+            assignments = self._camera_capture.assignments
+            self.log.info("相机 GPU 分配", assignments=assignments)
+            (run / "capture_gpu_assignments.json").write_text(json.dumps(assignments, indent=2))
+            for _ in range(self.config.recorder.warmup_captures):
+                self._camera_capture.capture({c.name: warm / f"{c.name}.png" for c in self.cameras})
+            if self.sim_world.physics_steps != 0:
+                raise RuntimeError("Camera warm-up advanced physics")
+            return
         for _ in range(self.config.recorder.warmup_captures):
             for camera in self.cameras:
                 capture_viewport_frame(
@@ -391,6 +428,11 @@ class BatteryDisassemblyJob(BaseJob):
             raise RuntimeError("Camera warm-up advanced physics")
 
     def _capture(self, recorder: LeRobotV3Recorder) -> None:
+        if self._camera_capture is not None:
+            self._camera_capture.capture(
+                {c.name: recorder.frame_path(c.name) for c in self.cameras}
+            )
+            return
         step = self.sim_world.physics_steps
         for camera in self.cameras:
             capture_viewport_frame(
