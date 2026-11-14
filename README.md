@@ -16,6 +16,7 @@ Job 都是独立注册的后端，复用同一个 `IsaacsimWorld` 和固定的 J
 | 分拣包裹 | Pro-M6 双臂把软包和纸箱依次从入料带经平台送到出料带，四路 1K 视频 | MuJoCo（CPU）+ VBD（CUDA） | [configs/sorting/](configs/sorting/) | [docs/sorting.md](docs/sorting.md) |
 | 机器狗巡检 | X30 一句话指令巡航仓库，发现火点、拍照、警示灯报警 | PhysX（CPU）+ Flow 火焰 | [configs/fire_inspection/](configs/fire_inspection/) | [docs/fire_inspection.md](docs/fire_inspection.md) |
 | HALO G1 | 原生 29 关节 G1 在客厅爬过矮桌（crawl）、弯腰走过颈高桌（crouch）、走到沙发坐下（sit），GEAR-SONIC 闭环 | PhysX（CPU，500 Hz） | [configs/halo/](configs/halo/) | [docs/halo.md](docs/halo.md) |
+| 电池拆解 | 双 KR210：电动螺丝刀靠批头接触拧出四颗螺丝放入篮子，平行夹爪摩擦夹起 12 kg 盖板放到托盘 | PhysX（CPU，240 Hz） | [configs/battery_disassembly/](configs/battery_disassembly/) | [docs/battery_disassembly.md](docs/battery_disassembly.md) |
 
 采集命令（仓库根目录）：
 
@@ -30,6 +31,9 @@ Job 都是独立注册的后端，复用同一个 `IsaacsimWorld` 和固定的 J
 # HALO G1：crawl / crouch / sit 各一个正式配置（1024×576/30fps，PathTracing），*_debug.toml 为 640×360/15fps 实时 RTX
 ./scripts/rsr collect run -c configs/halo/g1_physx_crawl.toml
 ./app/python.sh scripts/halo/validate_halo.py outputs/halo/crawl
+# 电池拆解：c1003b1a1 场景，三路 640×480/15fps
+./scripts/rsr collect run -c configs/battery_disassembly/kr210_physx_c1003b1a1.toml
+./app/python.sh scripts/battery_disassembly/validate_battery_disassembly.py outputs/battery_disassembly/kr210_physx_c1003b1a1
 ```
 
 ### 输出约定
@@ -40,6 +44,7 @@ Job 都是独立注册的后端，复用同一个 `IsaacsimWorld` 和固定的 J
 | `outputs/sorting/` | 分拣连续物理源、渲染缓存、`lerobot_v3/`、`qa/` 独立验收 |
 | `outputs/fire_inspection/` | 巡检 `lerobot_v3/`、照片、地图、`validation.json` |
 | `outputs/halo/<crawl,crouch,sit>/` | HALO G1 `lerobot_v3/`（含 `meta/physics` 50 Hz 控制记录）、`validation.json` |
+| `outputs/battery_disassembly/<config>/` | 电池拆解 `lerobot_v3/`（含 `meta/physics` 状态记录与接触）、`validation.json` |
 | `outputs/debug/<task>/` | 调试与未通过验收的结果（`diagnostic` 数据、局部物理、对照实验） |
 
 `outputs/` 下非 debug 目录里的 `lerobot_v3/` 都是通过全部物理验收的 `demonstration` 数据；
@@ -64,7 +69,8 @@ uv lock                                    # 更新 uv.lock（不创建运行时
 不要 `uv sync` 出 `.venv` 当仿真环境。录制依赖 Pillow、PyArrow，视频编码与校验需要系统 `ffmpeg` / `ffprobe`。
 资产（`assets/`）与输出（`outputs/`）不进 git；各任务的资产准备脚本见对应文档。
 每个任务的资产自成一个目录，可单独打包：`assets/PhysicSolver/`（物理求解器验证）、
-`assets/SortingPackage/`（分拣包裹）、`assets/FireInspection/`（机器狗巡检）、`assets/Halo/`（HALO G1）；
+`assets/SortingPackage/`（分拣包裹）、`assets/FireInspection/`（机器狗巡检）、`assets/Halo/`（HALO G1）、
+`assets/BatteryDisassembly/`（电池拆解）；
 其余资产在 `assets/bak/`。
 本项目同时运行的 Isaac Sim 实例不超过两个。
 
@@ -77,23 +83,25 @@ rsr/
 ├── real2sim2real/
 │   ├── core/                   # 配置、Registry、CLI、日志、default_settings.toml
 │   ├── simworld/               # base.py、stub.py、isaacsim.py（统一世界）
-│   ├── scene/                  # base.py、scene_stub.py、scene_{physic_solver,sorting,fire_inspection,halo}.py
-│   ├── robot/                  # base.py、robot_stub.py、robot_{physic_solver,sorting,fire_inspection,halo}.py
-│   ├── planner/                # base.py、planner_stub.py、planner_{physic_solver,sorting,fire_inspection,halo}.py
-│   ├── job/                    # base.py、cli.py、job_stub.py、job_{physic_solver,sorting,fire_inspection,halo}.py
+│   ├── scene/                  # base.py、scene_stub.py、scene_{physic_solver,sorting,fire_inspection,halo,battery_disassembly}.py
+│   ├── robot/                  # base.py、robot_stub.py、robot_{physic_solver,sorting,fire_inspection,halo,battery_disassembly}.py
+│   ├── planner/                # base.py、planner_stub.py、planner_{physic_solver,sorting,fire_inspection,halo,battery_disassembly}.py
+│   ├── job/                    # base.py、cli.py、job_stub.py、job_{physic_solver,sorting,fire_inspection,halo,battery_disassembly}.py
 │   └── utils/                  # 共用：asset_utils、cameras、kit_process、lerobot_v3
-│                               # 任务：{physic_solver,sorting,fire_inspection,halo}_utils.py
+│                               # 任务：{physic_solver,sorting,fire_inspection,halo,battery_disassembly}_utils.py
 ├── configs/
 │   ├── physic_solver/          # 原求解器组合、包裹矩阵、纸箱与螺纹装配
 │   ├── sorting/                # mujoco_vbd_sorting.toml + render_profile.json
 │   ├── fire_inspection/        # 正式 + 调试
-│   └── halo/                   # crawl / crouch / sit 正式 + 调试
+│   ├── halo/                   # crawl / crouch / sit 正式 + 调试
+│   └── battery_disassembly/    # c1003b1a1 正式 + 调试
 ├── scripts/
 │   ├── rsr                     # 用 Isaac python.sh 启动 CLI
 │   ├── physic_solver/          # 资产准备、批量采集、包裹物理检查与校验、世界模式冒烟测试
 │   ├── sorting/                # 一体流程、物理求解、回放渲染、独立验收、同步检查、预览
 │   ├── fire_inspection/        # 资产准备、独立验收
-│   └── halo/                   # 资产准备、独立验收
+│   ├── halo/                   # 资产准备、独立验收
+│   └── battery_disassembly/    # 资产准备、独立验收
 ├── tests/                      # 无 Kit 单元测试
 └── docs/                       # 每个任务一份文档
 ```

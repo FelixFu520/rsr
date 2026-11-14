@@ -1,0 +1,11 @@
+# kr210_physx_c1003b1a1_debug — 调试：同一物理与相机，输出到 outputs/debug，允许覆盖并保存失败集。
+# 只跑物理（不录 RGB）：RSR_JOB__RECORDER__RECORD_RGB=false ./scripts/rsr collect run -c <本文件>
+inherit = "kr210_physx_c1003b1a1.toml"
+
+[job]
+output_dir = "outputs/debug/battery_disassembly/kr210_physx_c1003b1a1_debug"
+overwrite_dataset = true
+timeout_s = 7200.0
+
+[job.recorder]
+save_failed_episodes = true

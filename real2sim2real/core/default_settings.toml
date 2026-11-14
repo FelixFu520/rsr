@@ -44,6 +44,8 @@ backend = "stub"
 # halo_home：引用的 home_010 全部网格设为静态三角网格碰撞，薄地板与 Decals 关闭，由 floor_proxy_* 隐形盒承重。
 # contact_offset_m=0.004、rest_offset_m=0.0005、static_friction=1.0、dynamic_friction=0.8；desk/seat 可选。
 # third_person：width/height、focal_length=1.93、horizontal_aperture=3.896（mm），mode="fixed"/"follow"。
+# battery_workcell：Battery.usd 引用到 /World/scene，battery_yaw_deg=-90；资产碰撞体换成盒体代理（cover/case/basket），
+# 螺丝 M10×1.5 螺纹 24 mm（mimic 螺旋约束，thread_damping_nms_rad=0.002），盖板 cover.mass_kg=12，pallet 托盘。
 
 [robot]
 backend = "stub"
@@ -65,6 +67,8 @@ backend = "stub"
 # g1_sonic：原生 29 关节 G1（三指手），自由基座；SONIC 电机增益，肩肘 arm_stiffness/arm_damping=40/3。
 # 手指 auxiliary_stiffness/damping/effort=20/2/5；head_camera 在 torso_link (0.12,0,0.43)、下俯 25°。
 # place_at_start=false：与 HALO 相同，引用留在资产原点，起始状态由 PhysX 写入。
+# kr210_dual：两台 KR210 L150（保留资产驱动与碰撞）；screwdriver 浮动弹簧 1500 N/m、预伸 8 mm、主轴 2 N·m，
+# 批头磁力 magnet_max_force_n=3、magnet_range_m=0.006；gripper 双指 stroke_m=0.06、max_force_n=200、胶垫 μ=1.0/0.9。
 
 [planner]
 backend = "stub"
@@ -161,6 +165,8 @@ backend = "stub"
 # 拍照后 detect_hold_s=4 原地停留，再报警 alarm_s=3；全程警示灯 alarm_flash_hz=2 爆闪，途中不停留。
 # sonic_tracking：reference_dir/model_dir 指向 assets/Halo；warmup_control_steps=50、joint_limit_margin_rad=0.001。
 # motor_smoothing.enabled=false、seated_hold.enabled=false、seated_target_filter_alpha=None（crawl / sit 打开）。
+# battery_unscrew：transit/approach/contact 速度 0.30/0.06/0.02 m/s；screwdriver.unscrew_speed_rps=3、seek 60°/s；
+# gripper.grasp_root_above_flange_m=0.266、place_clearance_m=0.005；先螺丝刀臂，回零后夹爪臂。
 
 [job]
 # screw_assembly：record_rgb=true；物理诊断设 false，仍走完整 BaseJob 生命周期。
@@ -173,3 +179,4 @@ backend = "stub"  # StubJob 只串工厂,不采集
 # halo：50 Hz 控制、图像取最近控制帧；调试 640×360/15 fps 实时 RTX，正式 1024×576/30 fps PathTracing。
 # acceptance.episode="crawl"/"crouch"/"sit"、max_penetration_m=0.005。
 # startup_app_updates=1：写起始状态前的 Kit 更新次数（复现 HALO 轨迹）；max_control_frames=None 可提前结束冒烟测试。
+# battery_disassembly：PhysX 240 Hz、recorder.fps=15、record_rgb=true（false 只跑物理）；max_physics_steps=None。

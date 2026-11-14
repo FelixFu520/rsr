@@ -1,0 +1,92 @@
+# kr210_physx_c1003b1a1 — 双 KR210 电池拆解（正式采集）
+# 任务：robot01 用电动螺丝刀拧出四颗 M10 螺丝放入篮子，robot02 用平行夹爪把 12 kg 盖板放到托盘。
+# 物理：PhysX CPU TGS 240 Hz。双臂由关节驱动跟踪 IK 轨迹（碰撞开启）；螺丝刀浮动弹簧 + 主轴速度驱动 +
+#       十字批头接触拧松；螺纹为 mimic 螺旋约束（M10×1.5，24 mm）；批头磁力持螺丝；夹爪摩擦夹持盖板。
+# 资产：./app/python.sh scripts/battery_disassembly/prepare_battery_disassembly_assets.py
+# 运行：./scripts/rsr collect run -c configs/battery_disassembly/kr210_physx_c1003b1a1.toml
+# 输出：outputs/battery_disassembly/kr210_physx_c1003b1a1/（已有数据集时拒绝覆盖）
+# 来源：Real2Sim2Real configs/arm_kr210_kr210_unscrew/c1003b1a1.toml（布局、相机与机器人摆位）
+
+[logging]
+level = "INFO"
+console = true
+
+[sim_world]
+backend = "isaacsim"
+physics_engine = "physx"
+device = "cpu"
+physx_solver = "TGS"
+physics_dt = 0.004166666666666667  # 240 Hz
+rendering_dt = 0.016666666666666666
+headless = true
+renderer = "RayTracedLighting"
+width = 640
+height = 480
+rt_subframes = 4
+warmup_frames = 2
+background_usd_path = "assets/BatteryDisassembly/Background/C1003B1A1/C1003B1A1.usd"
+background_prim_path = "/World/background"
+background_gravity = false
+background_skip_metrics_assembler = true
+
+[scene]
+backend = "battery_workcell"
+usd_path = "assets/BatteryDisassembly/Scene/Battery/Battery.usd"
+prim_path = "/World/scene"
+position_m = [0.5102575125032827, 0.4987062452981176, 0.0]
+yaw_deg = 0.0
+battery_yaw_deg = -90.0
+
+# -Y 侧抬高约 44° 俯视（源配置 overview_cam，D455 彩色相机内参 f=1.93 mm / 3.896 mm，水平视场 90.6°）
+[[scene.cameras]]
+name = "overview"
+prim_path = "/World/scene/rsr_cameras/overview"
+pose_relative_to = "/World/scene"
+resolution = [640, 480]
+clipping_range = [0.1, 80.0]
+focal_length = 1.93
+horizontal_aperture = 3.896
+pose = { position = [0.13, -3.77, 3.50], orientation_wxyz = [0.913685, 0.386895, -0.048533, -0.114615] }
+
+[robot]
+backend = "kr210_dual"
+usd_path = "assets/BatteryDisassembly/Robot/KR210_L150/kr210_l150.usd"
+urdf_path = "assets/BatteryDisassembly/Robot/KR210_L150/kr210.urdf"
+pose_relative_to = "/World/scene"
+screwdriver_arm = { prim_path = "/World/robots/kr210_01", position_m = [-2.05, 0.0, 0.0], yaw_deg = 90.0 }
+gripper_arm = { prim_path = "/World/robots/kr210_02", position_m = [2.05, 0.0, 0.0], yaw_deg = -90.0 }
+
+# 螺丝刀腕部相机：tool0 下方 0.12 m、侧向 0.26 m，从侧面看批头与螺丝头（画面上方朝机器人）
+[[robot.cameras]]
+name = "screwdriver"
+prim_path = "/World/robots/kr210_01/tool0/rsr_screwdriver_cam"
+pose_relative_to = "/World/robots/kr210_01/tool0"
+resolution = [640, 480]
+clipping_range = [0.02, 20.0]
+focal_length = 1.93
+horizontal_aperture = 3.896
+pose = { position = [0.12, 0.26, 0.0], orientation_wxyz = [0.328173, -0.626341, 0.328173, 0.626341] }
+
+# 夹爪相机：tool0 下 0.24 m（横梁下沿以下）、沿夹爪 x 外移 0.6 m，从盖板一端看两指夹持（源配置位置被腕部遮挡）
+[[robot.cameras]]
+name = "gripper"
+prim_path = "/World/robots/kr210_02/tool0/rsr_gripper_cam"
+pose_relative_to = "/World/robots/kr210_02/tool0"
+resolution = [640, 480]
+clipping_range = [0.02, 20.0]
+focal_length = 1.93
+horizontal_aperture = 3.896
+pose = { position = [0.24, 0.0, 0.60], orientation_wxyz = [0.703666, -0.069677, -0.069677, 0.703666] }
+
+[planner]
+backend = "battery_unscrew"
+
+[job]
+backend = "battery_disassembly"
+output_dir = "outputs/battery_disassembly/kr210_physx_c1003b1a1"
+timeout_s = 14400.0
+
+[job.recorder]
+fps = 15
+record_rgb = true
+save_failed_episodes = false

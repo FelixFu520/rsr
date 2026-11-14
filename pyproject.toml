@@ -37,7 +37,7 @@ select = ["E", "F", "I", "UP", "B"]
 
 # 后端名 = 配置里的 backend 字符串。实现按任务分文件：
 # *_physic_solver（物理求解器验证）、*_sorting（分拣包裹）、*_fire_inspection（机器狗巡检）、
-# *_halo（G1 爬行/弯腰过桌与落座）。
+# *_halo（G1 爬行/弯腰过桌与落座）、*_battery_disassembly（双 KR210 电池拆解）。
 [project.entry-points."real2sim2real.simworld.backends"]
 newton_diagnostic = "real2sim2real.simworld.simworld_physic_solver:NewtonDiagnosticWorld"
 stub = "real2sim2real.simworld.stub:StubSimWorld"
@@ -54,6 +54,7 @@ pickplace_package = "real2sim2real.scene.scene_physic_solver:PackageScene"
 sorting_package = "real2sim2real.scene.scene_sorting:SortingScene"
 fire_warehouse = "real2sim2real.scene.scene_fire_inspection:FireWarehouseScene"
 halo_home = "real2sim2real.scene.scene_halo:HaloHomeScene"
+battery_workcell = "real2sim2real.scene.scene_battery_disassembly:BatteryWorkcellScene"
 
 [project.entry-points."real2sim2real.robot.backends"]
 franka_carton_gripper = "real2sim2real.robot.robot_physic_solver:CartonGripperRobot"
@@ -65,6 +66,7 @@ franka_package_pads = "real2sim2real.robot.robot_physic_solver:PackagePadRobot"
 pro_m6_newton = "real2sim2real.robot.robot_sorting:SortingRobot"
 x30_kinematic = "real2sim2real.robot.robot_fire_inspection:X30Robot"
 g1_sonic = "real2sim2real.robot.robot_halo:G1SonicRobot"
+kr210_dual = "real2sim2real.robot.robot_battery_disassembly:Kr210DualRobot"
 
 [project.entry-points."real2sim2real.planner.backends"]
 pickplace_carton = "real2sim2real.planner.planner_physic_solver:CartonPlanner"
@@ -77,6 +79,7 @@ sorting_package = "real2sim2real.planner.planner_sorting:SortingPlanner"
 sorting_stream = "real2sim2real.planner.planner_sorting:SortingStreamPlanner"
 fire_patrol = "real2sim2real.planner.planner_fire_inspection:FirePatrolPlanner"
 sonic_tracking = "real2sim2real.planner.planner_halo:SonicTrackingPlanner"
+battery_unscrew = "real2sim2real.planner.planner_battery_disassembly:BatteryUnscrewPlanner"
 
 [project.entry-points."real2sim2real.job.backends"]
 pickplace_carton = "real2sim2real.job.job_physic_solver:CartonJob"
@@ -86,6 +89,7 @@ pickplace_cloth = "real2sim2real.job.job_physic_solver:PhysicSolverJob"
 sorting_package = "real2sim2real.job.job_sorting:SortingJob"
 fire_inspection = "real2sim2real.job.job_fire_inspection:FireInspectionJob"
 halo = "real2sim2real.job.job_halo:HaloJob"
+battery_disassembly = "real2sim2real.job.job_battery_disassembly:BatteryDisassemblyJob"
 
 [project.entry-points."real2sim2real.cli.commands"]
 collect = "real2sim2real.job.cli:register"
