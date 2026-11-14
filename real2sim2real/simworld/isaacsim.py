@@ -76,6 +76,10 @@ class IsaacsimWorldConfig(BaseConfig):
     auto_exposure: bool = False
     fast_shutdown: bool = True
     extensions: list[str] = Field(default_factory=list)
+    # 渲染 GPU：None 沿用 SimulationApp 默认（全部 GPU、多卡渲染）。指定 active_gpu 时
+    # 只用该物理 GPU 渲染；multi_gpu=false 关闭多卡分摊，便于两个采集进程各占一张卡。
+    active_gpu: int | None = Field(default=None, ge=0)
+    multi_gpu: bool | None = None
 
     # 环境加载二选一：整份打开 stage，或在新建 stage 中引用背景。
     # 桌面物体与机器人由其他组件添加，不能借背景挂载覆盖它们的根路径。
@@ -258,19 +262,22 @@ class IsaacsimWorld(BaseSimWorld):
         from isaacsim import SimulationApp
 
         try:
-            self.app = SimulationApp(
-                {
-                    "headless": self.config.headless,
-                    "renderer": self.config.renderer,
-                    "width": self.config.width,
-                    "height": self.config.height,
-                    "samples_per_pixel_per_frame": self.config.samples_per_pixel_per_frame,
-                    "fast_shutdown": self.config.fast_shutdown,
-                    "extra_args": [
-                        "--/exts/isaacsim.physics.newton/auto_switch_on_startup=false",
-                    ],
-                }
-            )
+            launch = {
+                "headless": self.config.headless,
+                "renderer": self.config.renderer,
+                "width": self.config.width,
+                "height": self.config.height,
+                "samples_per_pixel_per_frame": self.config.samples_per_pixel_per_frame,
+                "fast_shutdown": self.config.fast_shutdown,
+                "extra_args": [
+                    "--/exts/isaacsim.physics.newton/auto_switch_on_startup=false",
+                ],
+            }
+            if self.config.active_gpu is not None:
+                launch["active_gpu"] = self.config.active_gpu
+            if self.config.multi_gpu is not None:
+                launch["multi_gpu"] = self.config.multi_gpu
+            self.app = SimulationApp(launch)
             self._initialize_runtime()
         except BaseException:
             self.destroy_world()

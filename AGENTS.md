@@ -42,6 +42,7 @@
 | 物理求解器验证（含包裹矩阵／螺纹装配） | `physic_solver` | `assets/PhysicSolver/` | `pickplace_cloth`、`pickplace_rigid`、`newton_cloth_franka`、`pickplace_package`、`pickplace_carton`、`screw_assembly` / `screw_spindle`、`franka_carton_gripper`、`franka_newton`、`franka_physx`、`franka_package_pads` / `pickplace_cloth`、`newton_cloth_franka`、`pickplace_package`、`pickplace_carton`、`screw_assembly` / `pickplace_cloth`、`pickplace_carton`、`screw_assembly` |
 | 分拣包裹 | `sorting` | `assets/SortingPackage/` | `sorting_package` / `pro_m6_newton` / `sorting_package`、`sorting_stream` / `sorting_package` |
 | 机器狗巡检 | `fire_inspection` | `assets/FireInspection/` | `fire_warehouse` / `x30_kinematic` / `fire_patrol` / `fire_inspection` |
+| HALO G1（爬行／弯腰过桌、落座） | `halo` | `assets/Halo/` | `halo_home` / `g1_sonic` / `sonic_tracking` / `halo` |
 
 - 同一任务的多个后端、运行时和辅助类放在同一文件中，按依赖顺序分节（节首注释说明内容）。
 - 新任务依次新增 `{domain}/{domain}_<task>.py`、`utils/<task>_utils.py`、`configs/<task>/`、
@@ -157,6 +158,7 @@ Entry point 组名以 `pyproject.toml` / `core/registry.py` 为准，勿自创�
   - 物理求解器验证：`./app/python.sh scripts/physic_solver/recapture_physic_solver.py`
   - 分拣包裹：`./scripts/sorting/run_sorting_showcase.sh outputs/sorting`（内部调用 `rsr collect render-sorting`）
   - 机器狗巡检：`./scripts/rsr collect run -c configs/fire_inspection/x30_physx_warehouse.toml`
+  - HALO G1：`./scripts/rsr collect run -c configs/halo/g1_physx_{crawl,crouch,sit}.toml`（调试用 `*_debug.toml`）
 
 调试子命令时使用 `./app/python.sh -m real2sim2real.core.cli`（`main()` 内加载插件）。
 

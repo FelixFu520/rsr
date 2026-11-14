@@ -11,6 +11,7 @@ backend = "stub"  # 不启动 Kit
 # pathtracing_temporal_denoising=false；pathtracing_cached/pathtracing_many_light_sampling=true。
 # synchronous_capture=false；高清同步采集示例将其设为 true，并关闭两项光照缓存。
 # background_light_scale=1.0；引用背景子树的灯光强度倍率，官方衣服示例设为 0.25。
+# active_gpu=None、multi_gpu=None：沿用 SimulationApp 默认；halo 设 active_gpu=0/1、multi_gpu=false 单卡渲染。
 
 [scene]
 backend = "stub"
@@ -40,6 +41,9 @@ backend = "stub"
 # light_scale=1.0：仓库全部灯光强度倍率，只改运行时 stage。
 # rigid_usd_path=""、rigid_scale=0.5、rigid_mass_kg=0.03125：可选 V10 纸箱及声明的缩放/质量。
 # belt_markers=false：用循环移动的细缝显示实际传送带表面偏移。
+# halo_home：引用的 home_010 全部网格设为静态三角网格碰撞，薄地板与 Decals 关闭，由 floor_proxy_* 隐形盒承重。
+# contact_offset_m=0.004、rest_offset_m=0.0005、static_friction=1.0、dynamic_friction=0.8；desk/seat 可选。
+# third_person：width/height、focal_length=1.93、horizontal_aperture=3.896（mm），mode="fixed"/"follow"。
 
 [robot]
 backend = "stub"
@@ -58,6 +62,9 @@ backend = "stub"
 # leg.*：官方 URDF 腿长；gait.mode="trot"/"stand"、period_s=0.5、lift_m=0.07。
 # gait.max_stride_m=0.13、max_tracking_error_rad=0.35；camera_for_detection="front_rgb"。
 # beacon：护笼顶部红色警示灯，base_position_m=[0.14,0,0.462]、light_intensity=6000，仅视觉。
+# g1_sonic：原生 29 关节 G1（三指手），自由基座；SONIC 电机增益，肩肘 arm_stiffness/arm_damping=40/3。
+# 手指 auxiliary_stiffness/damping/effort=20/2/5；head_camera 在 torso_link (0.12,0,0.43)、下俯 25°。
+# place_at_start=false：与 HALO 相同，引用留在资产原点，起始状态由 PhysX 写入。
 
 [planner]
 backend = "stub"
@@ -152,6 +159,8 @@ backend = "stub"
 # cruise_speed_mps=0.8、approach_speed_mps=0.5、detect_max_distance_m=10、detect_confirm_steps=12。
 # standoff_xy=None 时在火点周围 standoff_m=2.1 的圆上选可达且视线通畅的拍照点。
 # 拍照后 detect_hold_s=4 原地停留，再报警 alarm_s=3；全程警示灯 alarm_flash_hz=2 爆闪，途中不停留。
+# sonic_tracking：reference_dir/model_dir 指向 assets/Halo；warmup_control_steps=50、joint_limit_margin_rad=0.001。
+# motor_smoothing.enabled=false、seated_hold.enabled=false、seated_target_filter_alpha=None（crawl / sit 打开）。
 
 [job]
 # screw_assembly：record_rgb=true；物理诊断设 false，仍走完整 BaseJob 生命周期。
@@ -161,3 +170,6 @@ backend = "stub"  # StubJob 只串工厂,不采集
 # fire_inspection：command 为空时终端输入，否则用 default_command="巡检仓库"；关键词解析，不调用 LLM。
 # output_dir="outputs/fire_inspection"、overwrite_dataset=false、fire_warmup_s=4、fire_check_camera、fire_check_min_pixels=20。
 # photo.resolution=[1280,960]、photo.min_window_fraction=0.01；recorder.fps=15。
+# halo：50 Hz 控制、图像取最近控制帧；调试 640×360/15 fps 实时 RTX，正式 1024×576/30 fps PathTracing。
+# acceptance.episode="crawl"/"crouch"/"sit"、max_penetration_m=0.005。
+# startup_app_updates=1：写起始状态前的 Kit 更新次数（复现 HALO 轨迹）；max_control_frames=None 可提前结束冒烟测试。
