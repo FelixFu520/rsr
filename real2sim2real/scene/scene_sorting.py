@@ -199,6 +199,7 @@ class SortingScene(PackageScene):
             ):
                 raise ValueError("Spawned parcel must fit entirely on the infeed belt")
         for part in self.package_parts:
+            part["masses"] = part.get("authored_masses", part["masses"]).copy()
             name = part["name"].lower()
             authored = float(part["masses"].sum())
             target = getattr(self.config, f"{name}_mass_kg")

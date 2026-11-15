@@ -1,0 +1,132 @@
+# 桌面抓放（正式）：home_000 家居背景、桌子、木块 + 苹果；Franka 用 Isaac Sim 自带 cuMotion 规划，
+# PhysX（CPU TGS，120 Hz）摩擦抓起木块放到桌面放置位；2 集，木块 XY 均匀抖动 ±0.12 m（seed 42）。
+# 迁移自 Real2Sim2Real configs/tabletop-pickplace_franka_curobo_home000.toml（cuRobo → cuMotion）。
+# 渲染：1024×768（1K）/ 30 fps PathTracing 64 spp，GPU 0，两路固定 RenderProduct（实测约 23 s / 帧组）。
+# 资产：./app/python.sh scripts/tabletop_pickplace/prepare_tabletop_pickplace_assets.py
+# 正式采集：./app/python.sh scripts/tabletop_pickplace/collect_tabletop_pickplace.py（单调 GPU 预算时钟，独立验收后发布）
+# 校验：./app/python.sh scripts/tabletop_pickplace/validate_tabletop_pickplace.py <output_dir>
+# 输出：outputs/tabletop_pickplace/franka_physx_home000/episode_XXX/lerobot_v3
+
+[logging]
+level = "INFO"
+console = true
+
+[sim_world]
+backend = "isaacsim"
+physics_engine = "physx"
+device = "cpu"
+physx_solver = "TGS"
+physics_dt = 0.008333333333333333  # 120 Hz
+rendering_dt = 0.03333333333333333
+headless = true
+renderer = "PathTracing"
+width = 1024
+height = 768
+rt_subframes = 4
+samples_per_pixel_per_frame = 64
+pathtracing_max_bounces = 6
+pathtracing_denoiser = true
+pathtracing_temporal_denoising = false
+pathtracing_cached = false
+pathtracing_many_light_sampling = false
+synchronous_capture = true
+dlss = false
+auto_exposure = false
+active_gpu = 0
+multi_gpu = false
+warmup_frames = 2
+extensions = ["isaacsim.robot_motion.cumotion"]
+background_usd_path = "assets/TabletopPickplace/Background/Home/home_000/interior_template.usdc"
+background_prim_path = "/World/background"
+background_gravity = false
+background_skip_metrics_assembler = true
+
+[scene]
+backend = "tabletop_home"
+prim_path = "/World/scene"
+min_object_gap_m = 0.02
+table_edge_margin_m = 0.05
+
+[scene.table]
+usd_path = "assets/TabletopPickplace/Scene/Table/table_000/Aligned.usd"
+prim_path = "/World/scene/Table"
+position_m = [0.45, -3.75, 0.415]
+yaw_deg = 0.0
+collision_approximation = "none"
+
+# 5 cm 木块：资产自带 1 g，运行时按 5 cm 硬木块设为 0.1 kg（与 physic_solver 刚体基线一致）
+[[scene.objects]]
+name = "cube"
+usd_path = "assets/TabletopPickplace/Scene/Cube/cube_000/Aligned.usd"
+prim_path = "/World/scene/Objects/cube_0"
+role = "target"
+offset_m = [0.10, 0.10]
+mass_kg = 0.1
+
+# 苹果：资产无质量（按默认密度约 0.4 kg），运行时设为 0.18 kg
+[[scene.objects]]
+name = "apple"
+usd_path = "assets/TabletopPickplace/Scene/Fruit/apple/apple_000/Aligned.usd"
+prim_path = "/World/scene/Objects/apple_000"
+body_prim = "body"
+role = "distractor"
+offset_m = [0.0, 0.30]
+mass_kg = 0.18
+
+# 俯视相机：源 overhead_cam 的 SG5 光学中心位姿（已合成壳体内 Camera 的 (-90,180,90) 旋转）；
+# 针孔相机，内参取 SG5 Camera prim（f=4.26 mm、水平光圈 8.64 mm，水平视场 90.8°）。
+# Isaac Sim 6.2 RTX 不支持其 ftheta 鱼眼投影（按针孔渲染），且 SG5 传感器 prim 不能用于固定 RenderProduct。
+[[scene.cameras]]
+name = "overhead_cam"
+prim_path = "/World/scene/cameras/overhead_cam"
+pose_relative_to = "/World/scene"
+resolution = [1024, 768]
+clipping_range = [0.01, 1000000.0]
+pose = { position = [1.2, -3.7, 1.25], orientation_wxyz = [0.627211375, 0.326505576, 0.326505576, 0.627211375] }
+focal_length = 4.26
+horizontal_aperture = 8.64
+
+[robot]
+backend = "franka_tabletop"
+usd_path = "assets/TabletopPickplace/Robot/FrankaPanda/franka.usd"
+prim_path = "/World/robots/Franka"
+base_offset_m = [-0.35, 0.0]
+keep_base_on_table = true
+gripper_open_m = 0.04
+gripper_closed_m = 0.0
+
+# 腕部相机：源 wrist_cam 的光学中心位姿，挂在 panda_hand，与夹持中心近似等高，从侧面向夹指倾斜约 12°
+[[robot.cameras]]
+name = "wrist_cam"
+prim_path = "/World/robots/Franka/panda_hand/wrist_cam"
+pose_relative_to = "/World/robots/Franka/panda_hand"
+resolution = [1024, 768]
+clipping_range = [0.01, 1000000.0]
+pose = { position = [0.20, 0.0, 0.06], orientation_wxyz = [0.444354389, -0.550044705, 0.550044705, -0.444354389] }
+focal_length = 4.26
+horizontal_aperture = 8.64
+
+[planner]
+backend = "cumotion_pickplace"
+cumotion_robot = "franka"
+tool_frame = "panda_hand"
+hand_above_object_m = 0.103
+approach_clearance_m = 0.12
+place_offset_m = [0.15, -0.15]
+place_clearance_m = 0.0
+time_scale = 1.0
+avoid_distractors = true
+
+[job]
+backend = "tabletop_pickplace"
+task = "pick the cube and place it on the table"
+output_dir = "outputs/tabletop_pickplace/franka_physx_home000"
+num_episodes = 2
+object_jitter_xy_m = 0.12
+object_jitter_seed = 42
+timeout_s = 14400.0
+
+[job.recorder]
+fps = 30
+capture_mode = "parallel_cameras"  # 每路相机一个固定 RenderProduct，避免切换视口导致路径追踪累积重置
+save_failed_episodes = false

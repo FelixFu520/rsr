@@ -6,6 +6,10 @@ bak/
 tests/*
 !tests/test_sorting_package.py
 !tests/test_fire_inspection.py
+!tests/test_halo.py
+!tests/test_battery_disassembly.py
+!tests/test_tabletop_pickplace.py
+!tests/test_tabletop_replay.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -227,3 +231,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+!tests/test_physic_solver_migration.py

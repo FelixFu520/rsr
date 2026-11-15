@@ -115,9 +115,9 @@ class PickPlaceClothScene(BaseScene):
         if sim_world.stage is None:
             raise RuntimeError("Cloth scene requires an initialized USD stage")
         stage = sim_world.stage
-        dome = UsdLux.DomeLight.Define(stage, "/World/scene/lighting/fill")
+        dome = UsdLux.DomeLight.Define(stage, f"{self.config.prim_path}/lighting/fill")
         dome.CreateIntensityAttr(self.config.fill_light_intensity)
-        key = UsdLux.DistantLight.Define(stage, "/World/scene/lighting/key")
+        key = UsdLux.DistantLight.Define(stage, f"{self.config.prim_path}/lighting/key")
         key.CreateIntensityAttr(self.config.key_light_intensity)
         UsdGeom.Xformable(key).AddRotateXYZOp().Set(Gf.Vec3f(-35, -25, -30))
         UsdGeom.Xform.Define(stage, self.config.prim_path)
@@ -494,6 +494,8 @@ class PackageSceneConfig(PickPlaceClothSceneConfig):
     cloth_usd_path: str = "assets/PhysicSolver/Package/v7/parcel_two_mesh.usd"
     target_xy: list[float] = [0.10, 0.0]
     robot_base_xy: list[float] = [-0.42, 0.0]
+    garment_mass_kg: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    bag_mass_kg: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
 
 class PackageScene(PickPlaceClothScene):
@@ -545,6 +547,10 @@ class PackageScene(PickPlaceClothScene):
             masses = np.asarray(original.GetPrim().GetAttribute("physics:masses").Get(), float)
             if not np.all(counts == 3) or len(masses) != len(vertices) or np.any(masses <= 0):
                 raise ValueError(f"Invalid dynamic triangle surface: {name}")
+            authored_masses = masses.copy()
+            requested_mass = getattr(self.config, f"{name.lower()}_mass_kg")
+            if requested_mass is not None:
+                masses = masses * (requested_mass / masses.sum())
             mesh = UsdGeom.Mesh.Get(self.sim_world.stage, f"{asset_path}/Parcel/{relative}")
             mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
             self.package_parts.append(
@@ -555,6 +561,7 @@ class PackageScene(PickPlaceClothScene):
                     end=offset + len(vertices),
                     triangles=indices.reshape(-1, 3),
                     masses=masses,
+                    authored_masses=authored_masses,
                 )
             )
             points.append(vertices + self.package_offset)
@@ -597,3 +604,136 @@ class PackageScene(PickPlaceClothScene):
             mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
             mesh.CreateNormalsAttr(Vt.Vec3fArray.FromNumpy(normals.astype(np.float32)))
         self.refresh_poses()
+
+
+# ================================================================================================
+# Fixed nut, real helical meshes, and the common table for the screw assembly subtask.
+# ================================================================================================
+
+
+class ScrewSceneConfig(PickPlaceClothSceneConfig):
+    """Factory M20 meshes are task-local; physical meshes use metres without rescaling."""
+
+    backend: str = "screw_assembly"
+    object_kind: Literal["screw"] = "screw"
+    bolt_mesh_path: str = "assets/PhysicSolver/Screw/M20/bolt.obj"
+    nut_mesh_path: str = "assets/PhysicSolver/Screw/M20/nut.obj"
+    initial_engagement_m: float = Field(default=0.004, gt=0, le=0.008)
+    thread_pitch_m: float = Field(default=0.0025, gt=0)
+
+
+class ScrewScene(PickPlaceClothScene):
+    """Fix the nut to a table fixture and publish the independently simulated bolt."""
+
+    config_cls = ScrewSceneConfig
+
+    def _arrange_target(self) -> None:
+        from pxr import Gf, UsdGeom, Vt
+
+        from real2sim2real.utils.physic_solver_utils import read_obj_triangles
+
+        self.screw_origin = np.array([*self.config.target_xy, self.table_top_z])
+        self.fastener_meshes = {}
+        self.fastener_visuals = {}
+        for name in ("nut", "bolt"):
+            path = self._asset(getattr(self.config, f"{name}_mesh_path"))
+            vertices, triangles = read_obj_triangles(path)
+            self.fastener_meshes[name] = (vertices, triangles)
+            root = UsdGeom.Xform.Define(self.sim_world.stage, f"{self.config.prim_path}/{name}")
+            root.ClearXformOpOrder()
+            self.fastener_visuals[name] = root.AddTransformOp()
+            mesh = UsdGeom.Mesh.Define(self.sim_world.stage, f"{root.GetPath()}/mesh")
+            mesh.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(vertices))
+            mesh.CreateFaceVertexCountsAttr([3] * len(triangles))
+            mesh.CreateFaceVertexIndicesAttr(triangles.ravel().tolist())
+            mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+            mesh.CreateDisplayColorAttr([Gf.Vec3f(0.48, 0.53, 0.6)])
+        self.nut_height_m = float(self.fastener_meshes["nut"][0][:, 2].max())
+        nut_min = float(self.fastener_meshes["nut"][0][:, 2].min())
+        self.nut_top_m = self.nut_height_m - nut_min
+        self.bolt_tip_m = float(self.fastener_meshes["bolt"][0][:, 2].max())
+        self.initial_bolt_z_m = self.nut_top_m + self.bolt_tip_m - self.config.initial_engagement_m
+        # The nut and bolt are both flipped so the bolt head faces the overhead driver.
+        self.publish_fastener("nut", np.array([0, 0, self.nut_height_m, 1, 0, 0, 0]))
+        self.publish_fastener("bolt", np.array([0, 0, self.initial_bolt_z_m, 1, 0, 0, 0]))
+
+    def publish_fastener(self, name: str, pose_xyzw: np.ndarray) -> None:
+        """Publish a local solver pose into the metre-scale world, caching measured poses."""
+        from pxr import Gf
+
+        position = pose_xyzw[:3] + self.screw_origin
+        q = pose_xyzw[[6, 3, 4, 5]]
+        matrix = Gf.Matrix4d().SetRotate(Gf.Quatd(float(q[0]), Gf.Vec3d(*q[1:])))
+        matrix.SetTranslateOnly(Gf.Vec3d(*position))
+        self.fastener_visuals[name].Set(matrix)
+        self.poses_realtime[name] = (position.copy(), q.copy())
+        self.poses.setdefault(name, (position.copy(), q.copy()))
+
+    def refresh_poses(self) -> None:
+        """The screw meshes publish their own measured body poses."""
+
+    @property
+    def target_position(self) -> np.ndarray:
+        """Return the fixed assembly origin."""
+        return self.screw_origin.copy()
+
+
+# ================================================================================================
+# V10 rigid cartons at their original sizes, with a declared long-stroke gripper.
+# ================================================================================================
+
+
+class CartonSceneConfig(PickPlaceClothSceneConfig):
+    """One task-local rigid carton visual mesh, unscaled, with declared total mass."""
+
+    backend: str = "pickplace_carton"
+    object_kind: Literal["rigid"] = "rigid"
+    carton_usd_path: str = "assets/PhysicSolver/Package/v10/box01/source.usd"
+    carton_mass_kg: float = Field(default=0.35, gt=0)
+
+
+class CartonScene(PickPlaceClothScene):
+    """Reference the original carton appearance and publish the actual rigid-body pose."""
+
+    config_cls = CartonSceneConfig
+
+    def _arrange_target(self) -> None:
+        from pxr import Gf, Usd, UsdGeom
+
+        source_path = self._asset(self.config.carton_usd_path)
+        source = Usd.Stage.Open(source_path)
+        meshes = [UsdGeom.Mesh(p) for p in source.Traverse() if p.IsA(UsdGeom.Mesh)]
+        if len(meshes) != 1 or UsdGeom.GetStageMetersPerUnit(source) != 1:
+            raise ValueError("Carton asset must have one metre-scale mesh")
+        mesh = meshes[0]
+        transform = np.array(UsdGeom.Xformable(mesh).ComputeLocalToWorldTransform(0)).T
+        points = np.array(mesh.GetPointsAttr().Get(), float)
+        points = points @ transform[:3, :3].T + transform[:3, 3]
+        center = 0.5 * (points.min(0) + points.max(0))
+        self.carton_dimensions = np.ptp(points, axis=0)
+        self.carton_position = np.array(
+            [*self.config.target_xy, self.table_top_z + self.carton_dimensions[2] / 2 + 0.001]
+        )
+        self.carton_quaternion = np.array([1.0, 0, 0, 0])
+        root = UsdGeom.Xform.Define(self.sim_world.stage, self.target_prim_path)
+        self.carton_visual = root.AddTransformOp()
+        asset = UsdGeom.Xform.Define(self.sim_world.stage, f"{root.GetPath()}/asset")
+        asset.GetPrim().GetReferences().AddReference(source_path, "/World")
+        asset.AddTranslateOp().Set(Gf.Vec3d(*(-center)))
+        self.publish_carton(np.r_[self.carton_position, 0, 0, 0, 1])
+
+    def _runtime_target_pose(self) -> tuple[np.ndarray, np.ndarray] | None:
+        if not hasattr(self, "carton_position"):
+            return None
+        return self.carton_position.copy(), self.carton_quaternion.copy()
+
+    def publish_carton(self, pose: np.ndarray) -> None:
+        """Publish only a measured rigid-body transform; keep the original mesh unchanged."""
+        from pxr import Gf
+
+        pose = np.asarray(pose, float)
+        self.carton_position, self.carton_quaternion = pose[:3].copy(), pose[[6, 3, 4, 5]]
+        matrix = Gf.Matrix4d().SetRotate(Gf.Quatd(float(pose[6]), Gf.Vec3d(*pose[3:6])))
+        matrix.SetTranslateOnly(Gf.Vec3d(*pose[:3]))
+        self.carton_visual.Set(matrix)
+        self._cache_pose(self.target_prim_path, self._runtime_target_pose())

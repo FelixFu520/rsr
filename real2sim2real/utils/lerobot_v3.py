@@ -18,6 +18,13 @@ from PIL import Image
 
 JOINT_NAMES = [f"fr3_joint{i}" for i in range(1, 8)] + ["left_finger_m", "right_finger_m"]
 VIDEO_KEY = "observation.images.overview"
+_RESERVED = {
+    "observation.state", "action", "timestamp", "frame_index", "episode_index", "index",
+    "task_index",
+}  # fmt: skip
+
+# Extra per-frame feature dtypes and their numpy storage types.
+_EXTRA_TYPES = {"float32": np.float32, "int64": np.int64, "bool": np.bool_}
 
 
 class LeRobotV3Recorder:
@@ -35,7 +42,14 @@ class LeRobotV3Recorder:
         joint_names: list[str] | None = None,
         action_names: list[str] | None = None,
         cameras: dict[str, tuple[int, int]] | None = None,
+        extra_features: dict[str, dict[str, Any]] | None = None,
     ) -> None:
+        """``extra_features`` adds per-frame columns: ``{name: {dtype, shape, names}}``.
+
+        dtype is ``float32``, ``int64`` or ``bool``; shape ``[1]`` is stored as a scalar column
+        (as the official writer does), longer shapes as fixed-size lists. ``None`` (default)
+        keeps the original state/action-only layout.
+        """
         if root.exists():
             raise FileExistsError(f"Dataset already exists: {root}")
         if fps <= 0 or width <= 0 or height <= 0 or width % 2 or height % 2:
@@ -68,6 +82,19 @@ class LeRobotV3Recorder:
             set(self.action_names)
         ) != len(self.action_names):
             raise ValueError("Coordinate names must be unique within each feature")
+        self.extra_features = {
+            name: {"dtype": spec["dtype"], "shape": list(spec["shape"]), "names": spec.get("names")}
+            for name, spec in (extra_features or {}).items()
+        }
+        for name, spec in self.extra_features.items():
+            if (
+                name in _RESERVED
+                or spec["dtype"] not in _EXTRA_TYPES
+                or len(spec["shape"]) != 1
+                or spec["shape"][0] <= 0
+                or (spec["names"] is not None and len(spec["names"]) != spec["shape"][0])
+            ):
+                raise ValueError(f"Invalid extra feature {name}: {spec}")
         self.rows: list[dict[str, Any]] = []
         self.image_stats = {
             name: dict(sum=np.zeros(3), squared_sum=np.zeros(3), min=np.ones(3), max=np.zeros(3))
@@ -80,7 +107,9 @@ class LeRobotV3Recorder:
             raise KeyError(f"Unknown recording camera: {camera}")
         return self.frame_dir / camera / f"frame_{len(self.rows):06d}.png"
 
-    def add_frame(self, state: np.ndarray, action: np.ndarray) -> None:
+    def add_frame(
+        self, state: np.ndarray, action: np.ndarray, extras: dict[str, Any] | None = None
+    ) -> None:
         """Store current joint positions and commanded targets at the same video frame time."""
         state, action = np.asarray(state, np.float32), np.asarray(action, np.float32)
         if (
@@ -90,6 +119,7 @@ class LeRobotV3Recorder:
             or not np.isfinite(action).all()
         ):
             raise ValueError("State/action must match their named finite coordinates")
+        extra_values = self._extra_values(extras or {})
         # Validate every view before committing any per-frame statistics or joint data.
         images = {}
         for name, resolution in self.cameras.items():
@@ -113,8 +143,29 @@ class LeRobotV3Recorder:
                 "episode_index": 0,
                 "index": index,
                 "task_index": 0,
+                **extra_values,
             }
         )
+
+    def _extra_values(self, extras: dict[str, Any]) -> dict[str, Any]:
+        if set(extras) != set(self.extra_features):
+            raise ValueError(f"Extra features must be exactly {sorted(self.extra_features)}")
+        values = {}
+        for name, spec in self.extra_features.items():
+            array = np.asarray(extras[name], dtype=_EXTRA_TYPES[spec["dtype"]]).reshape(-1)
+            if array.shape != (spec["shape"][0],) or (
+                spec["dtype"] == "float32" and not np.isfinite(array).all()
+            ):
+                raise ValueError(f"Extra feature {name} must have shape {spec['shape']}")
+            values[name] = array.item() if spec["shape"][0] == 1 else array.tolist()
+        return values
+
+    def update_extra(self, index: int, name: str, value: Any) -> None:
+        """Overwrite one extra value of an already recorded frame (e.g. ``next.success``)."""
+        row = self.rows[index]
+        current = {key: row[key] for key in self.extra_features}
+        current[name] = value
+        row.update(self._extra_values(current))
 
     def finalize(self, *, episode_success: bool | None = None) -> Path:
         """Encode videos and publish a conforming v3 dataset after all files have been written."""
@@ -125,6 +176,7 @@ class LeRobotV3Recorder:
             raise ValueError("A dataset episode must contain at least two frames")
         for name in self.cameras:
             self._encode_video(name)
+        arrow = {"float32": pa.float32(), "int64": pa.int64(), "bool": pa.bool_()}
         schema = pa.schema(
             [
                 ("observation.state", pa.list_(pa.float32(), len(self.joint_names))),
@@ -134,6 +186,15 @@ class LeRobotV3Recorder:
                     (name, pa.int64())
                     for name in ("frame_index", "episode_index", "index", "task_index")
                 ],
+                *[
+                    (
+                        name,
+                        arrow[spec["dtype"]]
+                        if spec["shape"][0] == 1
+                        else pa.list_(arrow[spec["dtype"]], spec["shape"][0]),
+                    )
+                    for name, spec in self.extra_features.items()
+                ],
             ]
         )
         data_path = self.staging / "data/chunk-000/file-000.parquet"
@@ -142,6 +203,14 @@ class LeRobotV3Recorder:
         stats = {}
         features = {}
         for name in self.rows[0]:
+            if name in self.extra_features:
+                spec = self.extra_features[name]
+                array = np.asarray([row[name] for row in self.rows], dtype=float).reshape(
+                    len(self.rows), -1
+                )
+                stats[name] = self._stats(array)
+                features[name] = dict(spec)
+                continue
             is_vector = name in {"observation.state", "action"}
             array = np.asarray([row[name] for row in self.rows], dtype=float).reshape(
                 len(self.rows), -1

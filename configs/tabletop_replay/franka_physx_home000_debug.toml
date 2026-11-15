@@ -1,0 +1,87 @@
+# 桌面轨迹回放（调试）：640×480 / 15 fps / RTX Minimal 纹理预览（仍是 RTX，不是纯非光追）。
+# 回放 tabletop_pickplace 调试数据集；物理参数与验收门限同正式配置，失败也导出 diagnostic 数据集。
+# 只跑物理（嵌套字段名保持小写）：RSR_JOB__RECORDER__record_rgb=false ./scripts/rsr collect run -c <本文件>
+inherit = "franka_physx_home000.toml"
+
+[sim_world]
+renderer = "MinimalRendering"
+minimal_shading_mode = 2
+minimal_ambient_intensity = 0.5
+width = 640
+height = 480
+rendering_dt = 0.06666666666666667
+rt_subframes = 1
+synchronous_capture = false
+
+[scene]
+dynaconf_merge = false  # 替换相机列表，避免继承时追加同名相机
+backend = "tabletop_home"
+prim_path = "/World/scene"
+min_object_gap_m = 0.02
+table_edge_margin_m = 0.05
+
+[scene.table]
+usd_path = "assets/TabletopReplay/Scene/Table/table_000/Aligned.usd"
+prim_path = "/World/scene/Table"
+position_m = [0.45, -3.75, 0.415]
+yaw_deg = 0.0
+collision_approximation = "none"
+
+[[scene.objects]]
+name = "cube"
+usd_path = "assets/TabletopReplay/Scene/Cube/cube_000/Aligned.usd"
+prim_path = "/World/scene/Objects/cube_0"
+role = "target"
+offset_m = [0.10, 0.10]
+mass_kg = 0.1
+
+[[scene.objects]]
+name = "apple"
+usd_path = "assets/TabletopReplay/Scene/Fruit/apple/apple_000/Aligned.usd"
+prim_path = "/World/scene/Objects/apple_000"
+body_prim = "body"
+role = "distractor"
+offset_m = [0.0, 0.30]
+mass_kg = 0.18
+
+[[scene.cameras]]
+name = "overhead_cam"
+prim_path = "/World/scene/cameras/overhead_cam"
+pose_relative_to = "/World/scene"
+resolution = [640, 480]
+clipping_range = [0.01, 1000000.0]
+pose = { position = [1.2, -3.7, 1.25], orientation_wxyz = [0.627211375, 0.326505576, 0.326505576, 0.627211375] }
+focal_length = 4.26
+horizontal_aperture = 8.64
+
+[robot]
+dynaconf_merge = false
+backend = "franka_tabletop"
+usd_path = "assets/TabletopReplay/Robot/FrankaPanda/franka.usd"
+prim_path = "/World/robots/Franka"
+base_offset_m = [-0.35, 0.0]
+keep_base_on_table = true
+gripper_open_m = 0.04
+gripper_closed_m = 0.0
+
+[[robot.cameras]]
+name = "wrist_cam"
+prim_path = "/World/robots/Franka/panda_hand/wrist_cam"
+pose_relative_to = "/World/robots/Franka/panda_hand"
+resolution = [640, 480]
+clipping_range = [0.01, 1000000.0]
+pose = { position = [0.20, 0.0, 0.06], orientation_wxyz = [0.444354389, -0.550044705, 0.550044705, -0.444354389] }
+focal_length = 4.26
+horizontal_aperture = 8.64
+
+[planner]
+source_dir = "outputs/debug/tabletop_pickplace/franka_physx_home000_debug"
+
+[job]
+output_dir = "outputs/debug/tabletop_replay/franka_physx_home000_debug"
+overwrite_dataset = true
+timeout_s = 7200.0
+
+[job.recorder]
+fps = 15
+save_failed_episodes = true

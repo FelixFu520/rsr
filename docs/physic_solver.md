@@ -1,258 +1,253 @@
 # 物理求解器验证
 
-更新日期：2026-11-11。
+更新日期：2026-11-13。
 
-## 1. 任务介绍
+## 1. 任务与统一分类
 
-固定在桌面上的 Franka 机械臂执行一次完整抓放：接近 → 下探 → 闭合 → 抬升 → 保持 → 横向转运 →
-下放 → 松开 → 撤离 → 静置。被抓物体分三类：
+本任务比较机器人求解器、接触／柔体求解器与被操作物体的组合，覆盖衣服、刚体方块、柔性包裹、纸箱及螺纹装配。
+采集执行真实物理，按接近、闭合、提升、转运、释放、撤离验证完整过程；动作序列结束不等于成功。
+物理引擎和算法层级说明见 [physics_engines.md](physics_engines.md)。
 
-- **衣服**：一件 0.2 kg 的衬衫（质量按三角面积分配），无固定顶点、无抓取附件。
-- **刚体方块**：0.1 kg 方块，全部由 PhysX 求解，作为刚体对照。
-- **自定义柔性包裹**：袋膜（约 20.54 g）+ 内部衣物（200 g）两个物理网格，衣物内部有被动弹簧。
+### 1.1 文件名与工况
 
-任务目的不是训练策略，而是在同一套 `IsaacsimWorld` 和固定 Job 生命周期下，比较不同
-“机器人求解器 + 接触/柔体求解器”组合能否完成真实接触驱动的抓放，并把每次成功的过程采集为
-LeRobot v3 数据。每个组合的验收都基于实测几何（提升高度、双侧接触、释放回落、落点误差、
-拉伸、穿透），只完成动作序列不算成功。
+配置全部直接放在 `configs/physic_solver/`，不设置子目录，也没有仅作继承用的 base 文件。
+30份配置均为独立TOML，采用：
 
-### 1.1 求解器组合
+```text
+<机器人求解器>_<接触求解器>_<物体ID>_<工况>.toml
+```
 
-配置统一放在 `configs/physic_solver/`，文件名为 `<机器人求解器>_<接触/柔体求解器>_<任务>.toml`。
-PhysX 的实际求解器写作 `tgs`；引擎归属由 `sim_world.physics_engine` 指定。
+例如 `mujoco_vbd_package01_mass500g_pos_x35mm.toml` 的正式输出为
+`outputs/physic_solver/mujoco_vbd_package01_mass500g_pos_x35mm/`。
+各配置的 `job.output_dir` 最后一段与文件 stem 完全一致。
 
-| 配置 | 世界模式 | 机器人 | 机器人 / 物体求解器 | 物体 | 预期 |
-|---|---|---|---|---|---|
-| `featherstone_vbd_pickplace_cloth` | Newton direct | FR3 URDF，速度控制 | Featherstone / VBD | 官方 Newton 衬衫，官方关键帧控制器 | 通过 |
-| `mujoco_vbd_pickplace_cloth` | Newton direct | FR3 URDF | MuJoCo / VBD | 衣服 | 通过 |
-| `xpbd_vbd_pickplace_cloth` | Newton direct | FR3 URDF | XPBD / VBD | 衣服 | 通过 |
-| `tgs_vbd_pickplace_cloth` | hybrid | Panda USD + Lula IK | PhysX TGS / Newton VBD | 衣服 | 通过 |
-| `tgs_tgs_pickplace_rigid` | PhysX | Panda USD + Lula IK | TGS / TGS | 刚体方块 | 通过 |
-| `mujoco_vbd_pickplace_package` | Newton direct | FR3 原装短指，位置控制 | MuJoCo / VBD |  柔性包裹 | 通过 |
-| `featherstone_vbd_pickplace_package` | Newton direct | FR3 + 长夹块 | Featherstone / VBD | 柔性包裹 | 对照组，未通过验收 |
-| `xpbd_xpbd_pickplace_cloth` | Newton direct | FR3 URDF | 统一 XPBD（机器人与衣服同一求解器） | 衣服 | 实验组，未通过验收 |
+- 机器人求解器：`featherstone`、`mujoco`、`xpbd`、`tgs`。
+- 接触／柔体路径：`vbd`、`mujoco`（原生刚体接触）、`xpbd`、`tgs`、`hydroelastic`。
+- 工况：`baseline`、`center_native`、`center_pads`、`pos_x35mm`、`mass500g_pos_x35mm`、
+  `pos_x35mm_shake_noattach`、`center_shake_spring` 等。
+- `_control` 为原有对照实验，失败不作为成功演示发布；`_debug` 仅供不录RGB的物理排错。
 
-求解器区别：
-
-- **PhysX TGS**：迭代求解关节、刚体接触和摩擦约束。
-- **Featherstone**：用关节坐标计算机械臂动力学；本任务只求解机器人。
-- **MuJoCo**：求解机器人关节、驱动和刚体接触，不求解衣服。
-- **VBD**：逐顶点局部能量优化，处理衣服/袋膜的拉伸、弯曲、接触和自碰撞。
-- **XPBD**：带柔顺度的位置约束，可同时处理刚体和柔体；统一 XPBD 的衣服用距离弹簧，
-  与 VBD 的三角面材料模型不同。
-
-各组合除了求解器，还有机器人模型、控制方式、重力补偿、抓取高度偏移和子步预算的差异
-（见各配置文件注释）。因此结果只说明“该配置能否稳定抓放”，不能直接给求解器精度排名。
-统一 XPBD 未通过，也不能证明 XPBD 算法本身不适合抓衣服。
+`package01`的90°抓法为Y175mm优化抓点、59.5mm抓高和双向body代理；
+组合倾斜为X35mm、偏航30°／俯仰10°优化抓点。原中央90°和原(-25,40)mm组合倾斜的历史失败仍在debug归档，
+不能把当前优化抓点称为原位置的成功复现。各组的夹爪、控制与物理模型存在差别，不是严格单因素性能排名。
 
 ### 1.2 世界模式
 
-`sim_world.physics_engine` 与 `newton_execution` 决定动力学归属：
-
-| 值 | 动力学执行方式 |
+| 模式 | 动力学归属 |
 |---|---|
-| `physx` | USD 场景全部由 PhysX 积分 |
-| `newton` + `newton_execution="direct"` | Planner 自建 Newton 模型负责全部动力学，Kit 时间轴保持停止，只用于显示 |
-| `newton` + `newton_execution="usd"` | Isaac 官方 Newton USD 后端（`mujoco` / `xpbd`）；VBD 需要本机缺失的 `NewtonVbdSceneAPI` schema |
-| `hybrid` | PhysX 推进一步后调用 Newton stepper；PhysX 手指/手掌位姿作为 VBD 的运动学碰撞代理 |
+| `physx` | 机器人及刚体由PhysX TGS积分 |
+| `hybrid` | PhysX机器人推进后，Newton VBD求解衣服；使用单向运动学碰撞代理 |
+| `newton` + `direct` | 由Planner创建真实Newton模型，Kit用于可视化 |
+| `newton_diagnostic` | 使用本机Isaac安装的Newton／USD SDK求解并保存连续轨迹，不启动Kit；通过后另行零物理步回放采集 |
 
-direct / hybrid 的组件在启动仿真前注册 stepper：
-`sim_world.register_newton_stepper(runtime.step, reset=..., close=...)`。缺少 stepper 时世界在
-运行前报错。hybrid 不会自动创建跨引擎碰撞或双向力反馈。
+普通VBD外部刚体路径为刚体影响柔体的单向耦合；配置中的 `rigid_soft_coupling="proxy"` 显式启用双向body代理。
+这两类实验均不构成真实机械臂额定负载认证。纸箱采用原生MuJoCo双向刚体接触。
 
-## 2. 当前结果
+## 2. 物体编号
 
-本节数据来自 2026-11-11 用整理后代码重新采集的结果（`collect_physic_solver_cases.py`，每个组合一个 Kit
-进程）。汇总见 [collection_summary.json](../outputs/physic_solver/collection_summary.json)。
-
-| 组合 | 结果 | 帧数 / 时长 | 关键实测 | 目录 |
-|---|---|---|---|---|
-| `featherstone_vbd_pickplace_cloth` | 通过 | 270 帧 / 18.0 s | 接触片抬升 100.6 mm，释放回落 83.4 mm，转运双侧接触 100% | [outputs/physic_solver/featherstone_vbd_pickplace_cloth](../outputs/physic_solver/featherstone_vbd_pickplace_cloth/) |
-| `mujoco_vbd_pickplace_cloth` | 通过（见下方说明） | 323 帧 / 21.5 s | 保持最低抬升 251.6 mm，回落 239.3 mm，落点误差 44.7 mm | [outputs/physic_solver/mujoco_vbd_pickplace_cloth](../outputs/physic_solver/mujoco_vbd_pickplace_cloth/) |
-| `xpbd_vbd_pickplace_cloth` | 通过 | 323 帧 / 21.5 s | 抬升 261.1 mm，回落 164.4 mm，落点误差 52.1 mm | [outputs/physic_solver/xpbd_vbd_pickplace_cloth](../outputs/physic_solver/xpbd_vbd_pickplace_cloth/) |
-| `tgs_vbd_pickplace_cloth` | 通过 | 323 帧 / 21.5 s | 抬升 253.4 mm，回落 191.1 mm，落点误差 9.1 mm | [outputs/physic_solver/tgs_vbd_pickplace_cloth](../outputs/physic_solver/tgs_vbd_pickplace_cloth/) |
-| `tgs_tgs_pickplace_rigid` | 通过 | 323 帧 / 21.5 s | 抬升 241.3 mm，回落 243.1 mm，落点误差 2.6 mm | [outputs/physic_solver/tgs_tgs_pickplace_rigid](../outputs/physic_solver/tgs_tgs_pickplace_rigid/) |
-| `mujoco_vbd_pickplace_package` | 通过 14/14 | 185 帧 / 12.3 s | 衣物/袋膜质心提升 238.5/235.2 mm，转运双侧接触 100%，回落 111.0 mm，落点误差 51.4 mm，最大边长比 1.234 | [outputs/physic_solver/mujoco_vbd_pickplace_package](../outputs/physic_solver/mujoco_vbd_pickplace_package/) |
-| `featherstone_vbd_pickplace_package` | 未通过（对照组） | 195 帧 / 13.0 s | 质心提升 139 mm、转运接触 100%；撤离后静置阶段（约 12 s）包裹突然加速飞离桌面，`placed_near_goal`、`table_penetration_bounded` 失败 | [outputs/debug/physic_solver/featherstone_vbd_pickplace_package](../outputs/debug/physic_solver/featherstone_vbd_pickplace_package/) |
-| `xpbd_xpbd_pickplace_cloth` | 未通过（实验组） | 323 帧 / 21.5 s | 衣服没有被提起（保持期抬升 -5.5 mm），导出为 `diagnostic` | [outputs/debug/physic_solver/xpbd_xpbd_pickplace_cloth](../outputs/debug/physic_solver/xpbd_xpbd_pickplace_cloth/) |
-
-正式目录 `outputs/physic_solver/` 中的 6 个 `lerobot_v3/` 都是 `demonstration`，已通过
-`validate_dataset`（帧号/时间戳、有限关节值、视频逐帧解码、H.264、分辨率、episode 时间范围）。
-
-**`mujoco_vbd_pickplace_cloth` 的结果在多次运行间波动。** 第一次批量采集时落点误差 81.3 mm，超过
-80 mm 门限，被移到 debug。为区分整理代码引入的回归和运行间差异，用整理前的提交（`96eec55`）和整理后
-代码各重复运行：
-
-| 代码 | 落点误差 | 结果 |
-|---|---:|---|
-| 整理后，第 1 次（批量采集） | 81.3 mm | 未通过 |
-| 整理后，第 2 次 | 72.3 mm | 通过 |
-| 整理后，第 3 次（当前正式数据） | 44.7 mm | 通过 |
-| 整理前 `96eec55`，第 1 次 | 21.9 mm | 通过 |
-| 整理前 `96eec55`，第 2 次 | 84.2 mm | 未通过 |
-
-两套代码都在 22–84 mm 之间波动，抬升、回落和拉伸几乎不变，说明这是 GPU 求解的运行间差异
-（衣服松开后的落点对微小差异敏感），不是整理引入的回归。正式目录保存第 3 次运行，运行记录见
-[run_note.json](../outputs/physic_solver/mujoco_vbd_pickplace_cloth/run_note.json)；其余运行留在
-`outputs/debug/physic_solver/`。该组合离门限余量小，重新采集可能需要多次运行。
-
-`featherstone_vbd_pickplace_package` 另跑了两次对照：整理前代码提升约 109 mm 后滑脱、转运双侧接触 0%、
-最大边长比 1.362；整理后代码第 2 次提升约 127 mm 后滑脱、转运双侧接触 18%、边长比 1.354。两者都与早期记录
-（约 115 mm 后滑脱）一致；批量采集那次的“抓稳后静置失稳”是同一失败组合的另一种表现，不是整理引入的回归。
-
-## 3. 组成
-
-| 模块 | 后端名 | 实现 |
+| 编号 | 物体 | 任务内资产 |
 |---|---|---|
-| SimWorld | `isaacsim` | [simworld/isaacsim.py](../real2sim2real/simworld/isaacsim.py) |
-| Scene | `pickplace_cloth` / `pickplace_rigid` / `newton_cloth_franka` / `pickplace_package` | [scene/scene_physic_solver.py](../real2sim2real/scene/scene_physic_solver.py) |
-| Robot | `franka_newton` / `franka_physx` / `franka_package_pads` | [robot/robot_physic_solver.py](../real2sim2real/robot/robot_physic_solver.py) |
-| Planner | `pickplace_cloth` / `newton_cloth_franka` / `pickplace_package` | [planner/planner_physic_solver.py](../real2sim2real/planner/planner_physic_solver.py) |
-| Job | `pickplace_cloth` | [job/job_physic_solver.py](../real2sim2real/job/job_physic_solver.py) |
-| 辅助函数 | — | [utils/physic_solver_utils.py](../real2sim2real/utils/physic_solver_utils.py)：hybrid VBD 步进、移动坐标系 VBD、袋膜包含检查 |
+| `cloth01` | Newton官方衬衫 | `assets/PhysicSolver/Cloth/newton_official/` |
+| `cloth02` | 通用衬衫 | `assets/PhysicSolver/Cloth/unisex_shirt.usd` |
+| `rigid01` | 0.1kg刚体方块 | 场景代码创建的刚体对照 |
+| `package01` | V7双网格衣物＋袋膜 | `assets/PhysicSolver/Package/v7/` |
+| `package02` | 站点衣物包裹 | `assets/PhysicSolver/Package/v10/station_clothing/` |
+| `package03` | 绿色包裹 | `assets/PhysicSolver/Package/v10/station_green/` |
+| `package04` | 粉色T恤包裹 | `assets/PhysicSolver/Package/v10/pink_tshirt/` |
+| `package05` | 磨砂上衣包裹 | `assets/PhysicSolver/Package/v10/frosted_top/` |
+| `package06` | 黑色连帽衫包裹 | `assets/PhysicSolver/Package/v10/black_hoodie/` |
+| `package07` | 原尺寸纸箱01，350g | `assets/PhysicSolver/Package/v10/box01/` |
+| `package08` | 原尺寸纸箱02，250g | `assets/PhysicSolver/Package/v10/box02/` |
+| `screw01` | M20 loose螺栓／螺母 | `assets/PhysicSolver/Screw/M20/` |
 
-`planner_physic_solver.py` 按依赖顺序包含四部分：
+重量工况的100／200／350／500g指衣物质量；袋膜另约20.54g，不把两者混作总负载。
+纸箱采用原尺寸刚性包围盒，不模拟纸板压溃。模型、MDL、贴图、URDF、许可证和来源哈希均位于本任务资产目录，
+不依赖源项目 `/home/fufa/Projects/package` 的运行时路径。
 
-1. `PickPlaceClothPlanner` + `NewtonClothRuntime`：通用抓放阶段机、URDF 雅可比 IK、
-   Featherstone / MuJoCo / XPBD + VBD 模型构建、hybrid 代理插值、USD 显示同步和验收。
-   PhysX 刚体方块也使用这个 Planner，此时不创建 Newton 运行时。
-2. `OFFICIAL_KEYFRAMES`：Newton 1.6.1 官方 `example_cloth_franka.py` 的关键帧。
-3. `OfficialClothPlanner` + `OfficialClothRuntime`：官方关键帧 + 雅可比伪逆 + 零空间速度控制。
-4. `PackagePlanner` + `PackageRuntime`：V7 双网格包裹、`MovingFrameVBD`、逐子步接触容量审计。
-   分拣任务的 `SortingRuntime` 继承 `PackageRuntime`。
+## 3. 配置目录
 
-当前没有使用 cuRobo：Newton 机器人使用本文件的 URDF IK，PhysX 机器人使用 Lula IK；
-TCP 轨迹由预设阶段插值生成，不做避障路径搜索。
+| 配置 | 用途 | 输出位置 |
+|---|---|---|
+| [featherstone_vbd_cloth01_baseline](../configs/physic_solver/featherstone_vbd_cloth01_baseline.toml) | 正式采集目标 | `outputs/physic_solver/featherstone_vbd_cloth01_baseline/` |
+| [mujoco_vbd_cloth02_baseline](../configs/physic_solver/mujoco_vbd_cloth02_baseline.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_cloth02_baseline/` |
+| [xpbd_vbd_cloth02_baseline](../configs/physic_solver/xpbd_vbd_cloth02_baseline.toml) | 正式采集目标 | `outputs/physic_solver/xpbd_vbd_cloth02_baseline/` |
+| [tgs_vbd_cloth02_baseline](../configs/physic_solver/tgs_vbd_cloth02_baseline.toml) | 正式采集目标 | `outputs/physic_solver/tgs_vbd_cloth02_baseline/` |
+| [tgs_tgs_rigid01_baseline](../configs/physic_solver/tgs_tgs_rigid01_baseline.toml) | 正式采集目标 | `outputs/physic_solver/tgs_tgs_rigid01_baseline/` |
+| [mujoco_vbd_package01_center_native](../configs/physic_solver/mujoco_vbd_package01_center_native.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package01_center_native/` |
+| [featherstone_vbd_package01_center_control](../configs/physic_solver/featherstone_vbd_package01_center_control.toml) | 失败对照，保留真实结果 | `outputs/debug/physic_solver/featherstone_vbd_package01_center_control/` |
+| [xpbd_xpbd_cloth02_baseline_control](../configs/physic_solver/xpbd_xpbd_cloth02_baseline_control.toml) | 失败对照，保留真实结果 | `outputs/debug/physic_solver/xpbd_xpbd_cloth02_baseline_control/` |
+| [mujoco_vbd_package01_center_pads](../configs/physic_solver/mujoco_vbd_package01_center_pads.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package01_center_pads/` |
+| [mujoco_vbd_package01_pos_x35mm](../configs/physic_solver/mujoco_vbd_package01_pos_x35mm.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package01_pos_x35mm/` |
+| [mujoco_vbd_package01_pos_y55mm](../configs/physic_solver/mujoco_vbd_package01_pos_y55mm.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package01_pos_y55mm/` |
+| [mujoco_vbd_package01_pos_x35mm_yaw45deg](../configs/physic_solver/mujoco_vbd_package01_pos_x35mm_yaw45deg.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package01_pos_x35mm_yaw45deg/` |
+| [mujoco_vbd_package01_pos_y175mm_yaw90deg_twoway](../configs/physic_solver/mujoco_vbd_package01_pos_y175mm_yaw90deg_twoway.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package01_pos_y175mm_yaw90deg_twoway/` |
+| [mujoco_vbd_package01_pos_x35mm_yaw30deg_pitch10deg](../configs/physic_solver/mujoco_vbd_package01_pos_x35mm_yaw30deg_pitch10deg.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package01_pos_x35mm_yaw30deg_pitch10deg/` |
+| [mujoco_vbd_package01_mass100g_pos_x35mm](../configs/physic_solver/mujoco_vbd_package01_mass100g_pos_x35mm.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package01_mass100g_pos_x35mm/` |
+| [mujoco_vbd_package01_mass200g_pos_x35mm](../configs/physic_solver/mujoco_vbd_package01_mass200g_pos_x35mm.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package01_mass200g_pos_x35mm/` |
+| [mujoco_vbd_package01_mass350g_pos_x35mm](../configs/physic_solver/mujoco_vbd_package01_mass350g_pos_x35mm.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package01_mass350g_pos_x35mm/` |
+| [mujoco_vbd_package01_mass500g_pos_x35mm](../configs/physic_solver/mujoco_vbd_package01_mass500g_pos_x35mm.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package01_mass500g_pos_x35mm/` |
+| [mujoco_vbd_package02_center](../configs/physic_solver/mujoco_vbd_package02_center.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package02_center/` |
+| [mujoco_vbd_package03_center](../configs/physic_solver/mujoco_vbd_package03_center.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package03_center/` |
+| [mujoco_vbd_package04_center](../configs/physic_solver/mujoco_vbd_package04_center.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package04_center/` |
+| [mujoco_vbd_package05_center](../configs/physic_solver/mujoco_vbd_package05_center.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package05_center/` |
+| [mujoco_vbd_package06_center](../configs/physic_solver/mujoco_vbd_package06_center.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package06_center/` |
+| [mujoco_mujoco_package07_center](../configs/physic_solver/mujoco_mujoco_package07_center.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_mujoco_package07_center/` |
+| [mujoco_mujoco_package08_center](../configs/physic_solver/mujoco_mujoco_package08_center.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_mujoco_package08_center/` |
+| [mujoco_vbd_package01_pos_x35mm_shake_noattach](../configs/physic_solver/mujoco_vbd_package01_pos_x35mm_shake_noattach.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package01_pos_x35mm_shake_noattach/` |
+| [mujoco_vbd_package01_center_shake_spring](../configs/physic_solver/mujoco_vbd_package01_center_shake_spring.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package01_center_shake_spring/` |
+| [mujoco_vbd_package01_pos_x35mm_shake_spring](../configs/physic_solver/mujoco_vbd_package01_pos_x35mm_shake_spring.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package01_pos_x35mm_shake_spring/` |
+| [mujoco_hydroelastic_screw01_rotate](../configs/physic_solver/mujoco_hydroelastic_screw01_rotate.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_hydroelastic_screw01_rotate/` |
+| [mujoco_hydroelastic_screw01_rotate_debug](../configs/physic_solver/mujoco_hydroelastic_screw01_rotate_debug.toml) | 物理排错，不录RGB | `outputs/debug/physic_solver/mujoco_hydroelastic_screw01_rotate_debug/` |
 
-### 3.1 脚本
+## 4. 本轮重新采集
 
-| 脚本 | 用途 |
-|---|---|
-| [collect_physic_solver_cases.py](../scripts/physic_solver/collect_physic_solver_cases.py) | 串行采集全部 8 个组合并校验；未通过的组合移到 `outputs/debug/physic_solver/` |
-| [prepare_physic_solver_assets.py](../scripts/physic_solver/prepare_physic_solver_assets.py) | 从 `assets/bak/Demo` 复制桌子、衣服、方块、Franka 等到 `assets/PhysicSolver` |
-| [prepare_official_newton_cloth.py](../scripts/physic_solver/prepare_official_newton_cloth.py) | 从 Isaac Sim 自带 Newton 复制官方 `unisex_shirt.usd`、许可证和来源记录 |
-| [prepare_package_assets.py](../scripts/physic_solver/prepare_package_assets.py) | 复制 V7 包裹快照；`--source/--target` 也用于分拣任务的 V10 快照 |
-| [check_package_pickplace.py](../scripts/physic_solver/check_package_pickplace.py) | 包裹抓放只跑物理、不录 RGB，用于低成本调参 |
-| [validate_package_pickplace.py](../scripts/physic_solver/validate_package_pickplace.py) | 不启动 Kit，复核包裹数据集的帧对齐、双相机解码和粒子几何 |
-| [validate_physics_modes.py](../scripts/physic_solver/validate_physics_modes.py) | 各世界模式的自由落体与“只渲染不积分”冒烟测试，每次一个 Kit 进程 |
-
-### 3.2 资产
-
-所有资产放在 `assets/PhysicSolver/`（git 忽略，约 578 MB），全部是独立副本，只引用该目录内的文件，
-整个目录可以单独打包发给别人：
-
-| 目录 | 内容 |
-|---|---|
-| `Table/`、`Cube/`、`Cloth/` | 桌子、刚体方块、项目衣服 |
-| `Cloth/newton_official/` | 官方 Newton 衬衫 + `LICENSE.md` + 带 SHA-256 的 `provenance.json` |
-| `Robot/franka_emika_panda/` | FR3 URDF 与网格（Newton） |
-| `Isaac/Robots/FrankaRobotics/FrankaPanda/` | Panda USD（PhysX） |
-| `Isaac/Environments/Simple_Warehouse/` | 背景仓库 |
-| `Package/v7/` | V7 包裹：Bag、Garment 两个网格，原始 UV/材质、逐点质量和被动弹簧 |
-
-## 4. 运行
+本轮按用户要求清空原正式输出目录，从初态重新积分并重新采集视频；不将旧视频改名充当新数据，
+也不使用旧物理轨迹作为本轮演示。仅本轮新完成并通过独立审计的连续轨迹，可用来零物理步回放采集。
+所有源相机和recorder均为 **640×480、15fps**。后续多画面拼接视频可以采用1080p画布，不改变源采集分辨率。
 
 ```bash
-./app/python.sh -m pip install -e ".[dev]"
-# 资产已在 assets/PhysicSolver；需要重新准备时：
-./app/python.sh scripts/physic_solver/prepare_physic_solver_assets.py
-./app/python.sh scripts/physic_solver/prepare_official_newton_cloth.py
-./app/python.sh scripts/physic_solver/prepare_package_assets.py
-
-# 串行采集全部 8 个组合（每个组合一个 Kit 进程），汇总写到 outputs/physic_solver/collection_summary.json
-./app/python.sh scripts/physic_solver/collect_physic_solver_cases.py
-# 只采一个组合
-./app/python.sh scripts/physic_solver/collect_physic_solver_cases.py mujoco_vbd_pickplace_cloth
-# 或直接运行单个配置
-./scripts/rsr collect run -c configs/physic_solver/mujoco_vbd_pickplace_cloth.toml
-
-# 包裹：先只跑物理，再复核数据集
-./app/python.sh scripts/physic_solver/check_package_pickplace.py \
-    --config configs/physic_solver/mujoco_vbd_pickplace_package.toml \
-    --output outputs/debug/physic_solver/package_physics_check
-./app/python.sh scripts/physic_solver/validate_package_pickplace.py \
-    outputs/physic_solver/mujoco_vbd_pickplace_package
-
-# 世界模式冒烟测试
-./app/python.sh -m pytest -q tests/test_isaacsim_modes.py
-./app/python.sh scripts/physic_solver/validate_physics_modes.py --engine physx
-./app/python.sh scripts/physic_solver/validate_physics_modes.py --engine newton --solver mujoco
-./app/python.sh scripts/physic_solver/validate_physics_modes.py --engine hybrid --solver vbd --cloth
+# 从当前本轮状态继续；已经完成的新轨迹可在中断后续做渲染，未完成的物理前缀从初态重跑
+./app/python.sh scripts/physic_solver/recapture_physic_solver.py
+# 查看实际队列状态
+./app/python.sh scripts/physic_solver/recapture_physic_solver.py --status
+# 单个工况正常入口
+./scripts/rsr collect run -c configs/physic_solver/mujoco_vbd_package01_mass500g_pos_x35mm.toml
 ```
 
-已有 `lerobot_v3/` 的输出目录拒绝覆盖；重新采集要换 `job.output_dir`，例如
-`RSR_JOB__OUTPUT_DIR=outputs/debug/physic_solver/run2`。无头运行是默认值；打开 GUI 用
-`RSR_SIM_WORLD__HEADLESS=false RSR_JOB__KEEP_OPEN=true`。
+统一采集器包含27个成功目标（26个抓取＋1个螺纹装配）与2个原有对照，debug配置不加入正式录制。
+PathTracing阶段独占GPU；其后最多两个独立仿真实例，纯物理工况用两张GPU隔离求解，RTX录制在GPU0串行进行。
+本轮数值通过的数据先保存在debug暂存区；实际查看相机关键帧、写入视觉复核记录后才发布到同名正式目录。
+原有对照若出现与历史不同的结果，保留实际证据并检查，不通过重采样挑选失败。
+Featherstone包裹对照本轮保存了完整双相机原始帧，物理失败时未导出LeRobot状态／动作。
+采集器校验帧数、640×480、时间覆盖及逐帧解码后，将其编码为 `diagnostic_videos/`，
+只作为明确标注的失败视频纳入汇总，不补造训练数据，也不重新采样挑选失败。
 
-## 5. 输出与数据格式
+完整配置与工况目录校验：
 
-```text
-outputs/physic_solver/
-├── collection_summary.json        # 每个组合的采集状态、验收结果、日志路径
-├── capture_logs/<case>_<UTC>.log
-└── <case>/                        # 只保留通过验收的组合
-    ├── lerobot_v3/
-    │   ├── meta/info.json, stats.json, tasks.parquet, episodes/chunk-000/file-000.parquet
-    │   ├── meta/task_outcome.json  # 物理验收结果 + 生效配置
-    │   ├── data/chunk-000/file-000.parquet
-    │   └── videos/observation.images.{overview,wrist}/chunk-000/file-000.mp4
-    ├── result.json                # 实测验收与分项耗时
-    ├── validation.json            # 数据集独立校验
-    └── diagnostics/<run>/         # configuration.json、result.json、trajectory.jsonl（包裹另有 particles.npz）
-outputs/debug/physic_solver/<case>/  # 未通过验收的组合（含 diagnostic 数据集）
+```bash
+./app/python.sh .agents/skills/rsr-task-development/scripts/check_task_configs.py
+./app/python.sh -m ruff check real2sim2real scripts
+./app/python.sh -m pytest -q
 ```
 
-- 15 fps 同步录制 `observation.images.overview`（固定全景）、`observation.images.wrist`（腕部）、
-  `observation.state`、`action`，两路均为 640×480 H.264。
-- `observation.state` 是实际关节位置：前 7 维臂关节 rad，后 2 维手指开度 m。
-- `action` 是同一帧下发的关节目标。官方衣服控制器（`featherstone_vbd_pickplace_cloth`）记录的是
-  实际下发的关节速度（rad/s、m/s）。
-- 采集只刷新渲染，不额外推进物理；多相机逐路采集时核对物理步数不变。
-- 失败轨迹默认不导出；`job.recorder.save_failed_episodes=true` 时导出为
-  `success=false`、`dataset_use="diagnostic"`，采集脚本会把它移到 debug 目录。
+## 5. 验收
 
-## 6. 验收
+18个柔性包裹矩阵工况沿用各配置中的原门限：转运／摇晃两部分质心持续抬升≥80mm、双侧接触≥95%、
+最大边长比≤1.3、台面穿入≤1.5mm、落点≤80mm、释放回落≥10mm，最终受台面支撑、夹指接触归零。
+衣物须仍在袋内，无固定粒子。只有明确标为spring的两个工况启用有限力局部弹簧，且在释放时关闭。
+独立实际URDF FK检查闭合末TCP误差≤5mm、姿态误差≤1°；源状态与可见几何差≤0.01mm。
+双向代理另检查逐子步位置／姿态一致性和原生电机实际力限，不能把60N上限当作持续夹紧力。
 
-衣服 / 方块（`PickPlaceClothPlanner.result`）：保持阶段已观测、目标抬升 ≥ `minimum_lift_m`、
-保持期贴近夹爪、松开后回落 ≥ `minimum_release_drop_m`、回落后受桌面支撑、落点误差 ≤
-`maximum_place_error_m`、无附件；衣服另检查无固定顶点、确实变形（形状 RMS > 3 mm）、
-边长拉伸 p99 < 1.5。
+衣服、刚体及原装短指包裹基线沿用自己的完整checks和配置门限，不将包裹矩阵的门限套用到不同模型。
+纸箱由原始角点和全频率刚体轨迹独立复算，核对原尺寸／质量、提升、释放、落点、穿入和最终支撑。
+螺纹装配由真实M20螺纹SDF与hydroelastic接触决定进给，控制中没有“转角→轴向位移”规则：
+至少2圈／6mm进给，导程相对误差≤25%，旋入接触帧≥95%，保持漂移≤1mm，全程非导程前进≤2mm。
+固定螺母与导向主轴方案不覆盖自由拾取、工具移走后的保持或指定预紧力认证。
 
-官方衬衫（`OfficialClothPlanner.result`）：关键帧序列完成、状态有限、出现双侧接触、首轮转运
-≥ 95% 帧保持双侧接触、接触片抬升、松开后同一片顶点回落、无固定顶点、无附件。接触只统计进入
-物理接触包络的点，不统计检测余量内的候选。
+独立校验入口：
 
-V7 包裹（`PackagePlanner.result`，14 项）：序列完成、状态有限、双侧接触、衣物与袋膜分别提升、
-转运期双侧接触 ≥ 95%、释放回落、落点误差、落在桌面上、桌面穿透、表面拉伸 < 1.3、无固定顶点、
-十个检查时刻衣物顶点与面中心都在封闭袋膜内（1 mm 容差）、子步接触容量未溢出。
+- `validate_package_pickplace.py`、`run_package_matrix.py::audit_physics`、`audit_package_grasp_pose.py`
+- `validate_carton_pickplace.py`
+- `validate_screw_assembly.py`
+- 共用LeRobot v3数据校验：视频逐帧解码、H.264、分辨率、fps、帧数、状态／动作有限且同步。
 
-## 7. 遇到的问题与解决方案
+## 6. 本轮状态与历史
 
-| 问题 | 原因 | 处理 |
-|---|---|---|
-| XPBD 组合的关节观测不变 | XPBD 用最大坐标（body 位姿），不更新 `state.joint_q` | 用 `eval_ik` 写入独立观测缓冲区，再按指令分支展开转角；采集不改求解器状态 |
-| XPBD 步进会改写上一帧刚体位姿 | XPBD 把输入 body 缓冲区当作 Jacobi 临时空间，而 VBD 外部刚体路径要用未改动的上一帧位姿计算手指位移和接触摩擦 | XPBD 步进前复制、步进后恢复 `body_q/body_qd` |
-| 双相机采集超时（1800 s 只录到 16.68/18 s） | 128 spp × 8 子帧，且每次采集后还有一次不写数据的重复渲染 | 物理步进改为 `render=False`，只保留采集渲染；日志每 30 s 报告进度和控制/物理/采集/I/O 分项耗时 |
-| 多相机交替采集的画面一致性 | 不同相机之间不能共享时域抗锯齿历史；视口叠加层会进入截图 | 关闭 DLSS 时用空间 FXAA；等待实际渲染完成并核对相机矩阵与分辨率；无头 RGB 不含视口网格和坐标轴 |
-| 衣服像塑料、画面过亮 | 官方衬衫 USD 只有几何和显示颜色 | 绑定哑光材质（roughness 0.92、specular 0.02），仓库灯与补光降为 1/4 |
-| 官方演示密度不可直接用 | `density=0.02` 在厘米模型中对应约 141 kg | 保留 `cloth_mass_kg=0.2`，按三角面积分配 |
-| 夹指与衣服之间约 3 mm 可见间隙 | 粒子碰撞半径 8 mm 构成物理包络 | 试过 1–4 mm 半径、边/面接触、闭合时序、弯曲刚度和摩擦，薄接触都在转运中滑脱；保留 8 mm。接触验收与可见零间隙是两个独立条件，后者未解决 |
-| 指尖在桌面以下闭合或抓空 | FR3 URDF 与 Panda USD 的几何、驱动增益不同 | 按组合设置 `grasp_offset_m` 的 Z：XPBD+VBD 6 mm，MuJoCo+VBD 与统一 XPBD 10 mm，hybrid 12 mm 并提高机械臂驱动增益 |
-| hybrid 下 VBD 需要手指碰撞体 | VBD 模型里没有 PhysX 刚体 | 读取 PhysX 实测手指/手掌位姿，作为 Newton 运动学碰撞盒，逐子步插值位姿和速度 |
-| Panda 指垫位置左右镜像 | USD 镜像的是几何，不是 body 坐标系 | 代理盒偏移分别取 ±Y 7.58 mm |
-| 原装短指抓 V7 包裹滑脱（Featherstone） | 速度控制 + 短指在中央/边缘试抓都滑脱 | 新增 `mujoco_vbd_pickplace_package`：MuJoCo 位置控制 + 原装短指 + 中央抓点 + 慢抬升/转运 + `align_place_to_com` 按实测衣物质心修正落点，通过全部 14 项 |
-| 长夹块对照仍失败 | 32 子步/28 迭代下提升约 115 mm 后滑脱，转运双侧接触约 2.25%，拉伸 1.422 | 保留为 `diagnostic` 对照组，不当作原装夹爪数据 |
-| VBD 自接触界限随包裹整体平移变得保守 | DAT 截断按世界坐标计算 | `MovingFrameVBD` 先减去质量加权公共位移、截断后再加回；相对轨迹不变，并逐子步记录接触容量峰值 |
-| Newton USD 路径选 VBD 直接报错 | Isaac Sim 6.2 RC 未提供 `NewtonVbdSceneAPI` schema | 柔体统一走 direct / hybrid，USD 路径只用于 MuJoCo / XPBD 冒烟测试 |
-| 同一配置多次运行结果不同 | Newton VBD / MuJoCo（GPU）求解有运行间差异，衣服松开后的落点对微小差异敏感（`mujoco_vbd_pickplace_cloth` 落点误差 22–84 mm） | 不放宽门限；采集脚本把未通过的运行移到 `outputs/debug/physic_solver/`，正式目录只放通过全部验收的运行；用整理前代码复跑确认不是回归 |
-| 统一 XPBD 衣服抓不住 | Newton 1.6.1 XPBD 不支持布料自碰撞；原始粒子排斥没有网格邻接过滤 | 默认关闭粒子排斥、均匀分配质量；保留为实验组，失败正常返回非零 |
+配置平铺前后已逐份核对生效模型：物理参数和验收门限一致，仅输出／任务名、分辨率及运行超时预算更新。
+本轮最新全仓回归为266通过、3跳过（26.09s），覆盖配置路由、命名／640采集约定、双GPU队列不会重复领取同一工况及中断恢复。
+3个跳过项依赖USD／Newton SDK导入环境；随后在该环境以CPU补跑，3项全部通过（4.85s）。
+补跑检查了USD材质引用、夹垫碰撞体SI尺寸及闭合位姿，未增加GPU仿真实例。
+上述全仓回归包含失败视频恢复、首次运行初始化与存活子进程接管；任务专项42项也已通过（1.15s）。
+控制进程中断时，恢复逻辑先核对各工况仍存活的进程和输出，沿用它们所在的GPU通路等待完成，
+不会在原子进程仍求解时重复采集；只有中断且未完成的物理轨迹才从初态重跑。
 
-## 8. 局限
+本轮从初态重新采集已完成：**27项成功目标（26项抓取＋1项螺纹装配）**通过物理、数据及各路相机关键帧复核，
+**2项失败对照**完成诊断视频验收，明确保留物理失败。正式目录共27个与配置同名的结果文件夹。
+配置快照、运行ID、发布路径及视觉复核图片哈希已逐项核对，见
+[发布审计](../outputs/debug/physic_solver/recapture/20261113T093020Z/publication_audit.json)。
+完整结果见 [collection_summary.json](../outputs/physic_solver/collection_summary.json)及各同名目录的
+`result.json`、`validation.json`、`qa/visual_review.json`、`run_note.json`。
 
-- 衣服、包裹都是单向耦合：机器人推动柔体，柔体反力不回馈机械臂。数据能验证动作流程、
-  形变和持续抓持，不能评价真实夹爪的额定负载或限力性能。
-- Newton 1.6.1 的 Featherstone、XPBD 不执行 `joint_effort_limit`，`finger_max_force` 只在
-  PhysX / MuJoCo 路径生效。
-- V7 长夹块密度 1000 kg/m³（每块约 70.56 g）是仿真假设，未做硬件标定。
-- 几何检查只覆盖保存的物理帧，不构成连续时间无穿透的证明。
-- 每个组合只采一条固定初始状态的 episode。
+| 分类 | 成功目标数 | 本轮结果 |
+|---|---:|---|
+| 机器人／接触算法基础组合 | 6 | 通过 |
+| package01位置与姿态 | 6 | 通过 |
+| package01衣物重量变化 | 4 | 通过 |
+| package02–06种类变化 | 5 | 通过 |
+| 三种摇晃／附着＋package07–08纸箱 | 5 | 通过 |
+| 固定螺母＋连续旋转主轴 | 1 | 通过 |
+| Featherstone包裹、统一XPBD衣服 | 2项对照 | 物理失败，诊断视频有效 |
+
+[本轮队列状态](../outputs/debug/physic_solver/recapture/20261113T093020Z/queue.json) · [配置迁移对照](../outputs/debug/physic_solver/recapture/20261113T093020Z/config_migration.json) · [旧输出归档](../outputs/debug/physic_solver/recapture/20261113T093020Z/previous_outputs/) · [旧实验说明](../outputs/debug/physic_solver/recapture/20261113T093020Z/previous_physic_solver.md)
+
+每个通过配置目前以一条episode为目标，失败／中断和全部重试保留在debug及run_note中，不据此估算成功率。
+已有station_clothing工况历史最大边长比接近1.3门限，须保持门限并逐次验收，不直接沿用旧成功标签。
+本轮package02首轮在2.15s因边长比1.30094超过1.3而提前停止，未录制为成功视频；第二次保留同一门限并通过物理和双相机视觉验收。
+本轮X35mm首轮完成抓放但落点误差86.5mm，超过80mm门限而拒绝；原参数第二次完整运行误差42.8mm并通过。
+两个尝试均保留，说明该通过记录不能视作确定性复现或成功率统计。
+90°双向代理首轮新运行在开爪前已滑落，释放回落为0、落点误差103.9mm而拒绝；
+代理几何一致性与60N夹指实际力限检查通过。第二次保持原参数完整运行，通过新的物理审计与双相机视觉验收；
+该结果需配合首次失败解读，不能沿用历史通过标签或估计成功率。
+package05首轮已完成夹起、转运与释放，但落点误差84.6mm超过80mm门限，已拒绝发布并保留；
+原参数第二次运行误差5.7mm，通过原门限及双相机视觉验收。两次结果均保留，不能据此估计成功率。
+中央弹簧摇晃首轮在12.333s因最大边长比1.35001超过1.3而提前停止；第二次保留原参数，最大边长比1.27325，
+通过原门限和双相机视觉验收。所有失败及重试均保留在本轮debug尝试目录。
+
+三种摇晃工况的本轮实测结果如下。抬升为相对初始质心位置，衣物／袋膜分别统计：
+
+| 抓点／附着 | 摇晃最低抬升（mm，衣物／袋膜） | 双侧接触 | 最大边长比 | 释放回落（mm） | 落点误差（mm） |
+|---|---:|---:|---:|---:|---:|
+| X35mm／无附着 | 233.5／229.7 | 100% | 1.12420 | 117.6 | 8.7 |
+| 中央／有限力弹簧 | 190.7／204.1 | 99.33% | 1.27325 | 78.4 | 24.1 |
+| X35mm／有限力弹簧 | 233.2／228.9 | 100% | 1.12480 | 115.4 | 37.2 |
+
+实际URDF FK复算的偏航／俯仰峰峰值均约20.37°／10.21°；平移及角度范围通过原有“达到配置名义峰峰范围至少一半”检查。
+两种弹簧辅助均在释放时关闭，无固定粒子。
+螺纹装配本轮旋转3.49124圈、轴向旋入8.68827mm，导程误差0.456%，保持漂移0.0896mm；独立审计和双视角复核通过。
+
+## 7. 视频拼接
+
+本轮已在全部新数据完成数值验收与实际视觉复核后生成8个视频，全部位于 `outputs/physic_solver/`。
+源视频共56路（抓取54路＋螺纹装配2路），均来自本轮运行。成品为1920×1080、15fps、H.264。
+拼接入口如下；已有同名成品时拒绝覆盖：
+
+```bash
+./app/python.sh scripts/physic_solver/create_video_montages.py
+```
+
+按机器人求解器／接触算法、抓取位置、重量、包裹种类、摇晃／纸箱分屏，保留全景及腕部视角；
+标注物体编号、机器人型号、机器人求解器、接触／柔体算法和通过状态。
+片段全程原速，短片段结束后保持末帧并显示结束标记；失败对照明确标注，螺纹装配另做附篇。
+总片检查完整解码、帧数和分段顺序，另比较全部解码帧MD5，确认拼接没有丢帧或重复片段。
+本轮总片1624帧全部与六个抓取分类片的顺序解码帧一致。已实际查看7个分片各3张预览、总片3张预览，
+共24张，核对布局、标签、摇晃段、失败状态与结束标记；人工检查不覆盖每一帧。
+
+| 视频 | 时长（秒） | 内容 |
+|---|---:|---|
+| [抓取总片](../outputs/physic_solver/grasp_all_comparison_labeled.mp4) | 108.27 | 下列01–06依次拼接，含明确标注的失败对照 |
+| [01_solver_comparison](../outputs/physic_solver/01_solver_comparison.mp4) | 21.53 | 6种机器人／接触算法基础组合 |
+| [02_package_positions](../outputs/physic_solver/02_package_positions.mp4) | 17.80 | 6种抓取位置与姿态 |
+| [03_package_weights](../outputs/physic_solver/03_package_weights.mp4) | 14.80 | 100／200／350／500g衣物 |
+| [04_package_types](../outputs/physic_solver/04_package_types.mp4) | 14.80 | package02–06 |
+| [05_shake_and_cartons](../outputs/physic_solver/05_shake_and_cartons.mp4) | 17.80 | 3种摇晃／附着＋package07–08 |
+| [06_failed_grasp_controls](../outputs/physic_solver/06_failed_grasp_controls.mp4) | 21.53 | 2项本轮失败对照 |
+| [07_screw_assembly_appendix](../outputs/physic_solver/07_screw_assembly_appendix.mp4) | 9.00 | 螺纹装配双视角附篇，不计入抓取总片 |
+
+来源、逐文件SHA256、分片顺序、完整解码和实际视觉复核记录见
+[grasp_montage_index.json](../outputs/physic_solver/grasp_montage_index.json)。
+
+## 8. 代码与资产
+
+生命周期保持 `init_world → arrange_scene → place_robot → start_simulation → finally: close`。
+各能力域仍每任务一个文件：
+
+- [scene_physic_solver.py](../real2sim2real/scene/scene_physic_solver.py)
+- [robot_physic_solver.py](../real2sim2real/robot/robot_physic_solver.py)
+- [planner_physic_solver.py](../real2sim2real/planner/planner_physic_solver.py)
+- [job_physic_solver.py](../real2sim2real/job/job_physic_solver.py)
+- [physic_solver_utils.py](../real2sim2real/utils/physic_solver_utils.py)：包含统一工况名称与分组映射。
+- [simworld_physic_solver.py](../real2sim2real/simworld/simworld_physic_solver.py)：真实SDK纯物理世界。
+
+资产准备脚本为 `prepare_physic_solver_assets.py`、`prepare_official_newton_cloth.py`、
+`prepare_package_assets.py` 与 `prepare_screw_assets.py`；后端注册见 `pyproject.toml`。
+运行时继续使用Isaac `python.sh`，没有创建 `.venv`，无新增包依赖，不修改其他任务配置、资产和输出。

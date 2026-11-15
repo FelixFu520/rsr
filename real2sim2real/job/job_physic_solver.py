@@ -43,7 +43,7 @@ class PhysicSolverRecorderConfig(BaseModel):
 class PhysicSolverJobConfig(BaseConfig):
     """Finite task execution and accepted dataset destination."""
 
-    output_dir: str = "outputs/physic_solver/featherstone_vbd_pickplace_cloth"
+    output_dir: str = "outputs/physic_solver/featherstone_vbd_cloth01_baseline"
     max_steps: int = Field(default=6000, gt=0)
     timeout_s: float = Field(
         default=1800, gt=0, description="Wall-clock limit for the loop, including RGB capture."
@@ -89,6 +89,9 @@ class PhysicSolverJob(BaseJob):
     def before_place_robot_hook(self) -> None:
         """Mount the robot on the measured table before its asset is initialized."""
         self.robot.config.base_position = tuple(self.scene.robot_base_position)
+        prepare = getattr(self.planner, "prepare_initial_joints", None)
+        if prepare is not None:
+            prepare(self.robot, self.scene)
 
     def before_start_simulation_hook(self) -> None:
         """Build and register the Newton model before the unified world checks readiness."""
@@ -317,3 +320,167 @@ class PhysicSolverJob(BaseJob):
                 raise RuntimeError("Multi-camera capture advanced physics")
         finally:
             viewport.camera_path, viewport.resolution = previous_camera, previous_resolution
+
+
+# ================================================================================================
+# Screw assembly shares the BaseJob lifecycle; recorder/state dimensions are tool-specific.
+# ================================================================================================
+
+
+class ScrewJobConfig(PhysicSolverJobConfig):
+    """Screw assembly output and optional physics-only diagnostics."""
+
+    backend: str = "screw_assembly"
+    output_dir: str = "outputs/physic_solver/mujoco_hydroelastic_screw01_rotate"
+    record_rgb: bool = True
+
+
+class ScrewJob(BaseJob):
+    """Assemble the fixed nut and guided spindle, execute physical threading, and record."""
+
+    config_cls = ScrewJobConfig
+
+    def __init__(self, config: ScrewJobConfig | None = None) -> None:
+        super().__init__(config=config)
+        if not self.sim_world.uses_direct_newton or self.sim_world.config.newton_solver != "mujoco":
+            raise ValueError("Screw assembly requires direct Newton MuJoCo")
+        combination = (
+            self.scene.config.backend,
+            self.robot.config.backend,
+            self.planner.config.backend,
+        )
+        if combination not in {
+            ("screw_assembly", "screw_spindle", "screw_assembly"),
+            ("pickplace_carton", "franka_carton_gripper", "pickplace_carton"),
+        }:
+            raise ValueError("Assembly requires its declared scene and robot combination")
+        ratio = 1 / (self.config.recorder.fps * self.sim_world.config.physics_dt)
+        if not math.isclose(ratio, round(ratio), abs_tol=1e-8):
+            raise ValueError("Recorder fps must divide physics frequency")
+        if (
+            self.sim_world.config.newton_use_cuda_graph
+            and not getattr(self.planner.config, "mujoco_cpu", False)
+            and self.sim_world.config.newton_substeps % 2
+        ):
+            raise ValueError("Assembly CUDA graph requires an even number of substeps")
+        self.record_stride = round(ratio)
+        self.recording_cameras = validate_camera_list(
+            [*self.scene.config.cameras, *self.robot.config.cameras]
+        )
+        output = Path(self.config.output_dir)
+        if (output / "result.json").exists() or (output / "lerobot_v3").exists():
+            raise FileExistsError(f"Select a fresh screw output directory: {output}")
+
+    def before_place_robot_hook(self) -> None:
+        """Mount the spindle exactly above the measured table fixture."""
+        self.robot.config.base_position = tuple(self.scene.screw_origin)
+
+    def before_start_simulation_hook(self) -> None:
+        """Build the model and register its one direct-Newton step callback."""
+        self.planner.begin_episode(self.scene)
+        self.sim_world.register_newton_stepper(self.planner.runtime.step)
+        self.sim_world.reset()
+
+    def simulate(self) -> None:
+        """Collect measured joint states and contact diagnostics; export accepted demonstrations."""
+        output = Path(self.config.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        configs = {
+            name: getattr(self, name).config.model_dump(mode="json")
+            for name in ("sim_world", "scene", "robot", "planner")
+        }
+        configs["job"] = self.config.model_dump(mode="json")
+        (output / "configuration.json").write_text(json.dumps(configs, indent=2) + "\n")
+        recorder = None
+        if self.config.record_rgb:
+            recorder = LeRobotV3Recorder(
+                output / "lerobot_v3",
+                fps=self.config.recorder.fps,
+                width=self.config.recorder.width,
+                height=self.config.recorder.height,
+                task=getattr(
+                    self.planner,
+                    "recording_task",
+                    "Use the continuous rotary spindle to thread a bolt through the fixed nut.",
+                ),
+                robot_type=self.robot.recording_robot_type,
+                joint_names=self.robot.recording_joint_names,
+                action_names=self.planner.action_names,
+                cameras={cam.name: cam.resolution for cam in self.recording_cameras},
+            )
+        self.sim_world.play()
+        started, next_report = time.monotonic(), 0.0
+        result = {}
+        error = None
+        try:
+            for step in range(self.config.max_steps):
+                if time.monotonic() - started > self.config.timeout_s:
+                    raise TimeoutError("Screw assembly exceeded its wall-clock limit")
+                if self.planner.on_physics_step(self.robot):
+                    break
+                if recorder is not None and step % self.record_stride == 0:
+                    PhysicSolverJob._capture_cameras(self, recorder)
+                    recorder.add_frame(*self.planner.runtime.recording_coordinates())
+                self.sim_world.step(render=False)
+                elapsed = time.monotonic() - started
+                if elapsed >= next_report:
+                    self.log.info(
+                        "PhysicSolver assembly progress",
+                        simulation_s=self.planner.elapsed,
+                        phase=self.planner.state["phase"],
+                        wall_s=elapsed,
+                        measurement=self.planner.rows[-1],
+                    )
+                    next_report = elapsed + 30
+            result = self.planner.result()
+            result["completed"] = bool(self.planner.state["done"])
+            if recorder is not None:
+                if result["success"] or self.config.recorder.save_failed_episodes:
+                    dataset = recorder.finalize(episode_success=result["success"])
+                    result.update(
+                        dataset=str(dataset),
+                        frames=len(recorder.rows),
+                        dataset_use="demonstration" if result["success"] else "diagnostic",
+                    )
+                    (dataset / "meta/task_outcome.json").write_text(
+                        json.dumps({"physical_result": result, "configuration": configs}, indent=2)
+                        + "\n"
+                    )
+                else:
+                    recorder.discard(output / "diagnostics")
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            if recorder is not None:
+                recorder.discard(output / "diagnostics")
+            raise
+        finally:
+            if not result:
+                result = self.planner.result()
+            result.update(
+                success=bool(result.get("success") and error is None),
+                error=error,
+                elapsed_s=time.monotonic() - started,
+                physics_steps=self.sim_world.physics_steps,
+            )
+            self.state["result"] = result
+            (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+            (output / "trajectory.json").write_text(json.dumps(self.planner.rows) + "\n")
+            self.log.info("PhysicSolver assembly result", **result)
+
+
+class CartonJobConfig(ScrewJobConfig):
+    """Rigid V10 carton demonstration using the same finite assembly recording loop."""
+
+    backend: str = "pickplace_carton"
+    output_dir: str = "outputs/physic_solver/mujoco_mujoco_package07_center"
+
+
+class CartonJob(ScrewJob):
+    """Reuse the fixed lifecycle and recorder for the long-stroke carton grasp subtask."""
+
+    config_cls = CartonJobConfig
+
+    def before_place_robot_hook(self) -> None:
+        """Mount the Franka on the measured table instead of the screw-fixture origin."""
+        self.robot.config.base_position = tuple(self.scene.robot_base_position)
+        self.planner.prepare_initial_joints(self.robot, self.scene)

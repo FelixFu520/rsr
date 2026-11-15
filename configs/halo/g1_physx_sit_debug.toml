@@ -1,0 +1,26 @@
+# 调试配置：继承 sit 正式配置，640×360 / 15 fps，实时 RTX，结果写到 outputs/debug/halo/sit（可重复运行）。
+# 物理、控制、场景与验收与正式配置完全相同；失败轨迹也导出为 diagnostic 数据。
+# 运行：./scripts/rsr collect run -c configs/halo/g1_physx_sit_debug.toml
+inherit = "g1_physx_sit.toml"
+
+[sim_world]
+renderer = "RayTracedLighting"
+width = 640
+height = 360
+
+[scene.third_person]
+width = 640
+height = 360
+
+[robot.head_camera]
+width = 640
+height = 360
+
+[job]
+output_dir = "outputs/debug/halo/sit"
+overwrite_dataset = true
+timeout_s = 7200.0
+
+[job.recorder]
+fps = 15
+save_failed_episodes = true

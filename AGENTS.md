@@ -37,13 +37,15 @@
 
 每个任务在 scene / robot / planner / job / utils 中**各只有一个文件**，文件名后缀即任务名：
 
-| 任务 | 后缀 | 后端名（scene / robot / planner / job） |
-|------|------|------------------------------------------|
 | 任务 | 后缀 | 资产目录 | 后端名（scene / robot / planner / job） |
 |------|------|----------|------------------------------------------|
-| 物理求解器验证 | `physic_solver` | `assets/PhysicSolver/` | `pickplace_cloth`、`pickplace_rigid`、`newton_cloth_franka`、`pickplace_package` / `franka_newton`、`franka_physx`、`franka_package_pads` / `pickplace_cloth`、`newton_cloth_franka`、`pickplace_package` / `pickplace_cloth` |
+| 物理求解器验证（含包裹矩阵／螺纹装配） | `physic_solver` | `assets/PhysicSolver/` | `pickplace_cloth`、`pickplace_rigid`、`newton_cloth_franka`、`pickplace_package`、`pickplace_carton`、`screw_assembly` / `screw_spindle`、`franka_carton_gripper`、`franka_newton`、`franka_physx`、`franka_package_pads` / `pickplace_cloth`、`newton_cloth_franka`、`pickplace_package`、`pickplace_carton`、`screw_assembly` / `pickplace_cloth`、`pickplace_carton`、`screw_assembly` |
 | 分拣包裹 | `sorting` | `assets/SortingPackage/` | `sorting_package` / `pro_m6_newton` / `sorting_package`、`sorting_stream` / `sorting_package` |
 | 机器狗巡检 | `fire_inspection` | `assets/FireInspection/` | `fire_warehouse` / `x30_kinematic` / `fire_patrol` / `fire_inspection` |
+| HALO G1（爬行／弯腰过桌、落座） | `halo` | `assets/Halo/` | `halo_home` / `g1_sonic` / `sonic_tracking` / `halo` |
+| 双 KR210 电池拆解（拧螺丝、揭盖） | `battery_disassembly` | `assets/BatteryDisassembly/` | `battery_workcell` / `kr210_dual` / `battery_unscrew` / `battery_disassembly` |
+| Franka 桌面抓放（cuMotion） | `tabletop_pickplace` | `assets/TabletopPickplace/` | `tabletop_home` / `franka_tabletop` / `cumotion_pickplace` / `tabletop_pickplace` |
+| 桌面轨迹回放 | `tabletop_replay` | `assets/TabletopReplay/` | `tabletop_home` / `franka_tabletop`（复用抓放后端）/ `lerobot_replay` / `tabletop_replay` |
 
 - 同一任务的多个后端、运行时和辅助类放在同一文件中，按依赖顺序分节（节首注释说明内容）。
 - 新任务依次新增 `{domain}/{domain}_<task>.py`、`utils/<task>_utils.py`、`configs/<task>/`、
@@ -52,11 +54,23 @@
 - 资产：每个任务只引用自己资产目录里的文件（含 USD 依赖、MDL 与贴图），可以单独打包发给别人；
   任务之间共用的资产各自复制一份。不属于任何任务的资产放 `assets/bak/`，任务配置和运行代码不引用它
   （资产准备脚本可以从这里复制）。
+- `physic_solver` 配置全部平铺在 `configs/physic_solver/`；文件名为 `<机器人求解器>_<接触求解器>_<物体ID>_<工况>.toml`，输出文件夹与配置文件 stem 一致，不再设置 `package_cases/` 子目录。
 - 任务之间可以继承（分拣复用物理求解器任务的 `PackageScene` / `PackageRuntime` / `PhysicSolverJob`），
   不要复制代码。
 - 包内模块顶层不导入 Kit / pxr / Newton / Warp；Warp kernel 和依赖 Newton 的子类在首次使用时定义
   （见 `utils/physic_solver_utils.moving_frame_vbd_class`），保证 `list-backends` 和单元测试不启动 Kit。
 - 输出：`outputs/<task>/` 只放通过验收的结果；调试、对照和失败轨迹放 `outputs/debug/<task>/`。
+
+### 1.2 调试与正式采集的渲染规格
+
+- 调试：图像宽度 640 像素、15 fps，保持相机原有宽高比；优先非光线追踪的简化渲染。
+  当前 Isaac Sim 6.2 的受支持入口均为 RTX，使用 `MinimalRendering` + `minimal_shading_mode=2`
+  做低成本纹理预览，关闭间接光照；它仍属于 RTX，不能标成纯非光追。只查物理时关闭 RGB 采集。
+- 正式采集：图像宽度 2048（2K）或 1024（1K）像素、30 fps，保持原有宽高比；使用
+  `PathTracing`、足够的每像素采样、光线反弹和降噪，保留真实材质、阴影与反射，优先逼真度。
+  帧率指输出视频的仿真时间采样率，离线渲染不要求墙钟实时达到 30 fps。
+- 调试配置显式覆盖分辨率、fps 和渲染器；正式与调试只改变采集设置，不改变物理参数与验收门限。
+  新规格采集写入新的输出目录，保留已有正式结果。历史结果按其实际参数标注，不追溯改写。
 
 模块职责（分离，由 Job 编排）：
 
@@ -155,9 +169,14 @@ Entry point 组名以 `pyproject.toml` / `core/registry.py` 为准，勿自创�
 - stub 示例：`./app/python.sh -m real2sim2real.core.cli collect run`
 - 指定配置：`./app/python.sh -m real2sim2real.core.cli collect run -c settings.toml`
 - 任务入口：
-  - 物理求解器验证：`./app/python.sh scripts/physic_solver/collect_physic_solver_cases.py`
+  - 物理求解器验证：`./app/python.sh scripts/physic_solver/recapture_physic_solver.py`
   - 分拣包裹：`./scripts/sorting/run_sorting_showcase.sh outputs/sorting`（内部调用 `rsr collect render-sorting`）
   - 机器狗巡检：`./scripts/rsr collect run -c configs/fire_inspection/x30_physx_warehouse.toml`
+  - HALO G1：`./scripts/rsr collect run -c configs/halo/g1_physx_{crawl,crouch,sit}.toml`（调试用 `*_debug.toml`）
+  - 电池拆解：`./scripts/rsr collect run -c configs/battery_disassembly/kr210_physx_c1003b1a1.toml`（调试用 `*_debug.toml`）
+  - 桌面抓放：`./scripts/rsr collect run -c configs/tabletop_pickplace/franka_physx_home000.toml`（调试用 `*_debug.toml`）
+  - 桌面轨迹回放：`./scripts/rsr collect run -c configs/tabletop_replay/franka_physx_home000.toml`（先有抓放数据集）
+  - 桌面任务正式采集优先使用 `./app/python.sh scripts/tabletop_pickplace/collect_tabletop_pickplace.py` 或 `./app/python.sh scripts/tabletop_replay/collect_tabletop_replay.py`（单调 GPU 预算时钟、独立验收后发布）；调试沿用上述 CLI。
 
 调试子命令时使用 `./app/python.sh -m real2sim2real.core.cli`（`main()` 内加载插件）。
 
@@ -191,6 +210,7 @@ uv lock
 | 机器人关节发散、驱动振荡、闭环/mimic 稳定性 | [isaac-articulation-stability](.agents/skills/isaac-articulation-stability/SKILL.md) |
 | 夹爪驱动力、闭合速度、夹持不足与具体调参 | [isaac-gripper-tuning](.agents/skills/isaac-gripper-tuning/SKILL.md) |
 | 功能组合不支持、版本行为差异、官方已知限制 | [isaac-physics-faq](.agents/skills/isaac-physics-faq/SKILL.md) |
+| 迁移任务、新增任务、丰富已有任务（引擎选型、组件接入、资产打包、回归、采集验收） | [rsr-task-development](.agents/skills/rsr-task-development/SKILL.md) |
 
 混合问题先按直接证据选主入口：夹爪参数估算从 gripper 开始，接触几何异常从 collision 开始，驱动/约束异常从 articulation 开始；只有证据涉及其他领域时再读取对应 skill，避免循环加载。
 

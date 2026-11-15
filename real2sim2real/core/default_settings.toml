@@ -6,23 +6,32 @@ console = true  # 文本控制台输出
 [sim_world]
 backend = "stub"  # 不启动 Kit
 # Featherstone 双相机采集示例：renderer="RayTracedLighting"、rt_subframes=4。
+# 渲染规格：调试宽 640 / 15 fps，优先非光追；本机仅支持 RTX，简化预览用
+# renderer="MinimalRendering"、minimal_shading_mode=2、minimal_ambient_intensity=0.5（仍是 RTX）。
+# 正式宽 2048（2K）或 1024（1K）/ 30 fps，PathTracing + 采样/反弹/降噪，保持相机宽高比。
 # samples_per_pixel_per_frame=64 仅 PathTracing 生效；采集核对真实渲染帧及相机矩阵。
 # IsaacsimWorld：pathtracing_max_bounces=4、pathtracing_denoiser=true。
 # pathtracing_temporal_denoising=false；pathtracing_cached/pathtracing_many_light_sampling=true。
 # synchronous_capture=false；高清同步采集示例将其设为 true，并关闭两项光照缓存。
 # background_light_scale=1.0；引用背景子树的灯光强度倍率，官方衣服示例设为 0.25。
+# active_gpu=None、multi_gpu=None：沿用 SimulationApp 默认；halo 设 active_gpu=0/1、multi_gpu=false 单卡渲染。
+# battery_disassembly 的 1K 正式配置：active_gpu=None、multi_gpu=true，单个 Kit 进程使用本机双卡。
+# renderer_multithreading=None：沿用 RTX 的 CPU 命令录制线程设置；false 不关闭多 GPU 或改变画质。
 
 [scene]
 backend = "stub"
 # pickplace_cloth / pickplace_rigid 支持 [[scene.cameras]] 固定相机列表。
 # 每项含 name、prim_path、pose_relative_to、pose、resolution 和可选镜头参数。
-# 示例见 configs/physic_solver/featherstone_vbd_pickplace_cloth.toml。
+# 示例见 configs/physic_solver/featherstone_vbd_cloth01_baseline.toml。
 # newton_cloth_franka 使用 newton_official/unisex_shirt.usd 和未经压扁的官方布局。
 # cloth_base_color=[0.16,0.20,0.65]、cloth_roughness=0.92、cloth_specular=0.02。
 # pickplace 系列场景：fill_light_intensity=650、key_light_intensity=2200。
 
 # pickplace_package：cloth_usd_path="assets/PhysicSolver/Package/v7/parcel_two_mesh.usd"。
 # target_xy=[0.10,0]、robot_base_xy=[-0.42,0]；保持两个网格及原始 UV/材质。
+# pickplace_package：garment_mass_kg=None、bag_mass_kg=None，按原逐点比例覆盖各部分总质量。
+# screw_assembly：bolt_mesh_path/nut_mesh_path 位于 assets/PhysicSolver/Screw/M20/。
+# thread_pitch_m=0.0025、initial_engagement_m=0.004；固定螺母、真实螺纹网格。
 # sorting_package：station_usd_path 指向旧分拣工位，cloth_usd_path 默认 v7_sorting 快照（正式配置用 v10_station）。
 # infeed_path/platform_path/outfeed_path 读取各自 USD 支撑面；support_depth_m=0.04。
 # garment_mass_kg=0.2；bag_mass_kg 默认不覆盖袋膜质量。可显式设置两者并保持各自质量分布。
@@ -37,6 +46,14 @@ backend = "stub"
 # light_scale=1.0：仓库全部灯光强度倍率，只改运行时 stage。
 # rigid_usd_path=""、rigid_scale=0.5、rigid_mass_kg=0.03125：可选 V10 纸箱及声明的缩放/质量。
 # belt_markers=false：用循环移动的细缝显示实际传送带表面偏移。
+# halo_home：引用的 home_010 全部网格设为静态三角网格碰撞，薄地板与 Decals 关闭，由 floor_proxy_* 隐形盒承重。
+# contact_offset_m=0.004、rest_offset_m=0.0005、static_friction=1.0、dynamic_friction=0.8；desk/seat 可选。
+# third_person：width/height、focal_length=1.93、horizontal_aperture=3.896（mm），mode="fixed"/"follow"。
+# battery_workcell：Battery.usd 引用到 /World/scene，battery_yaw_deg=-90；资产碰撞体换成盒体代理（cover/case/basket），
+# 螺丝 M10×1.5 螺纹 24 mm（mimic 螺旋约束，thread_damping_nms_rad=0.002），盖板 cover.mass_kg=12，pallet 托盘。
+# tabletop_home：table.position_m=[0.45,-3.75,0.415]、collision_approximation="none"（桌面网格静态三角网格碰撞）；
+# objects[].offset_m 为桌面系 XY、clearance_m=0.001、mass_kg=None（不覆盖资产）；min_object_gap_m=0.02、table_edge_margin_m=0.05。
+# cameras 为 SensorCameraConfig：usd_path+optical_prim 引用传感器 USD（仅视口采集），hide_housing=true；为空时同 CameraConfig 建针孔相机。
 
 [robot]
 backend = "stub"
@@ -44,6 +61,8 @@ backend = "stub"
 # 官方 cloth_franka 场景使用 franka_newton 的 control_mode="velocity"。
 # franka_package_pads：V7 长夹块，pad_half_extents_m=[0.03,0.007,0.042]，
 # pad_center_m=[0,0.007,0.055]；pad_density_kg_m3=1000 为未硬件标定的仿真密度。
+# screw_spindle：axial_stiffness_n_m=100、axial_damping_n_s_m=5、axial_preload_target_m=-0.04。
+# spindle_damping_nm_s_rad=0.02、maximum_torque_nm=0.3、carriage_mass_kg=0.05；无限旋转。
 # pro_m6_newton：保留原 USD 世界位姿、惯量与原生 Robotiq 碰撞近似。
 # arm_stiffness/arm_damping=6000/300、finger_stiffness/finger_damping=40/1。
 # finger_friction=1.4；cameras 支持头部及左右腕部挂载。
@@ -53,6 +72,13 @@ backend = "stub"
 # leg.*：官方 URDF 腿长；gait.mode="trot"/"stand"、period_s=0.5、lift_m=0.07。
 # gait.max_stride_m=0.13、max_tracking_error_rad=0.35；camera_for_detection="front_rgb"。
 # beacon：护笼顶部红色警示灯，base_position_m=[0.14,0,0.462]、light_intensity=6000，仅视觉。
+# g1_sonic：原生 29 关节 G1（三指手），自由基座；SONIC 电机增益，肩肘 arm_stiffness/arm_damping=40/3。
+# 手指 auxiliary_stiffness/damping/effort=20/2/5；head_camera 在 torso_link (0.12,0,0.43)、下俯 25°。
+# place_at_start=false：与 HALO 相同，引用留在资产原点，起始状态由 PhysX 写入。
+# kr210_dual：两台 KR210 L150（保留资产驱动与碰撞）；screwdriver 浮动弹簧 1500 N/m、预伸 8 mm、主轴 2 N·m，
+# 批头磁力 magnet_max_force_n=3、magnet_range_m=0.006；gripper 双指 stroke_m=0.06、max_force_n=200、胶垫 μ=1.0/0.9。
+# franka_tabletop：base_offset_m=[-0.35,0]（桌面系）、keep_base_on_table=true；保留 USD 驱动；
+# initial_joint_positions=USD 驱动目标（0.012,-0.570,0,-2.810,0,3.037,0.741,0.04,0.04）、gripper_open_m=0.04、gripper_closed_m=0。
 
 [planner]
 backend = "stub"
@@ -64,7 +90,28 @@ backend = "stub"
 # keyframe_offset_m=[0,0,0]：以米平移官方末端路径，厚度变化时需重新验证抓放。
 # finger_velocity_gain=1.0：夹指开合响应增益（1/s），速度受 URDF 限制。
 
+# newton_diagnostic：只用Isaac内置Newton/USD SDK跑物理；check_package_matrix.py负责SDK环境。
 # pickplace_package 参数与默认值见 PackagePlannerConfig 和包裹示例 TOML。
+# pickplace_package：grasp_yaw_deg/grasp_pitch_deg=0、shake_s=0，保留旧动作。
+# shake_frequency_hz=1.5、shake_translation_m=[0.015,0.01,0.008]、shake_yaw_deg=12、shake_pitch_deg=6。
+# attachment_mode="none"/"spring"；spring 为显式有限刚度辅助，不代表纯摩擦抓取。
+# spring 仅连接外袋膜与两侧指垫；内容物没有直接附着。
+# attachment_vertices_per_group=8、attachment_capture_distance_m=0.004、attachment_stiffness_n_m=30。
+# attachment_damping_n_s_m=0.015、attachment_max_force_n=0.5；释放时只关闭力，不改节点状态。
+# screw_assembly：sdf_resolution=128、hydroelastic_stiffness=1e11、friction=0.01、contact_capacity=40000。
+# spindle_speed_rad_s=-4、engage_s/screw_s/hold_s=0.5/5/1、minimum_turns=2、minimum_advance_m=0.006。
+# maximum_pitch_error_fraction=0.25、maximum_hold_drift_m=0.001、initial_yaw_deg=22.5。
+# hold_s/post_shake_hold_s=0、realign_before_release=false；新矩阵统一延长保持并重算下放航点。
+# soft_contact_capacity=16384；长夹块矩阵用32768，验收要求逐子步未溢出。
+# pickplace_package：mujoco_cpu=false；新矩阵设true，原生CPU解刚体，CUDA VBD解包裹。
+# rigid_soft_coupling="one_way"；可选"proxy"使用逐子步双向刚体代理反馈，须CPU MuJoCo、无附着。
+# proxy_mass_scale=1：仅调整目标代理的虚拟惯量，源机器人／包裹质量不变。
+# grip_preload_n=0：proxy模式可通过PD参考偏移加入闭合预紧，真实关节行程与总力限不变。
+# particle_tile_solve=true：Newton VBD 的弹性核实现选择，迭代数与验收门限不变。
+# gripper_close_ramp_s/gripper_open_ramp_s=0：保持原阶跃目标；非零值平滑闭合/释放且不得长于对应阶段。
+# prepare_initial_pose=false；旋转包裹抓点可设true，在before_place_robot_hook中先对齐预抓姿态。
+# pickplace_carton：mujoco_cpu=false、rigid_contact_stiffness_n_m=1e6、rigid_contact_damping_n_s_m=1000。
+# maximum_unthreaded_advance_m=0.002：拧螺丝全程位移必须符合真实导程。
 # V7 材料、质量和内部弹簧从 USD 的 parcel:runtimeParameters / physics:masses 读取。
 # self_contact_buffer=512、friction_epsilon_m_s=0.001、grasp_height_m=0.0704（V7 长夹块）。
 # closed_finger_m=0.00625、lift_height_m=0.18、place_offset_m=[0,-0.12,0]。
@@ -75,6 +122,7 @@ backend = "stub"
 # approach_s/descend_s/close_s/lift_s/transfer_s/lower_s/release_s/retract_s/rest_s
 # 默认依次为 2/1.5/1.5/2/1.5/1/1/1/1.5 秒；原装短指示例使用较慢抬升/转运。
 # align_place_to_com=false：开启后在转运开始时，按实测衣物质心平移剩余路径对齐落点。
+# release_compensation_xy_m=[0,0]：按释放后漂移修正机器人XY目标，验收目标不变；需质心对齐。
 # sorting_package：mujoco_cpu=true、mujoco_iterations=100；VBD 仍由 CUDA 执行。
 # tcp_orientation_wxyz=[0,0.70710678,0.70710678,0]：世界 X 闭合；预抓取和全程 IK 统一配置。
 # gripper_package_friction=None：可单独指定四个原生内指与包裹的有效接触摩擦系数。
@@ -125,11 +173,35 @@ backend = "stub"
 # cruise_speed_mps=0.8、approach_speed_mps=0.5、detect_max_distance_m=10、detect_confirm_steps=12。
 # standoff_xy=None 时在火点周围 standoff_m=2.1 的圆上选可达且视线通畅的拍照点。
 # 拍照后 detect_hold_s=4 原地停留，再报警 alarm_s=3；全程警示灯 alarm_flash_hz=2 爆闪，途中不停留。
+# sonic_tracking：reference_dir/model_dir 指向 assets/Halo；warmup_control_steps=50、joint_limit_margin_rad=0.001。
+# motor_smoothing.enabled=false、seated_hold.enabled=false、seated_target_filter_alpha=None（crawl / sit 打开）。
+# battery_unscrew：transit/approach/contact 速度 0.30/0.06/0.02 m/s；screwdriver.unscrew_speed_rps=3、seek 60°/s；
+# gripper.grasp_root_above_flange_m=0.266、place_clearance_m=0.005；先螺丝刀臂，回零后夹爪臂。
+# cumotion_pickplace：cumotion_robot="franka"、tool_frame="panda_hand"、hand_above_object_m=0.103、approach_clearance_m=0.12；
+# place_offset_m=[0.15,-0.15]、place_clearance_m=0；linear_phases=descend/lift/transfer/lower/retreat（任务空间直线 + 时间参数化），
+# path_deviation_m=0.005（直线偏差上限，超出即规划失败）、linear_speed_scale=0.5（关节速度/加速度/加加速度限的比例）；
+# time_scale=1.0、avoid_distractors=true、obstacle_margin_m=0.01、table_obstacle_depth_m=0.01（None 关闭桌面障碍）；start/settle/settle_before_gripper/close/open/rest=0.25/0.067/0.267/0.6/0.2/1.0 s。
+# lerobot_replay：source_dir 指向 tabletop_pickplace 输出、episodes=[]（全部）、interpolation="linear"、require_demonstrations=true。
 
 [job]
+# screw_assembly：record_rgb=true；物理诊断设 false，仍走完整 BaseJob 生命周期。
 backend = "stub"  # StubJob 只串工厂,不采集
 # pickplace_cloth 的 timeout_s=1800：包含采集与渲染的墙钟时限；运行中约每 30 秒记录进度。
 # sorting_package：timeout_s=14400，output_dir 使用独立的分拣目录，LeRobot v3 记录 16 维关节角。
 # fire_inspection：command 为空时终端输入，否则用 default_command="巡检仓库"；关键词解析，不调用 LLM。
 # output_dir="outputs/fire_inspection"、overwrite_dataset=false、fire_warmup_s=4、fire_check_camera、fire_check_min_pixels=20。
 # photo.resolution=[1280,960]、photo.min_window_fraction=0.01；recorder.fps=15。
+# halo：50 Hz 控制、图像取最近控制帧；调试 640×360/15 fps 实时 RTX，正式 1024×576/30 fps PathTracing。
+# acceptance.episode="crawl"/"crouch"/"sit"、max_penetration_m=0.005。
+# startup_app_updates=1：写起始状态前的 Kit 更新次数（复现 HALO 轨迹）；max_control_frames=None 可提前结束冒烟测试。
+# battery_disassembly：PhysX 240 Hz；正式 2048×1536/30 fps PathTracing 64 spp（另有 1K 配置），
+# recorder.capture_mode="viewport"；1K 正式配置使用 "parallel_cameras" 固定三路产品并按相机分配 GPU。
+# monotonic_render_budget_clock=false；1K 采集器在 Linux x86_64 为 GPU 预算计时加载单调时钟补丁。
+# 调试 640×480/15 fps MinimalRendering；record_rgb=true（false 只跑物理）；max_physics_steps=None。
+# tabletop_pickplace：num_episodes=2、object_jitter_xy_m=0.12、object_jitter_seed=42；PhysX 120 Hz；
+# recorder.capture_mode="viewport"（默认）；tabletop 配置用 "parallel_cameras"（仅普通 USD 相机）。
+# 每集导出 episode_XXX/lerobot_v3；failed_dir="outputs/debug/tabletop_pickplace"（正式运行未通过时整个输出移到此处）。
+# acceptance：min_lift_m=0.08、max_hold_slip_m=0.01、max_place_error_m=0.02、max_support_gap_m=0.003、max_tilt_deg=5 等。
+# tabletop_replay：同上；replay_acceptance.max_arm_rms_error_rad=0.02、max_arm_error_rad=0.05、max_object_final_error_m=0.01。
+# 桌面正式采集器 scripts/tabletop_{pickplace,replay}/collect_tabletop_*.py 默认加载进程内单调 GPU 预算时钟；
+# 需要 Linux x86_64 + cc；先在 debug 暂存，全部独立验收通过后发布。通用 CLI 不自动加载该补丁。

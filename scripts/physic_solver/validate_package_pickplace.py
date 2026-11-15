@@ -64,6 +64,14 @@ def audit(output: Path) -> dict:
         triangles, masses = stored["triangles"], stored["masses"]
         n = int(stored["garment_count"])
         checkpoints = stored["checkpoint_times_s"].tolist()
+    rows = [
+        json.loads(line) for line in (path.parent / "trajectory.jsonl").read_text().splitlines()
+    ]
+    phase_times = {}
+    for row in rows:
+        phase_times.setdefault(row["phase"], []).append(row["time_s"])
+    if not phase_times.get("transfer"):
+        raise ValueError("No measured transfer phase")
     if not np.isfinite(positions).all() or np.any(np.diff(times) <= 0):
         raise ValueError("Invalid saved particle trajectory")
     coms = np.stack(
@@ -75,7 +83,10 @@ def audit(output: Path) -> dict:
     )
     baseline = int(np.abs(times - checkpoints[1]).argmin())
     peaks = (coms[baseline:, :, 2] - coms[baseline, :, 2]).max(axis=0)
-    transfer = (times >= checkpoints[4]) & (times < checkpoints[5])
+    dt = configuration["sim_world"]["physics_dt"]
+    transfer = (times >= phase_times["transfer"][0]) & (
+        times < phase_times["transfer"][-1] + dt / 2
+    )
     minimum_transfer_lifts = (coms[transfer, :, 2] - coms[baseline, :, 2]).min(axis=0)
     transfer_lifted = bool(
         np.all(minimum_transfer_lifts >= configuration["planner"]["minimum_lift_m"])
@@ -87,12 +98,15 @@ def audit(output: Path) -> dict:
     qa.mkdir(exist_ok=True)
     selected_times = [
         0.0,
-        checkpoints[3],
-        checkpoints[4] - 0.3,
-        checkpoints[5] - 0.1,
-        checkpoints[7] - 0.1,
-        checkpoints[-1],
+        phase_times["close"][-1],
+        phase_times["lift"][-1],
+        phase_times["transfer"][-1],
+        phase_times["release"][-1],
+        times[-1],
     ]
+    if phase_times.get("shake"):
+        start, end = phase_times["shake"][0], phase_times["shake"][-1]
+        selected_times[4:4] = [start + 0.4 * (end - start), start + 0.6 * (end - start)]
     columns = 3
     panel_rows = (len(selected_times) + columns - 1) // columns
     sheet = Image.new("RGB", (columns * 320, panel_rows * 2 * 264), "#171717")
@@ -129,6 +143,7 @@ def audit(output: Path) -> dict:
             draw.text((x + 6, y + 3), f"{name}   t={frame / report['fps']:.2f}s", font=font)
     sheet.save(qa / "keyframes.jpg", quality=95)
     audit_report = dict(
+        success=bool(result["success"] and transfer_lifted and containment["passed"]),
         dataset_validated=True,
         physical_success=result["success"],
         dataset_use=report["dataset_use"],
@@ -150,6 +165,8 @@ def audit(output: Path) -> dict:
     )
     (qa / "physical_audit.json").write_text(json.dumps(audit_report, indent=2) + "\n")
     get_logger(__name__).info("Package dataset audited", **audit_report)
+    if result["success"] and not audit_report["success"]:
+        raise ValueError("Recorded package fails independent transfer or containment checks")
     return audit_report
 
 
@@ -158,7 +175,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "output",
         nargs="?",
-        default="outputs/physic_solver/mujoco_vbd_pickplace_package",
+        default="outputs/physic_solver/mujoco_vbd_package01_center_native",
         type=Path,
     )
     audit(parser.parse_args().output)

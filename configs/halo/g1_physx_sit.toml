@@ -1,0 +1,138 @@
+# HALO sit（源 sit_v1）：G1 静止 → 平滑起步走向电视前的原生双人沙发 → 转身 → 下坐前稳定 → 受双脚约束的下坐
+# → 实测座面接触触发保持 → 面向电视（世界 −X）稳定坐姿。场景不加桌子、箱子或额外椅子，沙发不移动、不缩放。
+# 物理：PhysX CPU TGS 500 Hz；GEAR-SONIC 编码器/解码器 50 Hz 闭环跟踪参考动作，原生 29 关节有限力电机，自由基座。
+# 相机：头部 D455 光学针孔相机 + 固定世界机位第三视角；1024×576 / 30 fps，PathTracing 16 spp。
+# 资产：先运行 ./app/python.sh scripts/halo/prepare_halo_assets.py（生成 assets/Halo）
+# 运行：./scripts/rsr collect run -c configs/halo/g1_physx_sit.toml
+# 校验：./app/python.sh scripts/halo/validate_halo.py outputs/halo/sit
+# 结果：outputs/halo/sit/（lerobot_v3/、diagnostics/<run>/、result.json）
+
+[logging]
+level = "INFO"
+console = true
+
+[sim_world]
+backend = "isaacsim"
+physics_engine = "physx"
+physics_dt = 0.002                  # 500 Hz；SONIC 每 20 ms 一个动作 = 10 个物理步
+rendering_dt = 0.016666666666666666
+device = "cpu"                      # PhysX 与 SONIC 都在 CPU，GPU 只渲染
+physx_solver = "TGS"
+physx_enable_ccd = true
+physx_enable_stabilization = false
+headless = true
+# 渲染：PathTracing 每张图 16 spp、最多 6 次反弹、OptiX 降噪，与 HALO 正式配置一致；
+# 两路相机交替采集时关闭光照缓存，并等实际渲染完成后再取图。
+renderer = "PathTracing"
+samples_per_pixel_per_frame = 16
+rt_subframes = 4
+pathtracing_max_bounces = 6
+pathtracing_denoiser = true
+pathtracing_temporal_denoising = false
+pathtracing_cached = false
+pathtracing_many_light_sampling = false
+synchronous_capture = true
+width = 1024
+height = 576
+dlss = false
+auto_exposure = false
+active_gpu = 0                      # 单卡渲染；本机两个 halo 进程并行时会卡住，一次只运行一个
+multi_gpu = false
+background_usd_path = "assets/Halo/Home010/home_010.usdc"
+background_offset = [0.0, 0.0, -0.015]   # HALO 对齐：地板顶面落在 z≈0
+
+[scene]
+backend = "halo_home"
+floor_proxy_center_m = [2.9, -0.7, -0.1]  # 隐形地面碰撞盒，替代被关闭的薄地板网格
+floor_proxy_size_m = [3.4, 7.8, 0.2]
+
+# 目标座位：home_010 自带的电视前双人沙发，座面约 0.377 m；网格、位置、尺度、材质都不改。
+# sofa_main 子树的接触记为座椅接触（chair），其余家具记为障碍物。
+[scene.seat]
+prim = "sofa_main/sofa_254_002"
+contact_group = "sofa_main"
+cushion_center_xyz_m = [3.7, -3.13288, 0.37678]
+expected_bounds_m = [[3.3352, -3.98787, 0.0], [4.20699, -2.27789, 0.758394]]
+
+# 第三视角：固定斜上方机位，覆盖走近、转身、落座和整张沙发。
+[scene.third_person]
+name = "rear"
+prim_path = "/World/Cameras/rear"
+width = 1024
+height = 576
+focal_length = 1.93
+horizontal_aperture = 3.896
+clipping_range = [0.02, 100.0]
+mode = "fixed"
+eye_m = [1.55, -1.4, 1.9]
+target_m = [3.0, -3.1, 0.65]
+
+[robot]
+backend = "g1_sonic"
+usd_path = "assets/Halo/Robot/g1_29_reference.usd"
+manifest_path = "assets/Halo/Robot/robot_manifest.json"
+prim_path = "/World/robots/G1"
+arm_stiffness_nm_rad = 40.0         # 肩、肘
+arm_damping_nms_rad = 3.0
+place_at_start = false             # 与 HALO 相同：引用留在资产原点，起始状态由 PhysX 一次写入
+
+# 头部相机：torso_link 前 0.12 m、上 0.43 m，光轴下俯 25°；D455 彩色镜头 1.93 mm / 3.896 mm。
+[robot.head_camera]
+name = "head"
+link = "torso_link"
+width = 1024
+height = 576
+focal_length = 1.93
+horizontal_aperture = 3.896
+
+[planner]
+backend = "sonic_tracking"
+reference_dir = "assets/Halo/reference/sit"     # sit_v1 walk_then_sit：24 s、720 帧 @30 fps
+reference_fps = 30.0
+model_dir = "assets/Halo/models/sonic"
+warmup_control_steps = 50           # 正式记录前 1 s 跟踪起始姿态，不记录
+joint_limit_margin_rad = 0.001
+seated_target_filter_alpha = 0.2    # seated 阶段、保持触发前对目标做一阶低通
+
+[planner.motor_smoothing]
+enabled = false
+
+# 实测触发的坐姿保持：骨盆 0.49–0.58 m、水平距座垫中心 < 0.12 m 且上一控制周期座面竖直冲量 > 2 N·s，
+# 之后 0.6 s 平滑过渡到实测关节姿态，并按实测躯干姿态驱动腰部扶正（朝 180°、后仰 5°）。不写基座状态。
+[planner.seated_hold]
+enabled = true
+phases = ["sit_down", "seated"]
+trigger_min_pelvis_height_m = 0.49
+trigger_max_pelvis_height_m = 0.58
+trigger_max_center_error_m = 0.12
+min_seat_vertical_impulse_ns = 2.0
+blend_s = 0.6
+upright_torso = true
+facing_yaw_deg = 180.0
+torso_recline_deg = -5.0
+torso_feedback_gain = 0.8
+
+[job]
+backend = "halo"
+task = "Walk to the existing living-room sofa, turn, and sit facing the television."
+output_dir = "outputs/halo/sit"
+overwrite_dataset = false
+timeout_s = 28800.0
+# 与 HALO 初始化顺序相同：play 后先跑 1 次 Kit 更新（机器人还在资产原点），再写入起始状态。
+# 这样物理轨迹与 HALO 记录逐位一致；设为 0 仍是有效物理，但轨迹会偏离 HALO 已标定的桌子位置。
+startup_app_updates = 1
+
+[job.recorder]
+format = "lerobot_v3"
+fps = 30                            # 每张图取最近的 50 Hz 控制帧，量化误差 ≤ 6.67 ms
+save_failed_episodes = false
+
+[job.acceptance]
+episode = "sit"
+max_penetration_m = 0.005
+
+# 坐姿验收：末 2 s 骨盆水平中心误差 ≤ 0.10 m、横向 ≤ 0.055 m，躯干竖直且面向电视（世界 −X）。
+[job.acceptance.seat]
+max_horizontal_center_error_m = 0.10
+max_lateral_center_error_m = 0.055
+facing_axis_xy = [-1.0, 0.0]

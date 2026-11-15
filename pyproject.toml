@@ -36,12 +36,17 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "B"]
 
 # 后端名 = 配置里的 backend 字符串。实现按任务分文件：
-# *_physic_solver（物理求解器验证）、*_sorting（分拣包裹）、*_fire_inspection（机器狗巡检）。
+# *_physic_solver（物理求解器验证）、*_sorting（分拣包裹）、*_fire_inspection（机器狗巡检）、
+# *_halo（G1 爬行/弯腰过桌与落座）、*_battery_disassembly（双 KR210 电池拆解）、
+# *_tabletop_pickplace（Franka 桌面抓放采集）、*_tabletop_replay（桌面轨迹回放）。
 [project.entry-points."real2sim2real.simworld.backends"]
+newton_diagnostic = "real2sim2real.simworld.simworld_physic_solver:NewtonDiagnosticWorld"
 stub = "real2sim2real.simworld.stub:StubSimWorld"
 isaacsim = "real2sim2real.simworld.isaacsim:IsaacsimWorld"
 
 [project.entry-points."real2sim2real.scene.backends"]
+pickplace_carton = "real2sim2real.scene.scene_physic_solver:CartonScene"
+screw_assembly = "real2sim2real.scene.scene_physic_solver:ScrewScene"
 stub = "real2sim2real.scene.scene_stub:StubScene"
 pickplace_cloth = "real2sim2real.scene.scene_physic_solver:PickPlaceClothScene"
 pickplace_rigid = "real2sim2real.scene.scene_physic_solver:PickPlaceRigidScene"
@@ -49,16 +54,26 @@ newton_cloth_franka = "real2sim2real.scene.scene_physic_solver:OfficialClothScen
 pickplace_package = "real2sim2real.scene.scene_physic_solver:PackageScene"
 sorting_package = "real2sim2real.scene.scene_sorting:SortingScene"
 fire_warehouse = "real2sim2real.scene.scene_fire_inspection:FireWarehouseScene"
+halo_home = "real2sim2real.scene.scene_halo:HaloHomeScene"
+battery_workcell = "real2sim2real.scene.scene_battery_disassembly:BatteryWorkcellScene"
+tabletop_home = "real2sim2real.scene.scene_tabletop_pickplace:TabletopHomeScene"
 
 [project.entry-points."real2sim2real.robot.backends"]
+franka_carton_gripper = "real2sim2real.robot.robot_physic_solver:CartonGripperRobot"
+screw_spindle = "real2sim2real.robot.robot_physic_solver:ScrewSpindleRobot"
 stub = "real2sim2real.robot.robot_stub:StubRobot"
 franka_newton = "real2sim2real.robot.robot_physic_solver:FrankaNewtonRobot"
 franka_physx = "real2sim2real.robot.robot_physic_solver:FrankaPhysxRobot"
 franka_package_pads = "real2sim2real.robot.robot_physic_solver:PackagePadRobot"
 pro_m6_newton = "real2sim2real.robot.robot_sorting:SortingRobot"
 x30_kinematic = "real2sim2real.robot.robot_fire_inspection:X30Robot"
+g1_sonic = "real2sim2real.robot.robot_halo:G1SonicRobot"
+kr210_dual = "real2sim2real.robot.robot_battery_disassembly:Kr210DualRobot"
+franka_tabletop = "real2sim2real.robot.robot_tabletop_pickplace:FrankaTabletopRobot"
 
 [project.entry-points."real2sim2real.planner.backends"]
+pickplace_carton = "real2sim2real.planner.planner_physic_solver:CartonPlanner"
+screw_assembly = "real2sim2real.planner.planner_physic_solver:ScrewPlanner"
 stub = "real2sim2real.planner.planner_stub:StubPlanner"
 pickplace_cloth = "real2sim2real.planner.planner_physic_solver:PickPlaceClothPlanner"
 newton_cloth_franka = "real2sim2real.planner.planner_physic_solver:OfficialClothPlanner"
@@ -66,12 +81,22 @@ pickplace_package = "real2sim2real.planner.planner_physic_solver:PackagePlanner"
 sorting_package = "real2sim2real.planner.planner_sorting:SortingPlanner"
 sorting_stream = "real2sim2real.planner.planner_sorting:SortingStreamPlanner"
 fire_patrol = "real2sim2real.planner.planner_fire_inspection:FirePatrolPlanner"
+sonic_tracking = "real2sim2real.planner.planner_halo:SonicTrackingPlanner"
+battery_unscrew = "real2sim2real.planner.planner_battery_disassembly:BatteryUnscrewPlanner"
+cumotion_pickplace = "real2sim2real.planner.planner_tabletop_pickplace:CumotionPickPlacePlanner"
+lerobot_replay = "real2sim2real.planner.planner_tabletop_replay:LeRobotReplayPlanner"
 
 [project.entry-points."real2sim2real.job.backends"]
+pickplace_carton = "real2sim2real.job.job_physic_solver:CartonJob"
+screw_assembly = "real2sim2real.job.job_physic_solver:ScrewJob"
 stub = "real2sim2real.job.job_stub:StubJob"
 pickplace_cloth = "real2sim2real.job.job_physic_solver:PhysicSolverJob"
 sorting_package = "real2sim2real.job.job_sorting:SortingJob"
 fire_inspection = "real2sim2real.job.job_fire_inspection:FireInspectionJob"
+halo = "real2sim2real.job.job_halo:HaloJob"
+battery_disassembly = "real2sim2real.job.job_battery_disassembly:BatteryDisassemblyJob"
+tabletop_pickplace = "real2sim2real.job.job_tabletop_pickplace:TabletopPickPlaceJob"
+tabletop_replay = "real2sim2real.job.job_tabletop_replay:TabletopReplayJob"
 
 [project.entry-points."real2sim2real.cli.commands"]
 collect = "real2sim2real.job.cli:register"

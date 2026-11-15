@@ -1,0 +1,146 @@
+# HALO crawl（源 crawl_v3）：G1 走近矮桌 → 降身 → 手膝着地爬过桌下 → 全身出桌后及时起身 → 站稳停留。
+# 物理：PhysX CPU TGS 500 Hz；GEAR-SONIC 编码器/解码器 50 Hz 闭环跟踪参考动作，原生 29 关节有限力电机，自由基座。
+# 相机：头部 D455 光学针孔相机 + 跟随实测骨盆的第三视角；1024×576 / 30 fps，PathTracing 16 spp。
+# 资产：先运行 ./app/python.sh scripts/halo/prepare_halo_assets.py（生成 assets/Halo）
+# 运行：./scripts/rsr collect run -c configs/halo/g1_physx_crawl.toml
+# 校验：./app/python.sh scripts/halo/validate_halo.py outputs/halo/crawl
+# 结果：outputs/halo/crawl/（lerobot_v3/、diagnostics/<run>/、result.json）
+
+[logging]
+level = "INFO"
+console = true
+
+[sim_world]
+backend = "isaacsim"
+physics_engine = "physx"
+physics_dt = 0.002                  # 500 Hz；SONIC 每 20 ms 一个动作 = 10 个物理步
+rendering_dt = 0.016666666666666666
+device = "cpu"                      # PhysX 与 SONIC 都在 CPU，GPU 只渲染
+physx_solver = "TGS"
+physx_enable_ccd = true
+physx_enable_stabilization = false
+headless = true
+# 渲染：PathTracing 每张图 16 spp、最多 6 次反弹、OptiX 降噪，与 HALO 正式配置一致；
+# 两路相机交替采集时关闭光照缓存，并等实际渲染完成后再取图。
+renderer = "PathTracing"
+samples_per_pixel_per_frame = 16
+rt_subframes = 4
+pathtracing_max_bounces = 6
+pathtracing_denoiser = true
+pathtracing_temporal_denoising = false
+pathtracing_cached = false
+pathtracing_many_light_sampling = false
+synchronous_capture = true
+width = 1024
+height = 576
+dlss = false
+auto_exposure = false
+active_gpu = 0                      # 单卡渲染；本机两个 halo 进程并行时会卡住，一次只运行一个
+multi_gpu = false
+background_usd_path = "assets/Halo/Home010/home_010.usdc"
+background_offset = [0.0, 0.0, -0.015]   # HALO 对齐：地板顶面落在 z≈0
+
+[scene]
+backend = "halo_home"
+floor_proxy_center_m = [2.9, -0.7, -0.1]  # 隐形地面碰撞盒，替代被关闭的薄地板网格
+floor_proxy_size_m = [3.4, 7.8, 0.2]
+
+# Blender 黑色矮桌：桌面 1.10×0.60 m、高 0.83 m，横梁下净空 0.785 m，立柱中心距 0.98 m。
+# 位置与朝向为 29 关节 G1 实测通道包络重新标定的结果（躯干居中、出桌后再起身）。
+[scene.desk]
+usd_path = "assets/Halo/Desk/crawl/crawl_desk.usdc"
+asset_prim = "/Desk"
+xy = [2.6692030301633447, -1.4013428066789777]
+yaw_deg = 86.0
+base_z_m = 0.0
+depth_m = 0.6
+width_m = 1.1
+top_height_m = 0.83
+clearance_z_m = 0.785
+column_spacing_m = 0.98
+
+# 第三视角：按 50 Hz 实测骨盆平滑跟随（位置 0.28 s、高度 0.38 s 时间常数），不跟随瞬时偏航。
+[scene.third_person]
+name = "rear"
+prim_path = "/World/Cameras/rear"
+width = 1024
+height = 576
+focal_length = 2.9
+horizontal_aperture = 3.896
+clipping_range = [0.02, 100.0]
+mode = "follow"
+eye_m = [4.5, -0.2, 1.25]           # 只是第一次跟随更新前的初始位姿
+target_m = [2.62, -0.7, 0.68]
+
+[scene.third_person.follow]
+task_yaw_deg = 90.0
+eye_offset_task_m = [2.0, -1.45, 0.52]
+look_ahead_task_m = [0.2, 0.0, 0.0]
+target_height_base_gain = 0.56
+target_height_offset_m = 0.21
+position_time_constant_s = 0.28
+height_time_constant_s = 0.38
+
+[robot]
+backend = "g1_sonic"
+usd_path = "assets/Halo/Robot/g1_29_reference.usd"
+manifest_path = "assets/Halo/Robot/robot_manifest.json"
+prim_path = "/World/robots/G1"
+arm_stiffness_nm_rad = 40.0         # 肩、肘
+arm_damping_nms_rad = 4.0           # crawl_v3 的手臂阻尼（crouch/sit 为 3.0）
+place_at_start = false             # 与 HALO 相同：引用留在资产原点，起始状态由 PhysX 一次写入
+
+# 头部相机：torso_link 前 0.12 m、上 0.43 m，光轴下俯 25°；D455 彩色镜头 1.93 mm / 3.896 mm。
+[robot.head_camera]
+name = "head"
+link = "torso_link"
+width = 1024
+height = 576
+focal_length = 1.93
+horizontal_aperture = 3.896
+
+[planner]
+backend = "sonic_tracking"
+reference_dir = "assets/Halo/reference/crawl"   # crawl_v3 crawl_29_native：20 s、600 帧 @30 fps
+reference_fps = 30.0
+model_dir = "assets/Halo/models/sonic"
+warmup_control_steps = 50           # 正式记录前 1 s 跟踪起始姿态，不记录
+joint_limit_margin_rad = 0.001
+
+# 爬行时肩、肘、腕目标做 15 ms 因果平滑，速度 ≤ 6 rad/s、加速度 ≤ 150 rad/s²；腿部直接闭环。
+[planner.motor_smoothing]
+enabled = true
+arms_only = true
+time_constant_s = 0.015
+arm_max_speed_rad_s = 6.0
+leg_max_speed_rad_s = 12.0
+max_acceleration_rad_s2 = 150.0
+
+[job]
+backend = "halo"
+task = "Crawl under the low desk on hands and knees, then promptly stand and stop after clearing it."
+output_dir = "outputs/halo/crawl"
+overwrite_dataset = false
+timeout_s = 28800.0
+# 与 HALO 初始化顺序相同：play 后先跑 1 次 Kit 更新（机器人还在资产原点），再写入起始状态。
+# 这样物理轨迹与 HALO 记录逐位一致；设为 0 仍是有效物理，但轨迹会偏离 HALO 已标定的桌子位置。
+startup_app_updates = 1
+
+[job.recorder]
+format = "lerobot_v3"
+fps = 30                            # 每张图取最近的 50 Hz 控制帧，量化误差 ≤ 6.67 ms
+save_failed_episodes = false
+
+[job.acceptance]
+episode = "crawl"
+under_desk_phase = "crawl_under_table"
+head_collider = "torso_link/collisions/head_link/mesh"
+max_penetration_m = 0.005
+
+# 躯干中心（骨盆与颈部点中点）在桌坐标系的横向偏差门限。
+[job.acceptance.centering]
+neck_body = "torso_link"
+neck_local_point_m = [0.004, 0.0, 0.315]
+maximum_median_bias_m = 0.015
+maximum_p95_offset_m = 0.04
+maximum_instant_offset_m = 0.05
