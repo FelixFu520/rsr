@@ -17,6 +17,8 @@ Job 都是独立注册的后端，复用同一个 `IsaacsimWorld` 和固定的 J
 | 机器狗巡检 | X30 一句话指令巡航仓库，发现火点、拍照、警示灯报警 | PhysX（CPU）+ Flow 火焰 | [configs/fire_inspection/](configs/fire_inspection/) | [docs/fire_inspection.md](docs/fire_inspection.md) |
 | HALO G1 | 原生 29 关节 G1 在客厅爬过矮桌（crawl）、弯腰走过颈高桌（crouch）、走到沙发坐下（sit），GEAR-SONIC 闭环 | PhysX（CPU，500 Hz） | [configs/halo/](configs/halo/) | [docs/halo.md](docs/halo.md) |
 | 电池拆解 | 双 KR210：电动螺丝刀靠批头接触拧出四颗螺丝放入篮子，平行夹爪摩擦夹起 12 kg 盖板放到托盘 | PhysX（CPU，240 Hz） | [configs/battery_disassembly/](configs/battery_disassembly/) | [docs/battery_disassembly.md](docs/battery_disassembly.md) |
+| 桌面抓放 | 家居桌面上 Franka 用 Isaac Sim 自带 cuMotion 规划，摩擦抓起木块放到放置位（苹果为障碍），2 集位置抖动 | PhysX（CPU，120 Hz） | [configs/tabletop_pickplace/](configs/tabletop_pickplace/) | [docs/tabletop_pickplace.md](docs/tabletop_pickplace.md) |
+| 桌面轨迹回放 | 在源布局下回放桌面抓放数据集的 LeRobot `action`，不调规划器，复验抓放与轨迹一致性 | PhysX（CPU，120 Hz） | [configs/tabletop_replay/](configs/tabletop_replay/) | [docs/tabletop_replay.md](docs/tabletop_replay.md) |
 
 采集命令（仓库根目录）：
 
@@ -33,6 +35,11 @@ Job 都是独立注册的后端，复用同一个 `IsaacsimWorld` 和固定的 J
 ./app/python.sh scripts/halo/validate_halo.py outputs/halo/crawl
 # 电池拆解：c1003b1a1 场景，三路 1024×768/30fps、双卡 PathTracing（另保留 2K 配置）
 ./app/python.sh scripts/battery_disassembly/collect_battery_disassembly.py  # 自动采集、独立校验、发布
+# 桌面抓放：2 集，两路 1024×768/30fps PathTracing；之后用其数据集做轨迹回放
+./app/python.sh scripts/tabletop_pickplace/collect_tabletop_pickplace.py  # 采集、独立校验、发布
+./app/python.sh scripts/tabletop_pickplace/validate_tabletop_pickplace.py outputs/tabletop_pickplace/franka_physx_home000
+./app/python.sh scripts/tabletop_replay/collect_tabletop_replay.py
+./app/python.sh scripts/tabletop_replay/validate_tabletop_replay.py outputs/tabletop_replay/franka_physx_home000
 ```
 
 ### 输出约定
@@ -44,6 +51,8 @@ Job 都是独立注册的后端，复用同一个 `IsaacsimWorld` 和固定的 J
 | `outputs/fire_inspection/` | 巡检 `lerobot_v3/`、照片、地图、`validation.json` |
 | `outputs/halo/<crawl,crouch,sit>/` | HALO G1 `lerobot_v3/`（含 `meta/physics` 50 Hz 控制记录）、`validation.json` |
 | `outputs/battery_disassembly/<config>/` | 电池拆解 `lerobot_v3/`（含 `meta/physics` 状态记录与接触）、`validation.json` |
+| `outputs/tabletop_pickplace/<config>/` | 桌面抓放每集 `episode_XXX/lerobot_v3/`（含 `meta/physics` 120 Hz 状态记录与接触）、`validation.json` |
+| `outputs/tabletop_replay/<config>/` | 桌面轨迹回放每集 `episode_XXX/lerobot_v3/`、与源数据的一致性、`validation.json` |
 | `outputs/debug/<task>/` | 调试与未通过验收的结果（`diagnostic` 数据、局部物理、对照实验） |
 
 `outputs/` 下非 debug 目录里的 `lerobot_v3/` 都是通过全部物理验收的 `demonstration` 数据；
@@ -69,7 +78,8 @@ uv lock                                    # 更新 uv.lock（不创建运行时
 资产（`assets/`）与输出（`outputs/`）不进 git；各任务的资产准备脚本见对应文档。
 每个任务的资产自成一个目录，可单独打包：`assets/PhysicSolver/`（物理求解器验证）、
 `assets/SortingPackage/`（分拣包裹）、`assets/FireInspection/`（机器狗巡检）、`assets/Halo/`（HALO G1）、
-`assets/BatteryDisassembly/`（电池拆解）；
+`assets/BatteryDisassembly/`（电池拆解）、`assets/TabletopPickplace/`（桌面抓放）、
+`assets/TabletopReplay/`（桌面轨迹回放）；
 其余资产在 `assets/bak/`。
 本项目同时运行的 Isaac Sim 实例不超过两个。
 
@@ -82,32 +92,37 @@ rsr/
 ├── real2sim2real/
 │   ├── core/                   # 配置、Registry、CLI、日志、default_settings.toml
 │   ├── simworld/               # base.py、stub.py、isaacsim.py（统一世界）
-│   ├── scene/                  # base.py、scene_stub.py、scene_{physic_solver,sorting,fire_inspection,halo,battery_disassembly}.py
-│   ├── robot/                  # base.py、robot_stub.py、robot_{physic_solver,sorting,fire_inspection,halo,battery_disassembly}.py
-│   ├── planner/                # base.py、planner_stub.py、planner_{physic_solver,sorting,fire_inspection,halo,battery_disassembly}.py
-│   ├── job/                    # base.py、cli.py、job_stub.py、job_{physic_solver,sorting,fire_inspection,halo,battery_disassembly}.py
+│   ├── scene/                  # base.py、scene_stub.py、scene_{physic_solver,sorting,fire_inspection,halo,battery_disassembly,tabletop_*}.py
+│   ├── robot/                  # base.py、robot_stub.py、robot_{physic_solver,sorting,fire_inspection,halo,battery_disassembly,tabletop_*}.py
+│   ├── planner/                # base.py、planner_stub.py、planner_{physic_solver,sorting,fire_inspection,halo,battery_disassembly,tabletop_*}.py
+│   ├── job/                    # base.py、cli.py、job_stub.py、job_{physic_solver,sorting,fire_inspection,halo,battery_disassembly,tabletop_*}.py
 │   └── utils/                  # 共用：asset_utils、cameras、kit_process、lerobot_v3
-│                               # 任务：{physic_solver,sorting,fire_inspection,halo,battery_disassembly}_utils.py
+│                               # 任务：{physic_solver,sorting,fire_inspection,halo,battery_disassembly,tabletop_*}_utils.py
 ├── configs/
 │   ├── physic_solver/          # 原求解器组合、包裹矩阵、纸箱与螺纹装配
 │   ├── sorting/                # mujoco_vbd_sorting.toml + render_profile.json
 │   ├── fire_inspection/        # 正式 + 调试
 │   ├── halo/                   # crawl / crouch / sit 正式 + 调试
-│   └── battery_disassembly/    # c1003b1a1 正式 2K / 1K + 调试 640
+│   ├── battery_disassembly/    # c1003b1a1 正式 2K / 1K + 调试 640
+│   ├── tabletop_pickplace/     # home000 正式 1K + 调试 640
+│   └── tabletop_replay/        # home000 正式 1K + 调试 640
 ├── scripts/
 │   ├── rsr                     # 用 Isaac python.sh 启动 CLI
 │   ├── physic_solver/          # 资产准备、批量采集、包裹物理检查与校验、世界模式冒烟测试
 │   ├── sorting/                # 一体流程、物理求解、回放渲染、独立验收、同步检查、预览
 │   ├── fire_inspection/        # 资产准备、独立验收
 │   ├── halo/                   # 资产准备、独立验收
-│   └── battery_disassembly/    # 资产准备、独立验收
+│   ├── battery_disassembly/    # 资产准备、独立验收
+│   ├── tabletop_pickplace/     # 资产准备、独立验收
+│   └── tabletop_replay/        # 资产准备、独立验收
 ├── tests/                      # 无 Kit 单元测试
 └── docs/                       # 每个任务一份文档
 ```
 
 每个任务在 scene / robot / planner / job / utils 中各只有一个文件，文件名后缀即任务名。
 分拣任务复用物理求解器任务的类（`SortingScene ← PackageScene`、`SortingRuntime ← PackageRuntime`、
-`SortingJob ← PhysicSolverJob`）。
+`SortingJob ← PhysicSolverJob`）；桌面轨迹回放复用桌面抓放的场景与机器人后端，
+`TabletopReplayJob ← TabletopPickPlaceJob`。
 
 ## 架构
 

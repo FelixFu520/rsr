@@ -44,6 +44,8 @@
 | 机器狗巡检 | `fire_inspection` | `assets/FireInspection/` | `fire_warehouse` / `x30_kinematic` / `fire_patrol` / `fire_inspection` |
 | HALO G1（爬行／弯腰过桌、落座） | `halo` | `assets/Halo/` | `halo_home` / `g1_sonic` / `sonic_tracking` / `halo` |
 | 双 KR210 电池拆解（拧螺丝、揭盖） | `battery_disassembly` | `assets/BatteryDisassembly/` | `battery_workcell` / `kr210_dual` / `battery_unscrew` / `battery_disassembly` |
+| Franka 桌面抓放（cuMotion） | `tabletop_pickplace` | `assets/TabletopPickplace/` | `tabletop_home` / `franka_tabletop` / `cumotion_pickplace` / `tabletop_pickplace` |
+| 桌面轨迹回放 | `tabletop_replay` | `assets/TabletopReplay/` | `tabletop_home` / `franka_tabletop`（复用抓放后端）/ `lerobot_replay` / `tabletop_replay` |
 
 - 同一任务的多个后端、运行时和辅助类放在同一文件中，按依赖顺序分节（节首注释说明内容）。
 - 新任务依次新增 `{domain}/{domain}_<task>.py`、`utils/<task>_utils.py`、`configs/<task>/`、
@@ -172,6 +174,9 @@ Entry point 组名以 `pyproject.toml` / `core/registry.py` 为准，勿自创�
   - 机器狗巡检：`./scripts/rsr collect run -c configs/fire_inspection/x30_physx_warehouse.toml`
   - HALO G1：`./scripts/rsr collect run -c configs/halo/g1_physx_{crawl,crouch,sit}.toml`（调试用 `*_debug.toml`）
   - 电池拆解：`./scripts/rsr collect run -c configs/battery_disassembly/kr210_physx_c1003b1a1.toml`（调试用 `*_debug.toml`）
+  - 桌面抓放：`./scripts/rsr collect run -c configs/tabletop_pickplace/franka_physx_home000.toml`（调试用 `*_debug.toml`）
+  - 桌面轨迹回放：`./scripts/rsr collect run -c configs/tabletop_replay/franka_physx_home000.toml`（先有抓放数据集）
+  - 桌面任务正式采集优先使用 `./app/python.sh scripts/tabletop_pickplace/collect_tabletop_pickplace.py` 或 `./app/python.sh scripts/tabletop_replay/collect_tabletop_replay.py`（单调 GPU 预算时钟、独立验收后发布）；调试沿用上述 CLI。
 
 调试子命令时使用 `./app/python.sh -m real2sim2real.core.cli`（`main()` 内加载插件）。
 

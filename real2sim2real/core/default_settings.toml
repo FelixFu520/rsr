@@ -51,6 +51,9 @@ backend = "stub"
 # third_person：width/height、focal_length=1.93、horizontal_aperture=3.896（mm），mode="fixed"/"follow"。
 # battery_workcell：Battery.usd 引用到 /World/scene，battery_yaw_deg=-90；资产碰撞体换成盒体代理（cover/case/basket），
 # 螺丝 M10×1.5 螺纹 24 mm（mimic 螺旋约束，thread_damping_nms_rad=0.002），盖板 cover.mass_kg=12，pallet 托盘。
+# tabletop_home：table.position_m=[0.45,-3.75,0.415]、collision_approximation="none"（桌面网格静态三角网格碰撞）；
+# objects[].offset_m 为桌面系 XY、clearance_m=0.001、mass_kg=None（不覆盖资产）；min_object_gap_m=0.02、table_edge_margin_m=0.05。
+# cameras 为 SensorCameraConfig：usd_path+optical_prim 引用传感器 USD（仅视口采集），hide_housing=true；为空时同 CameraConfig 建针孔相机。
 
 [robot]
 backend = "stub"
@@ -74,6 +77,8 @@ backend = "stub"
 # place_at_start=false：与 HALO 相同，引用留在资产原点，起始状态由 PhysX 写入。
 # kr210_dual：两台 KR210 L150（保留资产驱动与碰撞）；screwdriver 浮动弹簧 1500 N/m、预伸 8 mm、主轴 2 N·m，
 # 批头磁力 magnet_max_force_n=3、magnet_range_m=0.006；gripper 双指 stroke_m=0.06、max_force_n=200、胶垫 μ=1.0/0.9。
+# franka_tabletop：base_offset_m=[-0.35,0]（桌面系）、keep_base_on_table=true；保留 USD 驱动；
+# initial_joint_positions=USD 驱动目标（0.012,-0.570,0,-2.810,0,3.037,0.741,0.04,0.04）、gripper_open_m=0.04、gripper_closed_m=0。
 
 [planner]
 backend = "stub"
@@ -172,6 +177,11 @@ backend = "stub"
 # motor_smoothing.enabled=false、seated_hold.enabled=false、seated_target_filter_alpha=None（crawl / sit 打开）。
 # battery_unscrew：transit/approach/contact 速度 0.30/0.06/0.02 m/s；screwdriver.unscrew_speed_rps=3、seek 60°/s；
 # gripper.grasp_root_above_flange_m=0.266、place_clearance_m=0.005；先螺丝刀臂，回零后夹爪臂。
+# cumotion_pickplace：cumotion_robot="franka"、tool_frame="panda_hand"、hand_above_object_m=0.103、approach_clearance_m=0.12；
+# place_offset_m=[0.15,-0.15]、place_clearance_m=0；linear_phases=descend/lift/transfer/lower/retreat（任务空间直线 + 时间参数化），
+# path_deviation_m=0.005（直线偏差上限，超出即规划失败）、linear_speed_scale=0.5（关节速度/加速度/加加速度限的比例）；
+# time_scale=1.0、avoid_distractors=true、obstacle_margin_m=0.01、table_obstacle_depth_m=0.01（None 关闭桌面障碍）；start/settle/settle_before_gripper/close/open/rest=0.25/0.067/0.267/0.6/0.2/1.0 s。
+# lerobot_replay：source_dir 指向 tabletop_pickplace 输出、episodes=[]（全部）、interpolation="linear"、require_demonstrations=true。
 
 [job]
 # screw_assembly：record_rgb=true；物理诊断设 false，仍走完整 BaseJob 生命周期。
@@ -188,3 +198,10 @@ backend = "stub"  # StubJob 只串工厂,不采集
 # recorder.capture_mode="viewport"；1K 正式配置使用 "parallel_cameras" 固定三路产品并按相机分配 GPU。
 # monotonic_render_budget_clock=false；1K 采集器在 Linux x86_64 为 GPU 预算计时加载单调时钟补丁。
 # 调试 640×480/15 fps MinimalRendering；record_rgb=true（false 只跑物理）；max_physics_steps=None。
+# tabletop_pickplace：num_episodes=2、object_jitter_xy_m=0.12、object_jitter_seed=42；PhysX 120 Hz；
+# recorder.capture_mode="viewport"（默认）；tabletop 配置用 "parallel_cameras"（仅普通 USD 相机）。
+# 每集导出 episode_XXX/lerobot_v3；failed_dir="outputs/debug/tabletop_pickplace"（正式运行未通过时整个输出移到此处）。
+# acceptance：min_lift_m=0.08、max_hold_slip_m=0.01、max_place_error_m=0.02、max_support_gap_m=0.003、max_tilt_deg=5 等。
+# tabletop_replay：同上；replay_acceptance.max_arm_rms_error_rad=0.02、max_arm_error_rad=0.05、max_object_final_error_m=0.01。
+# 桌面正式采集器 scripts/tabletop_{pickplace,replay}/collect_tabletop_*.py 默认加载进程内单调 GPU 预算时钟；
+# 需要 Linux x86_64 + cc；先在 debug 暂存，全部独立验收通过后发布。通用 CLI 不自动加载该补丁。
