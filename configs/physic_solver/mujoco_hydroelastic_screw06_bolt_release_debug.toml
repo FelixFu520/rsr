@@ -1,0 +1,49 @@
+inherit = "mujoco_hydroelastic_screw06_bolt_release.toml"
+[sim_world]
+renderer = "MinimalRendering"
+minimal_shading_mode = 2
+width = 640
+height = 480
+rt_subframes = 1
+synchronous_capture = false
+[scene]
+dynaconf_merge = false
+backend = "dual_screw_assembly"
+object_kind = "screw"
+bolt_mesh_path = "assets/PhysicSolver/Screw/M20/bolt.obj"
+bolt_texture_path = "assets/PhysicSolver/Screw/M20/Textures/bolt_rotation.png"
+nut_mesh_path = "assets/PhysicSolver/Screw/M20/nut.obj"
+thread_pitch_m = 0.0025
+initial_engagement_m = 0.004
+target_xy = [ 0.1, 0.0,]
+fill_light_intensity = 200
+key_light_intensity = 700
+[[scene.cameras]]
+name = "overview"
+prim_path = "/World/scene/overview_cam"
+pose_relative_to = "/World/scene"
+resolution = [640, 480]
+clipping_range = [0.001, 10.0]
+focal_length = 26.0
+[scene.cameras.pose]
+position = [1.25, -1.65, 1.75]
+orientation_wxyz = [0.771305051386122, 0.5695300146456919, 0.16876999091657818, 0.22856239911662637]
+
+[[scene.cameras]]
+name = "threads"
+prim_path = "/World/scene/threads_cam"
+pose_relative_to = "/World/scene"
+resolution = [640, 480]
+clipping_range = [0.001, 10.0]
+focal_length = 30.0
+[scene.cameras.pose]
+position = [0.1, -0.5, 1.08]
+orientation_wxyz = [0.7793785289174703, 0.6265533565965791, -0.0, -0.0]
+
+
+[job]
+output_dir = "outputs/debug/physic_solver/mujoco_hydroelastic_screw06_bolt_release_debug"
+[job.recorder]
+fps = 15
+width = 640
+height = 480

@@ -234,3 +234,7 @@ UR5e 电批拧螺栓 demo（真实 M20 螺纹接触，1K/30 fps）：[观看双�
 
 末段松开螺母夹爪：[观看松爪版 demo](outputs/physic_solver/mujoco_hydroelastic_screw05_dual_release/demo.mp4)。
 夹指打开后螺母仍挂在螺栓上，尖端露出7.25 mm；[参数、验收与浮动下沉说明](docs/physic_solver.md#106-拧完后松开螺母夹爪)。
+
+新增松开电批、保持螺母夹紧的版本：[观看预览](outputs/debug/physic_solver/mujoco_hydroelastic_screw06_bolt_release_debug/demo.mp4)。
+拧入约12.45圈后，电批夹套主动张开并抬起，螺栓仍穿出约19 mm；
+[配置、运行与验收](docs/physic_solver.md#107-拧完后松开螺栓端螺母继续夹持)。

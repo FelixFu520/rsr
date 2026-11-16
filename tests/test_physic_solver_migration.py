@@ -67,6 +67,8 @@ def test_flat_configs_match_output_names_and_640_capture_contract():
         "mujoco_hydroelastic_screw04_dual_through_debug",
         "mujoco_hydroelastic_screw05_dual_release",
         "mujoco_hydroelastic_screw05_dual_release_debug",
+        "mujoco_hydroelastic_screw06_bolt_release",
+        "mujoco_hydroelastic_screw06_bolt_release_debug",
     }
     assert {p.stem for p in paths} == set(PHYSIC_SOLVER_CASE_NAMES.values()) | arm_cases
     assert len(PHYSIC_SOLVER_PACKAGE_CASES) == 18
@@ -603,6 +605,7 @@ def test_screw_arm_measures_absolute_bolt_advance_instead_of_float_joint():
         ("screw03_dual_ur5e", 12.8, 0.0),
         ("screw04_dual_through", 19.8, 0.005),
         ("screw05_dual_release", 21.8, 0.005),
+        ("screw06_bolt_release", 29.6, 0.005),
     ],
 )
 def test_dual_screw_routes_two_arms_without_loading_kit(
@@ -619,7 +622,10 @@ def test_dual_screw_routes_two_arms_without_loading_kit(
         assert job.sim_world.app is None
         assert job.scene.config.backend == "dual_screw_assembly"
         assert job.robot.config.backend == job.planner.config.backend == "dual_ur5e_screwdriver"
-        assert len(job.robot.recording_joint_names) == len(job.planner.action_names) == 16
+        expected_dofs = 18 if job.robot.config.releasable_socket else 16
+        assert (
+            len(job.robot.recording_joint_names) == len(job.planner.action_names) == expected_dofs
+        )
         assert job.planner.expected_duration_s == pytest.approx(duration)
         assert job.planner.config.minimum_tip_protrusion_m == tip
         assert job.scene.config.nut_support_height_m == 0.10
@@ -715,6 +721,51 @@ def test_dual_screw_requires_lift_bilateral_contact_and_low_slip():
     rows[-1]["joint_q"][14] = 0.028
     rows[-1]["jaw_p_contacts"] = 1
     assert not evaluate_dual_screw_rows(rows, cfg, 0.0025)["checks"]["nut_clear_of_both_fingers"]
+    cfg["release_target"] = "bolt"
+    for row in rows:
+        row.update(
+            jaw_p_contacts=3,
+            jaw_n_contacts=3,
+            nut_relative_holder_m=[0, 0, 0.028],
+            socket_contacts=0 if row["phase"] == "released" else 3,
+            socket_clearance_m=0.06 if row["phase"] == "released" else -0.019,
+            socket_jaw_q_m=[0.025, 0.025],
+        )
+    assert evaluate_dual_screw_rows(rows, cfg, 0.0025)["success"]
+    rows[-1]["socket_contacts"] = 1
+    assert not evaluate_dual_screw_rows(rows, cfg, 0.0025)["checks"]["socket_actually_detached"]
+    rows[-1]["socket_contacts"] = 0
+    rows[-1]["socket_jaw_q_m"] = [0.001, 0.025]
+    assert not evaluate_dual_screw_rows(rows, cfg, 0.0025)["checks"]["bolt_clamp_actually_open"]
+    rows[-1]["socket_jaw_q_m"] = [0.025, 0.025]
+    rows[-1]["jaw_n_contacts"] = 0
+    assert not evaluate_dual_screw_rows(rows, cfg, 0.0025)["checks"]["bilateral_finger_contact"]
+
+
+def test_contact_socket_clearance_uses_all_corners_and_bolt_frame():
+    from real2sim2real.utils.battery_disassembly_utils import quat_to_matrix
+    from real2sim2real.utils.physic_solver_utils import screw_socket_clearance, screw_socket_parts
+
+    assert len(screw_socket_parts(0.0148)) == 16
+    # Opposite movable halves must retain a real seam, including the retaining shoulders.
+    for part in screw_socket_parts(0.0145):
+        if part["side"] == "fixed":
+            continue
+        extent = (
+            abs(np.cos(part["yaw"])) * part["half"][0] + abs(np.sin(part["yaw"])) * part["half"][1]
+        )
+        assert abs(part["center"][0]) - extent > 0
+    bolt = np.array([0, 0, 0, 0, 0, 0, 1.0])
+    assert screw_socket_clearance(bolt, bolt, 0.0148) == pytest.approx(-0.0235)
+    tool = bolt.copy()
+    tool[2] = 0.1
+    assert screw_socket_clearance(tool, bolt, 0.0148) == pytest.approx(0.0765)
+    angle = 0.7
+    q = np.array([np.sin(angle / 2), 0, 0, np.cos(angle / 2)])
+    bolt = np.r_[[1, 2, 3], q]
+    tool = bolt.copy()
+    tool[:3] += quat_to_matrix(q[[3, 0, 1, 2]]) @ [0, 0, 0.1]
+    assert screw_socket_clearance(tool, bolt, 0.0148) == pytest.approx(0.0765)
 
 
 def test_screw_release_requires_observation_duration():

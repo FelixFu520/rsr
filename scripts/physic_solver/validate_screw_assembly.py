@@ -34,6 +34,8 @@ def _validate_arm_dataset(output: Path, config: dict, rows: list[dict]) -> dict:
     np.testing.assert_allclose(times, np.arange(frames) / fps, atol=2e-6)
     indices = np.rint(times / config["sim_world"]["physics_dt"]).astype(int)
     state_size = 16 if config["robot"]["backend"] == "dual_ur5e_screwdriver" else 8
+    if config["robot"].get("releasable_socket", False):
+        state_size += 2
     for key, field in (("observation.state", "joint_q"), ("action", "action")):
         values = np.array(table[key].to_pylist(), np.float32)
         expected = np.array([rows[i][field] for i in indices], np.float32)
@@ -243,6 +245,7 @@ def validate_dual(output: Path, config: dict) -> dict:
         dual_screw_phase,
         evaluate_dual_screw_rows,
         read_obj_triangles,
+        screw_socket_clearance,
     )
 
     result = json.loads((output / "result.json").read_text())
@@ -274,6 +277,24 @@ def validate_dual(output: Path, config: dict) -> dict:
         np.testing.assert_allclose(
             row["nut_relative_holder_m"], hr.T @ (nut[:3] - holder[:3]), atol=1e-9
         )
+        if settings.get("release_target", "nut") == "bolt":
+            tool = np.array(row["tool_pose_local_xyzw"])
+            opening = np.array(row["socket_jaw_q_m"])
+            np.testing.assert_allclose(opening, np.array(row["joint_q"])[[9, 8]], atol=1e-9)
+            tool_r = quat_to_matrix(tool[[6, 3, 4, 5]])
+            for side, distance in zip(("p", "n"), (opening[0], -opening[1]), strict=True):
+                body = np.array(row["socket_body_poses_local_xyzw"][side])
+                np.testing.assert_allclose(
+                    body[:3], tool[:3] + tool_r @ np.array([distance, 0, 0]), atol=1e-6
+                )
+                np.testing.assert_allclose(quat_to_matrix(body[[6, 3, 4, 5]]), tool_r, atol=1e-6)
+            np.testing.assert_allclose(
+                row["socket_clearance_m"],
+                screw_socket_clearance(
+                    tool, bolt, config["robot"]["socket_inner_radius_m"], opening
+                ),
+                atol=1e-9,
+            )
     np.testing.assert_allclose(
         [r["spindle_angle_rad"] for r in rows], np.unwrap(raw_yaw), atol=1e-8
     )
@@ -296,12 +317,20 @@ def validate_dual(output: Path, config: dict) -> dict:
             atol=1e-9,
         )
     if settings.get("release_s", 0) > 0:
-        for key in (
-            "minimum_released_finger_m",
+        metrics = [
             "released_thread_contact_fraction",
             "minimum_released_tip_protrusion_m",
-        ):
+        ]
+        if settings.get("release_target", "nut") == "bolt":
+            metrics += ["minimum_socket_clearance_m", "maximum_bolt_settling_m"]
+        else:
+            metrics += ["minimum_released_finger_m"]
+        for key in metrics:
             np.testing.assert_allclose(report[key], result[key], atol=1e-9)
+    if settings.get("release_target", "nut") == "bolt":
+        report["checks"]["bolt_not_attached_to_tool"] = (
+            result["bolt_attachments_used"] is False and config["robot"]["releasable_socket"]
+        )
     report["checks"].update(
         job_physical_checks_passed=bool(result["success"]),
         nut_not_attached=result["nut_attachments_used"] is False,
@@ -335,8 +364,12 @@ def validate_dual(output: Path, config: dict) -> dict:
             times[-1] - 0.1,
         ]
         if settings.get("release_s", 0) > 0:
-            release_start = start_screw + settings["screw_s"] + settings["hold_s"]
-            captures[-1] = release_start - 0.1
+            hold_end = start_screw + settings["screw_s"] + settings["hold_s"]
+            captures[-1] = hold_end - 0.1
+            opening_s = settings.get("socket_open_s", 0)
+            if opening_s > 0:
+                captures.append(hold_end + opening_s * 0.5)
+            release_start = hold_end + opening_s
             captures.extend([release_start + settings["release_s"] * 0.5, times[-1] - 0.1])
         sheet = Image.new("RGB", (320 * len(captures), 264 * len(data["videos"])), "#161616")
         draw = ImageDraw.Draw(sheet)

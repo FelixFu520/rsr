@@ -171,7 +171,8 @@ Entry point 组名以 `pyproject.toml` / `core/registry.py` 为准，勿自创�
 - 任务入口：
   - 物理求解器验证：`./app/python.sh scripts/physic_solver/recapture_physic_solver.py`；UR5e 电批 demo：`./app/python.sh scripts/physic_solver/collect_screw_arm_demo.py`
     （双臂穿出螺母及旋转涂装：加 `--config configs/physic_solver/mujoco_hydroelastic_screw04_dual_through.toml`；
-    末段松爪版本使用 `configs/physic_solver/mujoco_hydroelastic_screw05_dual_release.toml`）。
+    松螺母版本使用 `configs/physic_solver/mujoco_hydroelastic_screw05_dual_release.toml`；
+    松螺栓端并保持螺母使用 `configs/physic_solver/mujoco_hydroelastic_screw06_bolt_release.toml`）。
   - 分拣包裹：`./scripts/sorting/run_sorting_showcase.sh outputs/sorting`（内部调用 `rsr collect render-sorting`）
   - 机器狗巡检：`./scripts/rsr collect run -c configs/fire_inspection/x30_physx_warehouse.toml`
   - HALO G1：`./scripts/rsr collect run -c configs/halo/g1_physx_{crawl,crouch,sit}.toml`（调试用 `*_debug.toml`）

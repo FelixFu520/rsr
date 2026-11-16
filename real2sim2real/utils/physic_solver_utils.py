@@ -855,6 +855,78 @@ def screw_arm_chain(stage: Any, root: str, tool_length_m: float) -> tuple[Any, n
 # ================================================================================================
 
 
+def screw_socket_parts(inner_radius_m: float) -> list[dict]:
+    """Describe split-collet walls, shoulders and mount for collision and visible geometry."""
+    parts = []
+    for i in range(6):
+        yaw = i * np.pi / 3
+        radius = inner_radius_m + 0.003
+        parts.append(
+            dict(
+                name=f"wall_{i}",
+                half=[0.003, 0.007, 0.009],
+                center=[radius * np.cos(yaw), radius * np.sin(yaw), -0.010],
+                yaw=float(yaw),
+                side="p" if np.cos(yaw) > 0 else "n",
+            )
+        )
+        # A split retaining shoulder supports the cylindrical head without touching the shaft.
+        parts.append(
+            dict(
+                name=f"shoulder_{i}",
+                half=[0.004, 0.004, 0.0015],
+                center=[0.0145 * np.cos(yaw), 0.0145 * np.sin(yaw), -0.022],
+                yaw=float(yaw),
+                side="p" if np.cos(yaw) > 0 else "n",
+            )
+        )
+    parts.append(
+        dict(
+            name="backplate",
+            half=[0.022, 0.022, 0.002],
+            center=[0, 0, 0.002],
+            yaw=0.0,
+            side="fixed",
+        )
+    )
+    parts.append(
+        dict(name="rail", half=[0.05, 0.006, 0.003], center=[0, 0, 0.007], yaw=0.0, side="fixed")
+    )
+    for side, sign in (("p", 1), ("n", -1)):
+        parts.append(
+            dict(
+                name=f"tab_{side}",
+                half=[0.003, 0.004, 0.008],
+                center=[sign * 0.023, 0, 0.004],
+                yaw=0.0,
+                side=side,
+            )
+        )
+    return parts
+
+
+def screw_socket_clearance(
+    tool: np.ndarray, bolt: np.ndarray, inner_radius_m: float, openings_m: Any = (0.0, 0.0)
+) -> float:
+    """Measure the lowest socket corner above the bolt head plane in the bolt's frame."""
+    from real2sim2real.utils.battery_disassembly_utils import quat_to_matrix
+
+    tr, br = [quat_to_matrix(p[[6, 3, 4, 5]]) for p in (tool, bolt)]
+    corners = []
+    signs = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)])
+    for part in screw_socket_parts(inner_radius_m):
+        c, s = np.cos(part["yaw"]), np.sin(part["yaw"])
+        r = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+        center = np.array(part["center"], dtype=float)
+        if part["side"] == "p":
+            center[0] += openings_m[0]
+        elif part["side"] == "n":
+            center[0] -= openings_m[1]
+        corners.extend(signs * part["half"] @ r.T + center)
+    relative = (np.array(corners) @ tr.T + tool[:3] - bolt[:3]) @ br
+    return float(relative[:, 2].min())
+
+
 def dual_screw_phases(config: Any) -> list[tuple[str, float]]:
     """List active phases, preserving the original sequence when release is disabled."""
     phases = []
@@ -863,6 +935,13 @@ def dual_screw_phases(config: Any) -> list[tuple[str, float]]:
             config[f"{name}_s"] if isinstance(config, dict) else getattr(config, f"{name}_s")
         )
         phases.append((name, duration))
+    opening = float(
+        config.get("socket_open_s", 0)
+        if isinstance(config, dict)
+        else getattr(config, "socket_open_s", 0)
+    )
+    if opening > 0:
+        phases.append(("open_bolt", opening))
     for name, key in (("release", "release_s"), ("released", "post_release_s")):
         duration = float(
             config.get(key, 0) if isinstance(config, dict) else getattr(config, key, 0)
@@ -898,9 +977,9 @@ def evaluate_dual_screw_rows(rows: list[dict], config: dict, pitch_m: float) -> 
     """Measure threading relative to the free nut and actual contact-only pickup stability."""
     screw = [i for i, row in enumerate(rows) if row["phase"] == "screw"]
     hold = [i for i, row in enumerate(rows) if row["phase"] == "hold"]
-    carried = [
-        i for i, row in enumerate(rows) if row["phase"] not in {"clamp", "release", "released"}
-    ]
+    bolt_release = config.get("release_target", "nut") == "bolt"
+    excluded = {"clamp"} if bolt_release else {"clamp", "release", "released"}
+    carried = [i for i, row in enumerate(rows) if row["phase"] not in excluded]
     if not rows or not screw or not hold or not carried:
         return {"success": False, "checks": {"sequence_completed": False}}
     q = np.array([[r["axial_displacement_m"], r["spindle_angle_rad"]] for r in rows])
@@ -957,25 +1036,47 @@ def evaluate_dual_screw_rows(rows: list[dict], config: dict, pitch_m: float) -> 
         released = [r for r in rows if r["phase"] == "released"]
         checks["released_observation_recorded"] = bool(released)
         if released:
-            opening = float(np.min([r["joint_q"][14:16] for r in released]))
             fraction = float(np.mean([r["contacts"] > 0 for r in released]))
             tip = float(np.min([r["tip_protrusion_m"] for r in released]))
-            checks.update(
-                gripper_actually_reopened=opening >= config["minimum_released_finger_m"],
-                nut_clear_of_both_fingers=all(
-                    r["jaw_p_contacts"] == r["jaw_n_contacts"] == 0 for r in released
-                ),
-                nut_retained_on_bolt_after_release=fraction >= 0.95 and tip > 0,
-            )
+            if bolt_release:
+                clearance = float(np.min([r["socket_clearance_m"] for r in released]))
+                settling = float(
+                    np.max(np.abs([r["axial_displacement_m"] - end[0] for r in released]))
+                )
+                checks.update(
+                    socket_contact_during_drive=np.mean(
+                        [rows[i]["socket_contacts"] > 0 for i in screw]
+                    )
+                    >= 0.95,
+                    socket_actually_detached=all(r["socket_contacts"] == 0 for r in released),
+                    driver_retracted_clear=clearance >= config["minimum_tool_clearance_m"],
+                    bolt_stays_in_held_nut=fraction >= 0.95 and tip > 0,
+                    bolt_settling_after_release=settling <= config["maximum_bolt_settling_m"],
+                    bolt_clamp_actually_open=np.min([r["socket_jaw_q_m"] for r in released])
+                    >= config["minimum_socket_opening_m"],
+                )
+                protrusion.update(
+                    minimum_socket_clearance_m=clearance, maximum_bolt_settling_m=settling
+                )
+            else:
+                opening = float(np.min([r["joint_q"][14:16] for r in released]))
+                checks.update(
+                    gripper_actually_reopened=opening >= config["minimum_released_finger_m"],
+                    nut_clear_of_both_fingers=all(
+                        r["jaw_p_contacts"] == r["jaw_n_contacts"] == 0 for r in released
+                    ),
+                    nut_retained_on_bolt_after_release=fraction >= 0.95 and tip > 0,
+                )
+                protrusion["minimum_released_finger_m"] = opening
             if config.get("minimum_tip_protrusion_m", 0) > 0:
                 checks["bolt_still_protrudes_after_release"] = (
                     tip >= config["minimum_tip_protrusion_m"]
                 )
             protrusion.update(
-                minimum_released_finger_m=opening,
                 released_thread_contact_fraction=fraction,
                 minimum_released_tip_protrusion_m=tip,
             )
+    checks = {name: bool(value) for name, value in checks.items()}
     return dict(
         success=all(checks.values()),
         checks=checks,

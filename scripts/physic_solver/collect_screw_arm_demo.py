@@ -43,6 +43,13 @@ def _demo_filter(configuration: dict) -> str:
         release="7  OPEN NUT GRIPPER",
         released="8  NUT RELEASED - DRIVER STOPPED",
     )
+    if configuration["planner"].get("release_target", "nut") == "bolt":
+        labels.update(
+            clamp="1  CLAMP NUT AND BOLT",
+            open_bolt="7  OPEN BOLT CLAMP - KEEP NUT GRIPPED",
+            release="8  WITHDRAW DRIVER - KEEP NUT GRIPPED",
+            released="9  BOLT RELEASED - NUT STILL HELD",
+        )
     for name, duration in dual_screw_phases(configuration["planner"]):
         label = labels[name]
         if name == "hold" and configuration["planner"].get("minimum_tip_protrusion_m", 0) > 0:

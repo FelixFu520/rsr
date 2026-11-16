@@ -728,6 +728,19 @@ class Ur5eScrewdriverRobot(ScrewSpindleRobot):
         spin.CreateBody0Rel().SetTargets(["/UR5e/driver_float"])
         spin.CreateBody1Rel().SetTargets(["/UR5e/driver_spindle"])
         spin.CreateAxisAttr("Z")
+        if getattr(self.config, "releasable_socket", False):
+            for side in ("p", "n"):
+                path = f"/UR5e/driver_socket_{side}"
+                body(path, 0.025)
+                joint = UsdPhysics.PrismaticJoint.Define(stage, f"/UR5e/joints/socket_{side}")
+                joint.CreateBody0Rel().SetTargets(["/UR5e/driver_spindle"])
+                joint.CreateBody1Rel().SetTargets([path])
+                joint.CreateAxisAttr("X")
+                if side == "n":
+                    joint.CreateLocalRot0Attr(Gf.Quatf(0.0, 0.0, 0.0, 1.0))
+                    joint.CreateLocalRot1Attr(Gf.Quatf(0.0, 0.0, 0.0, 1.0))
+                joint.CreateLowerLimitAttr(0.0)
+                joint.CreateUpperLimitAttr(0.03)
         parsed = builder.add_usd(
             stage,
             root_path="/UR5e",
@@ -746,6 +759,19 @@ class Ur5eScrewdriverRobot(ScrewSpindleRobot):
         ]
         if self.arm_dofs + self.screw_dofs != list(range(8)):
             raise ValueError(f"Unexpected UR5e joint layout: {self.arm_dofs}, {self.screw_dofs}")
+        if getattr(self.config, "releasable_socket", False):
+            self.socket_dofs = [
+                builder.joint_q_start[joint_map[f"/UR5e/joints/socket_{s}"]] for s in ("p", "n")
+            ]
+            if self.socket_dofs != [9, 8]:
+                raise ValueError(f"Unexpected socket joint order: {self.socket_dofs}")
+            for dof in self.socket_dofs:
+                builder.joint_q[dof] = self.config.socket_initial_open_m
+                builder.joint_target_q[dof] = self.config.socket_initial_open_m
+                builder.joint_target_ke[dof] = self.config.socket_stiffness_n_m
+                builder.joint_target_kd[dof] = self.config.socket_damping_ns_m
+                builder.joint_effort_limit[dof] = self.config.socket_max_force_n
+                builder.joint_target_mode[dof] = 3
         for dof, value in zip(self.arm_dofs, goal, strict=True):
             builder.joint_q[dof] = float(value)
             builder.joint_target_q[dof] = float(value)
@@ -766,13 +792,48 @@ class Ur5eScrewdriverRobot(ScrewSpindleRobot):
         spindle = parsed["path_body_map"]["/UR5e/driver_spindle"]
         self.spindle_body = spindle
         self.wrist_body = parsed["path_body_map"]["/UR5e/wrist_3_link"]
-        builder.add_shape_mesh(
-            spindle,
-            mesh=bolt_mesh,
-            xform=wp.transform((0, 0, 0), wp.quat(1, 0, 0, 0)),
-            cfg=shape_config,
-            label="socket_clamped_bolt",
-        )
+        if getattr(self.config, "releasable_socket", False):
+            from dataclasses import replace
+
+            from real2sim2real.utils.physic_solver_utils import screw_socket_parts
+
+            cfg = replace(
+                shape_config,
+                kh=self.config.socket_hydroelastic_stiffness,
+                mu=self.config.socket_friction,
+                density=0,
+                sdf_max_resolution=64,
+            )
+            self.socket_shapes = []
+            self.socket_bodies = {
+                side: parsed["path_body_map"][f"/UR5e/driver_socket_{side}"] for side in ("p", "n")
+            }
+            for part in screw_socket_parts(self.config.socket_inner_radius_m):
+                parent = (
+                    spindle
+                    if part["side"] == "fixed"
+                    else parsed["path_body_map"][f"/UR5e/driver_socket_{part['side']}"]
+                )
+                shape = builder.add_shape_box(
+                    parent,
+                    hx=part["half"][0],
+                    hy=part["half"][1],
+                    hz=part["half"][2],
+                    xform=wp.transform(
+                        part["center"], wp.quat_from_axis_angle(wp.vec3(0, 0, 1), part["yaw"])
+                    ),
+                    cfg=cfg,
+                    label=f"contact_socket_{part['name']}",
+                )
+                self.socket_shapes.append(shape)
+        else:
+            builder.add_shape_mesh(
+                spindle,
+                mesh=bolt_mesh,
+                xform=wp.transform((0, 0, 0), wp.quat(1, 0, 0, 0)),
+                cfg=shape_config,
+                label="socket_clamped_bolt",
+            )
         self._author_driver_visuals()
         for path, index in parsed["path_body_map"].items():
             leaf = path.rsplit("/", 1)[-1]
@@ -808,6 +869,8 @@ class Ur5eScrewdriverRobot(ScrewSpindleRobot):
             ("driver_spindle", "shaft", 0.008, 0.055, 0.030, (0.65, 0.68, 0.72)),
             ("driver_spindle", "hex_socket", 0.019, 0.025, 0.006, (0.23, 0.26, 0.30)),
         ):
+            if name == "hex_socket" and getattr(self.config, "releasable_socket", False):
+                continue
             mesh = UsdGeom.Cylinder.Define(stage, f"{self.config.prim_path}/{parent}/{name}")
             mesh.CreateRadiusAttr(radius)
             mesh.CreateHeightAttr(height)
@@ -819,6 +882,21 @@ class Ur5eScrewdriverRobot(ScrewSpindleRobot):
         stripe.AddTranslateOp().Set(Gf.Vec3d(0.0185, 0, 0.006))
         stripe.AddScaleOp().Set(Gf.Vec3f(0.0015, 0.004, 0.0125))
         stripe.CreateDisplayColorAttr([Gf.Vec3f(1.0, 0.25, 0.02)])
+        if getattr(self.config, "releasable_socket", False):
+            from real2sim2real.utils.physic_solver_utils import screw_socket_parts
+
+            for part in screw_socket_parts(self.config.socket_inner_radius_m):
+                parent = (
+                    "driver_spindle" if part["side"] == "fixed" else f"driver_socket_{part['side']}"
+                )
+                UsdGeom.Xform.Define(stage, f"{self.config.prim_path}/{parent}")
+                mesh = UsdGeom.Cube.Define(
+                    stage, f"{self.config.prim_path}/{parent}/socket_{part['name']}"
+                )
+                mesh.AddTranslateOp().Set(Gf.Vec3d(*part["center"]))
+                mesh.AddRotateZOp().Set(float(np.rad2deg(part["yaw"])))
+                mesh.AddScaleOp().Set(Gf.Vec3f(*part["half"]))
+                mesh.CreateDisplayColorAttr([Gf.Vec3f(0.18, 0.35, 0.42)])
 
     def screw_control(
         self, measured: np.ndarray, speed: float, hold: bool
@@ -895,6 +973,15 @@ class DualUr5eScrewRobotConfig(Ur5eScrewdriverRobotConfig):
     finger_max_force_n: PositiveFloat = 100.0
     finger_friction: PositiveFloat = 1.5
     finger_hydroelastic_stiffness: PositiveFloat = 1e10
+    releasable_socket: bool = False
+    socket_inner_radius_m: float = Field(default=0.0145, gt=0.014, lt=0.015)
+    socket_friction: PositiveFloat = 0.8
+    socket_hydroelastic_stiffness: PositiveFloat = 1e10
+    socket_open_m: float = Field(default=0.025, ge=0.02, le=0.028)
+    socket_initial_open_m: float = Field(default=0.001, ge=0.001, le=0.005)
+    socket_stiffness_n_m: PositiveFloat = 30000.0
+    socket_damping_ns_m: PositiveFloat = 150.0
+    socket_max_force_n: PositiveFloat = 100.0
 
 
 class DualUr5eScrewRobot(Ur5eScrewdriverRobot):
@@ -902,18 +989,28 @@ class DualUr5eScrewRobot(Ur5eScrewdriverRobot):
 
     config_cls = DualUr5eScrewRobotConfig
     recording_robot_type = "dual_ur5e_nut_grip_and_electric_driver"
-    recording_joint_names = [
-        f"driver_{name}" for name in Ur5eScrewdriverRobot.recording_joint_names
-    ] + [
-        "holder_shoulder_pan_rad",
-        "holder_shoulder_lift_rad",
-        "holder_elbow_rad",
-        "holder_wrist_1_rad",
-        "holder_wrist_2_rad",
-        "holder_wrist_3_rad",
-        "holder_finger_n_m",
-        "holder_finger_p_m",
-    ]
+
+    @property
+    def recording_joint_names(self) -> list[str]:
+        """Include the physical bolt-clamp axes only for the detachable tool variant."""
+        driver = [f"driver_{name}" for name in Ur5eScrewdriverRobot.recording_joint_names]
+        if self.config.releasable_socket:
+            driver += ["driver_socket_n_m", "driver_socket_p_m"]
+        return (
+            driver
+            + [
+                f"holder_{name}_rad"
+                for name in (
+                    "shoulder_pan",
+                    "shoulder_lift",
+                    "elbow",
+                    "wrist_1",
+                    "wrist_2",
+                    "wrist_3",
+                )
+            ]
+            + ["holder_finger_n_m", "holder_finger_p_m"]
+        )
 
     def init_robot(self, sim_world: Any) -> None:
         """Reference a second complete arm; generate only its visible gripper geometry."""
@@ -1001,7 +1098,11 @@ class DualUr5eScrewRobot(Ur5eScrewdriverRobot):
         self.finger_dofs = [
             builder.joint_q_start[joint_map[f"/NutArm/joints/finger_{side}"]] for side in ("p", "n")
         ]
-        if self.holder_dofs != list(range(8, 14)) or self.finger_dofs != [15, 14]:
+        offset = 10 if self.config.releasable_socket else 8
+        if self.holder_dofs != list(range(offset, offset + 6)) or self.finger_dofs != [
+            offset + 7,
+            offset + 6,
+        ]:
             raise ValueError(f"Unexpected nut arm DOFs: {self.holder_dofs}, {self.finger_dofs}")
         for dof, value in zip(self.holder_dofs, self.holder_goal, strict=True):
             builder.joint_q[dof] = float(value)
@@ -1118,6 +1219,7 @@ class DualUr5eScrewRobot(Ur5eScrewdriverRobot):
         speed: float,
         hold: bool,
         measured: np.ndarray,
+        socket_opening_m: float = 0.0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Command both arms and the two fingers, without prescribing nut or thread motion."""
         self.arm_goal = self._solve_pose(
@@ -1130,9 +1232,11 @@ class DualUr5eScrewRobot(Ur5eScrewdriverRobot):
             self.holder_rotation,
             self.holder_goal,
         )
-        q, qd = np.zeros(16), np.zeros(16)
+        q, qd = np.zeros(len(self.recording_joint_names)), np.zeros(len(self.recording_joint_names))
         q[self.arm_dofs], q[self.holder_dofs] = self.arm_goal, self.holder_goal
         q[self.finger_dofs] = finger_m
+        if self.config.releasable_socket:
+            q[self.socket_dofs] = socket_opening_m
         q[self.screw_dofs[0]] = (
             measured[self.screw_dofs[0]]
             if hold

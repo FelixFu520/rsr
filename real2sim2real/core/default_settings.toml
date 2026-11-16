@@ -108,6 +108,8 @@ backend = "stub"
 # attachment_vertices_per_group=8、attachment_capture_distance_m=0.004、attachment_stiffness_n_m=30。
 # attachment_damping_n_s_m=0.015、attachment_max_force_n=0.5；释放时只关闭力，不改节点状态。
 # screw_assembly：sdf_resolution=128、hydroelastic_stiffness=1e11、friction=0.01、contact_capacity=40000。
+# deterministic_contacts=false 保留原接触分配；新自由螺栓夹套版本设true，稳定排序与SDF累加。
+# mujoco_iterations=30 保留旧求解上限；自由螺栓夹套配置设100、sdf_resolution=256。
 # ur5e_screwdriver 继承 screw_assembly 的螺纹字段；maximum_arm_tracking_error_rad=0.02。
 # dual_ur5e_screwdriver：clamp_s=0.8、lift_s=1.5、align_s=1.5、nut_lift_m=0.16；
 # driver_clearance_m=0.07、minimum_nut_lift_m=0.13、maximum_nut_grasp_slip_m=0.003；
@@ -116,6 +118,13 @@ backend = "stub"
 # release_s/post_release_s=0 禁用末段松爪；两者同时为正时在保持后张开并观察自由螺母。
 # minimum_released_finger_m=0.025，检查实测张开坐标和双侧零接触；夹持门限检查至松爪之前。
 # latch_axial_hold=false 保留旧行为；true 在首次停转时锁存轴向驱动位置目标，保持为有限刚度驱动。
+# release_target="nut" 保留松螺母夹爪行为；"bolt" 主动张开螺栓夹套，再退离，螺母保持夹持。
+# socket_open_s=0（bolt 模式需为正）、minimum_socket_opening_m=0.02。
+# driver_retract_m=0.12、minimum_tool_clearance_m=0.04、maximum_bolt_settling_m=0.001。
+# dual_ur5e_screwdriver 机器人 releasable_socket=false 保留原刚性工具；true 使用独立自由螺栓。
+# socket_inner_radius_m=0.0145、socket_friction=0.8、socket_hydroelastic_stiffness=1e10。
+# socket_open_m=0.025、socket_stiffness_n_m=30000、socket_damping_ns_m=150、socket_max_force_n=100。
+# socket_initial_open_m=0.001，初始留间隙并在clamp阶段平滑闭合，避免初始过盈冲击。
 # spindle_speed_rad_s=-4、engage_s/screw_s/hold_s=0.5/5/1、minimum_turns=2、minimum_advance_m=0.006。
 # maximum_pitch_error_fraction=0.25、maximum_hold_drift_m=0.001、initial_yaw_deg=22.5。
 # hold_s/post_shake_hold_s=0、realign_before_release=false；新矩阵统一延长保持并重算下放航点。

@@ -2451,6 +2451,8 @@ class ScrewPlannerConfig(BaseConfig):
     hydroelastic_stiffness: FiniteFloat = Field(default=1e11, gt=0)
     friction: FiniteFloat = Field(default=0.01, ge=0)
     contact_capacity: int = Field(default=40000, ge=2000)
+    deterministic_contacts: bool = False
+    mujoco_iterations: int = Field(default=30, ge=10, le=1000)
     spindle_speed_rad_s: FiniteFloat = -4.0
     engage_s: FiniteFloat = Field(default=0.5, ge=0)
     screw_s: FiniteFloat = Field(default=5.0, gt=0)
@@ -2516,13 +2518,14 @@ class ScrewRuntime:
             cone="elliptic",
             njmax=config.contact_capacity,
             nconmax=config.contact_capacity,
-            iterations=30,
+            iterations=config.mujoco_iterations,
             **self._solver_options(),
         )
         self.pipeline = newton.CollisionPipeline(
             self.model,
             rigid_contact_max=config.contact_capacity,
             reduce_contacts=True,
+            deterministic=config.deterministic_contacts,
             sdf_hydroelastic_config=HydroelasticSDF.Config(mc_edge_clamp_min=0, buffer_mult_iso=2),
         )
         self.contacts = self.pipeline.contacts()
@@ -3158,11 +3161,21 @@ class DualScrewPlannerConfig(ScrewArmPlannerConfig):
     post_release_s: FiniteFloat = Field(default=0.0, ge=0)
     minimum_released_finger_m: PositiveFloat = 0.025
     latch_axial_hold: bool = False
+    release_target: Literal["nut", "bolt"] = "nut"
+    driver_retract_m: float = Field(default=0.12, ge=0.08, le=0.16)
+    minimum_tool_clearance_m: PositiveFloat = 0.04
+    maximum_bolt_settling_m: PositiveFloat = 0.001
+    socket_open_s: FiniteFloat = Field(default=0.0, ge=0)
+    minimum_socket_opening_m: PositiveFloat = 0.02
 
     @model_validator(mode="after")
     def _release_has_observation(self) -> DualScrewPlannerConfig:
         if (self.release_s > 0) != (self.post_release_s > 0):
             raise ValueError("release_s and post_release_s must both be zero or both positive")
+        if self.release_target == "bolt" and self.release_s <= 0:
+            raise ValueError("Bolt release requires positive release and observation durations")
+        if (self.release_target == "bolt") != (self.socket_open_s > 0):
+            raise ValueError("Only bolt release requires a positive socket_open_s phase")
         return self
 
 
@@ -3177,6 +3190,8 @@ class DualScrewRuntime(ScrewRuntime):
 
         wp, newton = self.wp, self.newton
         scene, config, robot = self.scene, self.config, self.robot
+        if robot.config.releasable_socket != (config.release_target == "bolt"):
+            raise ValueError("releasable_socket must match release_target='bolt'")
         robot.pickup_z_m = scene.nut_grasp_z_m
         # Stop with the bolt tip 1mm above the raised nut; spring feed establishes contact.
         self.driver_work_z_m = (
@@ -3229,6 +3244,26 @@ class DualScrewRuntime(ScrewRuntime):
             cfg=replace(support_cfg),
             label="visible_nut_pickup_support",
         )
+        if config.release_target == "bolt":
+            bolt = builder.add_link(
+                xform=wp.transform(
+                    (0, 0, self.driver_hover_z_m),
+                    wp.quat_from_axis_angle(
+                        wp.vec3(0, 0, 1), float(np.deg2rad(config.initial_yaw_deg))
+                    ),
+                ),
+                label="free_bolt_contact_socket_only",
+            )
+            robot.bolt_shape = builder.add_shape_mesh(
+                bolt,
+                mesh=meshes["bolt"],
+                cfg=shape_cfg,
+                xform=wp.transform((0, 0, 0), wp.quat(1, 0, 0, 0)),
+                label="free_m20_bolt",
+            )
+            joint = builder.add_joint_free(bolt, label="unconstrained_bolt_6dof")
+            builder.add_articulation([joint], label="bolt_without_tool_attachment")
+            return bolt
         return spindle
 
     def publish(self) -> None:
@@ -3249,6 +3284,7 @@ class DualScrewRuntime(ScrewRuntime):
         preload: bool,
         speed: float,
         hold: bool,
+        socket_opening_m: float = 0.0,
     ) -> None:
         q, qd, action = self.robot.dual_control(
             holder_z_m=holder_z_m,
@@ -3258,6 +3294,7 @@ class DualScrewRuntime(ScrewRuntime):
             speed=speed,
             hold=hold,
             measured=self.state_0.joint_q.numpy(),
+            socket_opening_m=socket_opening_m,
         )
         if self.config.latch_axial_hold:
             if not hold:
@@ -3269,16 +3306,17 @@ class DualScrewRuntime(ScrewRuntime):
                 q[dof] = action[dof] = self.axial_hold_target_m
         full_q = np.zeros(self.model.joint_dof_count)
         full_qd = np.zeros_like(full_q)
-        full_q[:16], full_qd[:16] = q, qd
+        full_q[: len(q)], full_qd[: len(qd)] = q, qd
         self.control.joint_target_q.assign(full_q)
         self.control.joint_target_qd.assign(full_qd)
         self.target_q = action
 
     def recording_coordinates(self) -> tuple[np.ndarray, np.ndarray]:
-        """Record the 16 robot DOFs; the independent nut pose is in the physical log."""
-        return self.state_0.joint_q.numpy()[:16].astype(float), self.target_q.copy()
+        """Record robot DOFs; independent fastener poses are in the physical log."""
+        count = len(self.robot.recording_joint_names)
+        return self.state_0.joint_q.numpy()[:count].astype(float), self.target_q.copy()
 
-    def contact_counts(self) -> dict[str, int]:
+    def contact_counts(self) -> dict[str, Any]:
         """Count actual nut/thread, bilateral jaw and support contacts separately."""
         count = int(self.contacts.rigid_contact_count.numpy()[0])
         a = self.contacts.rigid_contact_shape0.numpy()[:count]
@@ -3291,26 +3329,58 @@ class DualScrewRuntime(ScrewRuntime):
                 )
             )
 
-        return dict(
+        counts = dict(
             thread=pairs(self.robot.bolt_shape),
             jaw_p=pairs(self.robot.finger_shapes[0]),
             jaw_n=pairs(self.robot.finger_shapes[1]),
             support=pairs(self.support_shape) + pairs(self.table_shape),
         )
+        if self.config.release_target == "bolt":
+            shapes = np.array([self.robot.bolt_shape])
+            socket = np.array(self.robot.socket_shapes)
+            counts["socket"] = int(
+                np.count_nonzero(
+                    (np.isin(a, shapes) & np.isin(b, socket))
+                    | (np.isin(b, shapes) & np.isin(a, socket))
+                )
+            )
+            other = (np.isin(a, socket) & ~np.isin(b, shapes)) | (
+                np.isin(b, socket) & ~np.isin(a, shapes)
+            )
+            counts["socket_other_pairs"] = [
+                [self.model.shape_label[int(i)], self.model.shape_label[int(j)]]
+                for i, j in sorted(set(zip(a[other].tolist(), b[other].tolist(), strict=True)))
+            ]
+        return counts
 
 
 class DualScrewPlanner(ScrewArmPlanner):
     """Close, lift and hold with arm two before driving the bolt with arm one."""
 
     config_cls = DualScrewPlannerConfig
-    action_names = (
-        [f"driver_{name}" for name in ScrewArmPlanner.action_names]
-        + [
-            f"holder_{name}_target_rad"
-            for name in ("shoulder_pan", "shoulder_lift", "elbow", "wrist_1", "wrist_2", "wrist_3")
-        ]
-        + ["holder_finger_n_target_m", "holder_finger_p_target_m"]
-    )
+
+    @property
+    def action_names(self) -> list[str]:
+        """Match robot coordinate order, including the optional physical split collet."""
+        driver = [f"driver_{name}" for name in ScrewArmPlanner.action_names]
+        if self.config.release_target == "bolt":
+            driver += ["driver_socket_n_target_m", "driver_socket_p_target_m"]
+        return (
+            driver
+            + [
+                f"holder_{name}_target_rad"
+                for name in (
+                    "shoulder_pan",
+                    "shoulder_lift",
+                    "elbow",
+                    "wrist_1",
+                    "wrist_2",
+                    "wrist_3",
+                )
+            ]
+            + ["holder_finger_n_target_m", "holder_finger_p_target_m"]
+        )
+
     recording_task = (
         "Grip and lift a free M20 nut with the second UR5e, then screw the bolt into it."
     )
@@ -3344,25 +3414,39 @@ class DualScrewPlanner(ScrewArmPlanner):
         driver_z = self.runtime.driver_hover_z_m
         if phase == "align":
             driver_z -= self.config.driver_clearance_m * smooth
-        elif phase in {"engage", "screw", "hold", "release", "released"}:
+        elif phase in {"engage", "screw", "hold", "open_bolt", "release", "released"}:
             driver_z = self.runtime.driver_work_z_m
+        if self.config.release_target == "bolt":
+            if phase == "release":
+                driver_z += self.config.driver_retract_m * smooth
+            elif phase == "released":
+                driver_z += self.config.driver_retract_m
         finger = robot.config.finger_closed_m
         if phase == "clamp":
             finger = robot.config.finger_open_m + smooth * (
                 robot.config.finger_closed_m - robot.config.finger_open_m
             )
-        elif phase == "release":
+        elif phase == "release" and self.config.release_target == "nut":
             finger += smooth * (robot.config.finger_open_m - robot.config.finger_closed_m)
-        elif phase == "released":
+        elif phase == "released" and self.config.release_target == "nut":
             finger = robot.config.finger_open_m
         done = self.elapsed + 1e-10 >= self.expected_duration_s
+        socket_opening = 0.0
+        if self.config.release_target == "bolt":
+            if phase == "clamp":
+                socket_opening = robot.config.socket_initial_open_m * (1 - smooth)
+            elif phase == "open_bolt":
+                socket_opening = robot.config.socket_open_m * smooth
+            elif phase in {"release", "released"}:
+                socket_opening = robot.config.socket_open_m
         self.runtime.command_dual(
             holder_z_m=holder_z,
             driver_z_m=driver_z,
             finger_m=finger,
-            preload=phase in {"engage", "screw", "hold", "release", "released"},
+            preload=phase in {"engage", "screw", "hold", "open_bolt", "release", "released"},
             speed=self.config.spindle_speed_rad_s if phase == "screw" else 0.0,
-            hold=phase in {"hold", "release", "released"},
+            hold=phase in {"hold", "open_bolt", "release", "released"},
+            socket_opening_m=socket_opening,
         )
         poses = self.runtime.state_0.body_q.numpy().astype(float)
         nut, bolt = poses[self.runtime.nut_body], poses[self.runtime.spindle_body]
@@ -3412,6 +3496,22 @@ class DualScrewPlanner(ScrewArmPlanner):
                 nut_yaw_rad=float(np.arctan2(nut_r[1, 0], nut_r[0, 0])),
             )
         )
+        if self.config.release_target == "bolt":
+            from real2sim2real.utils.physic_solver_utils import screw_socket_clearance
+
+            tool = poses[robot.spindle_body]
+            self.rows[-1].update(
+                tool_pose_local_xyzw=tool.tolist(),
+                socket_contacts=contacts["socket"],
+                socket_other_pairs=contacts["socket_other_pairs"],
+                socket_jaw_q_m=q[robot.socket_dofs].tolist(),
+                socket_body_poses_local_xyzw={
+                    side: poses[body].tolist() for side, body in robot.socket_bodies.items()
+                },
+                socket_clearance_m=screw_socket_clearance(
+                    tool, bolt, robot.config.socket_inner_radius_m, q[robot.socket_dofs]
+                ),
+            )
         self.state.update(done=done, phase="done" if done else phase)
         if not done:
             self.elapsed += robot.sim_world.config.physics_dt
@@ -3433,6 +3533,11 @@ class DualScrewPlanner(ScrewArmPlanner):
             newton_version=self.runtime.newton.__version__,
             asset_layers=self.robot.state.get("asset_layers", []),
         )
+        if self.config.release_target == "bolt":
+            result.update(
+                tool_clamp="contact-only driven split collet; bolt has six unconstrained DOFs",
+                bolt_attachments_used=False,
+            )
         result["checks"]["no_contact_overflow"] = (
             self.runtime.maximum_contacts < self.config.contact_capacity
         )
