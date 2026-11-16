@@ -1,6 +1,6 @@
 # 桌面抓放：Franka 在 home_000 家居桌面上用 cuMotion 抓起木块放到放置位
 
-更新日期：2026-11-14（运行时间记 UTC）。
+更新日期：2026-11-16（环境核对；运行时间记 UTC）。
 
 ## 1. 任务介绍
 
@@ -199,13 +199,47 @@ assets/TabletopPickplace/
 依赖检查唯一未解析项是 Franka USD 未选中的 `Robotiq_2F_85` 夹爪变体引用的 `Robotiq_2F_85_edit.usd`（源项目也没有），
 本任务用 `Default` 夹爪变体，不受影响。对源资产无改动。
 
-## 6. 依赖与安装
+## 6. 运行环境、依赖与安装
 
-无额外 pip 依赖。cuMotion 来自 Isaac Sim 扩展 `isaacsim.robot_motion.cumotion`，由配置 `sim_world.extensions` 启用；
-验证：Kit 进程里 `import cumotion` 成功、`load_cumotion_supported_robot("franka")` 返回 7 个关节。
-正式采集器默认复用电池任务的 Linux x86_64 单调预算时钟补丁，需要 `cc`（Debian/Ubuntu：`build-essential`）；
-源码、共享库及 SHA-256 留在运行目录的 `capture/native/`。补丁只替换 GPU 库的计时，不改物理时钟或画质。
+运行时为 Linux x86_64、Isaac Sim `6.2.0-rc.14+release.52805.02189a84.gl`、SDK Python 3.12.14。
+所有命令在仓库根通过 `./app/python.sh` / `./scripts/rsr` 运行，本机 `app -> /home/fufa/isaacsim`；
+不建 `.venv`。公共依赖为 NumPy、Pillow、PyArrow、Dynaconf、Pydantic、PyYAML、structlog、Typer，
+开发工具为 pytest / Ruff；版本、用途、位置见 [公共依赖表](../README.md#公共依赖与安装位置)。
+本任务不新增任务专用 pip 包。
+
+| 组件 | 用途与本机版本 | 实际安装位置 |
+|---|---|---|
+| PhysX / USD / Kit | CPU TGS 120 Hz、Franka 关节驱动与接触 | `/home/fufa/isaacsim/` 的物理、USD 与 Kit 扩展 |
+| cuMotion | Franka 轨迹优化、碰撞与路径约束；扩展版本 1.5.0 | `/home/fufa/isaacsim/exts/isaacsim.robot_motion.cumotion/`；Python/原生库在其 `pip_prebundle/` |
+| cuMotion 机器人描述 | Franka 的 URDF / XRDF 与规划配置 | 同一扩展的 `pip_prebundle/isaacsim/robot_motion/cumotion/robot_configurations/franka/` |
+| RTX | PathTracing、材质和双相机采集，物理在 CPU 时仍需 GPU | Isaac SDK 渲染插件 |
+| ffmpeg / ffprobe | H.264 编码、关键帧与独立校验，6.1.1 | `/usr/bin/ffmpeg`、`/usr/bin/ffprobe` |
+| `cc` 与系统运行库 | 正式采集器默认的预算时钟补丁，GCC 13.3.0 | `/usr/bin/cc`；Ubuntu/Debian 的 `build-essential` |
+
+配置 `sim_world.extensions=["isaacsim.robot_motion.cumotion"]` 由世界初始化阶段启用，
+本机已验证裸 Python `import cumotion`，历史 Kit 内检查 `load_cumotion_supported_robot("franka")` 返回 7 个关节。
+Python 模块能导入不等于规划/场景碰撞已验收，后者仍走任务调试流程。
+当前实现使用内置 cuMotion；环境里虽然另有 `nvidia-curobo`，它不参与本任务，无需按旧源项目说明安装它。
+同样不需要 Newton、MuJoCo、Kimodo 或官方 `lerobot` 包。Franka、桌面和背景等运行资产只读
+`assets/TabletopPickplace/`；源项目目录仅用于第 5 节的资产准备，不是运行时依赖。
+
+当前正式配置选择 `active_gpu=0`、`multi_gpu=false`；已有正式结果中的双 GPU 设置是历史采集快照。
+正式采集器默认复用电池任务的 Linux x86_64 单调预算时钟补丁，需 C 编译器及 libc/libdl/pthread，
+依赖当前 libstdc++ ABI。源码、共享库及 SHA-256 先留在运行目录 `capture/native/`，发布后为 `native/`；
+补丁仅在 Kit 子进程预加载，不需全局修改系统库。
 其它平台可显式传 `--system-budget-clock` 使用系统计时；该模式不能规避本机已出现的回跳问题。
+
+安装与无 Kit 自检：
+
+```bash
+./app/python.sh -m pip install -e '.[dev]'
+./app/python.sh -c 'import numpy, PIL, pyarrow, cumotion; print(cumotion.__file__)'
+command -v ffmpeg ffprobe cc
+./app/python.sh .agents/skills/rsr-task-development/scripts/check_task_configs.py configs/tabletop_pickplace
+```
+
+2026-11-16 公共包、cuMotion 原生模块导入、扩展目录和配置核对通过，本轮不重新采集。
+视频工具缺失时安装系统 `ffmpeg` 包，并检查 `libx264`；启用预算补丁而缺 `cc` 时安装 `build-essential`。
 
 ## 7. 配置
 

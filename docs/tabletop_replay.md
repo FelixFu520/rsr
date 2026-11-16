@@ -1,6 +1,57 @@
 # 桌面轨迹回放：在 PhysX 中回放桌面抓放数据集的动作并复验
 
-更新日期：2026-11-14（运行时间记 UTC）。
+更新日期：2026-11-16（环境核对；运行时间记 UTC）。
+
+## 运行环境与依赖
+
+唯一运行时为 Isaac SDK 的 `./app/python.sh`，所有命令在仓库根执行，`./scripts/rsr` 是对应 CLI 包装。
+本机 Linux x86_64、Isaac Sim `6.2.0-rc.14+release.52805.02189a84.gl`、Python 3.12.14，
+`app -> /home/fufa/isaacsim`，不创建 `.venv`。公共依赖为 NumPy、Pillow、PyArrow、Dynaconf、Pydantic、PyYAML、
+structlog、Typer，开发依赖 pytest / Ruff；版本、用途、安装路径见 [公共依赖表](../README.md#公共依赖与安装位置)。
+本任务没有新增任务专用 pip 包。
+
+| 组件 / 输入 | 用途与要求 | 本机位置 |
+|---|---|---|
+| PhysX / USD / Kit | CPU TGS 120 Hz，重新执行动作；RTX 采集仍需要 GPU | `/home/fufa/isaacsim/` 中的相应扩展 |
+| NumPy / PyArrow | 回放调度、状态比较，直接读取 LeRobot v3 的 Parquet / JSON | 公共依赖表所列 Isaac 包目录 |
+| 已验收的抓放数据集 | 动作、原布局、物理步长、相位、源任务结果；属于运行输入，不能只复制视频 | `planner.source_dir`，正式默认 `outputs/tabletop_pickplace/franka_physx_home000/` |
+| 独立任务资产 | 背景、Franka、木块、苹果及材质 | `assets/TabletopReplay/`，不运行时引用抓放任务资产目录 |
+| ffmpeg / ffprobe | H.264 编码与独立视频校验，6.1.1 | `/usr/bin/ffmpeg`、`/usr/bin/ffprobe` |
+| `cc` 与系统运行库 | 正式采集器默认预算时钟补丁，GCC 13.3.0 | `/usr/bin/cc`；Ubuntu/Debian 的 `build-essential` |
+
+回放不调用 cuMotion 或 cuRobo 重新规划，也不运行 Kimodo、Newton、MuJoCo。
+任务读写逻辑位于仓库中，因此 LeRobot v3 格式不要求安装官方 `lerobot` Python 包。
+正式采集器复用抓放采集器的 Python 实现，但本任务配置不需要启用 cuMotion 扩展。
+默认正式配置 `multi_gpu=true`，只有一张 GPU 时可设置 `RSR_SIM_WORLD__multi_gpu=false`，并使用新的输出目录。
+预算时钟补丁只适用于当前 Linux x86_64 / libstdc++ ABI，链接 libc/libdl/pthread，
+由父进程用 `cc` 编译后只向 Kit 子进程追加 `LD_PRELOAD`；临时库在 `capture/native/`，发布后保存为 `native/`。
+不用把该库安装到系统路径。`--system-budget-clock` 可关闭该补丁，但不能规避本机已观察到的回跳问题。
+
+迁机除 `assets/TabletopReplay/` 外，还要携带 `planner.source_dir` 指向的**完整源数据集**，
+保留 `episode_XXX/lerobot_v3/meta/physics/episode_000000/` 的布局和配置。
+源任务必须通过验收，fps 须整除 120 Hz，物理步长、关节顺序和布局须与回放匹配；
+正式源为 30 fps，调试配置默认读取对应抓放调试源（15 fps）。源数据要求见第 4 节。
+
+安装与不启动 Kit 的自检：
+
+```bash
+./app/python.sh -m pip install -e '.[dev]'
+./app/python.sh -c 'import numpy, PIL, pyarrow, pydantic'
+command -v ffmpeg ffprobe cc
+./app/python.sh - <<'PY'
+from pathlib import Path
+from real2sim2real.utils.tabletop_replay_utils import source_episode_dirs, load_source_episode
+for path in source_episode_dirs(Path("outputs/tabletop_pickplace/franka_physx_home000")):
+    episode = load_source_episode(path)
+    assert episode.success
+    print(path, episode.fps, episode.physics_dt, episode.actions.shape)
+PY
+./app/python.sh .agents/skills/rsr-task-development/scripts/check_task_configs.py configs/tabletop_replay
+```
+
+视频工具缺失时安装系统 `ffmpeg` 包；正式补丁缺编译器时安装 `build-essential`。
+2026-11-16 实测正式和调试源各 2 个 episode 均可由本仓库 reader 读取且源结果成功，
+公共包、工具路径与配置核对通过；本次没有重新执行回放物理或正式渲染。
 
 ## 1. 任务介绍
 

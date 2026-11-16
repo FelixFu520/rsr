@@ -1,6 +1,6 @@
 # HALO G1：原生 29 关节 G1 在客厅爬过矮桌、弯腰走过颈高桌、走到沙发坐下
 
-更新日期：2026-11-13（America/New_York；运行时间均记 UTC）。
+更新日期：2026-11-16（America/New_York；运行时间均记 UTC）。
 
 ## 1. 任务介绍
 
@@ -197,27 +197,31 @@ OptiX 降噪、关闭两项光照缓存与自动曝光。HALO 用 Replicator
 - HALO crawl_v3 的腕部–拇指碰撞过滤对当前三指手资产不生效（目标 prim `L_thumb_proximal` 不存在），未迁移。
 - 共享代码只加了默认不生效的选项：`IsaacsimWorldConfig.active_gpu` / `multi_gpu`（单卡渲染）、
   `LeRobotV3Recorder(extra_features=...)`（HALO 的附加列）。其它任务的默认行为不变。
-- HALO 的参考动作生成（Kimodo、IK、拼接）、Blender 建桌和机器人材质烘焙没有迁移；迁入的是它们的最终产物，
-  来源和 SHA-256 见 `assets/Halo/provenance.json`。
+- 初次迁移只带入 HALO 参考动作生成（Kimodo、IK、拼接）、Blender 建桌和机器人材质烘焙的最终产物，
+  来源和 SHA-256 见 `assets/Halo/provenance.json`。2026-11-16 补充 Kimodo wheel 安装和本地候选生成入口（第 6 节）；
+  历史三项正式结果仍使用原参考，未替换为新生成动作。
 
 ### 4.1 脚本
 
 | 脚本 | 用途 |
 |---|---|
 | [scripts/halo/prepare_halo_assets.py](../scripts/halo/prepare_halo_assets.py) | 从 HALO 项目逐字节复制资产到 `assets/Halo/`，检查 USD 依赖闭包，写 `provenance.json` |
+| [scripts/halo/prepare_kimodo_models.py](../scripts/halo/prepare_kimodo_models.py) | 复制 Kimodo、Llama 和 LLM2Vec 权重并核对逐文件哈希 |
+| [scripts/halo/generate_halo_reference.py](../scripts/halo/generate_halo_reference.py) | 本地离线生成 G1 候选参考，保存场景、约束、种子和生成证据；不执行物理 |
 | [scripts/halo/validate_halo.py](../scripts/halo/validate_halo.py) | 不启动 Kit 的独立校验；`--compare` 与 HALO 源记录逐帧对比 |
 
 ## 5. 资产
 
 ```text
-assets/Halo/                        907 MB，363 个文件
+assets/Halo/                        原仿真资产约 907 MB；另含新增 Kimodo 模型约 16.34 GiB
 ├── Home010/home_010.usdc           客厅（224 MB）+ textures/ + forest.exr
 ├── Robot/g1_29_reference.usd       29 关节 G1，银白参考材质 + Textures/G1Reference/、robot_manifest.json
 ├── Desk/crawl/crawl_desk.usdc      黑色矮桌 1.10×0.60×0.83 m（+ .blend 源文件、dimensions.json）
 ├── Desk/crouch/crouch_desk.usdc    银灰双柱桌 1.15×0.60×1.13 m
 ├── reference/{crawl,crouch,sit}/   qpos.npy + spec.json（30 fps 参考动作与阶段表）
 ├── models/sonic/                   model_encoder.onnx、model_decoder.onnx、observation_config.yaml、LICENSE
-└── provenance.json                 来源、许可证、依赖检查、每个文件的 SHA-256
+├── models/kimodo/                  G1 checkpoint、Llama 基座、两个 LLM2Vec 适配器、provenance.json（约 16.34 GiB）
+└── provenance.json                 原迁移资产的来源、许可证与 SHA-256；Kimodo 模型另有独立清单
 ```
 
 准备命令：`./app/python.sh scripts/halo/prepare_halo_assets.py`（源文件只读，目标已存在且内容不同则拒绝覆盖）。
@@ -235,9 +239,176 @@ assets/Halo/                        907 MB，363 个文件
 
 ## 6. 依赖与安装
 
-不需要额外安装。SONIC 用 Isaac Sim 6.2 自带的 `onnxruntime`（本机 1.26.0，CPUExecutionProvider），
-参考重采样与坐姿保持用自带的 `scipy`（1.17.0）。两者都只在方法内导入；缺失时 `SonicTracker` 报出安装命令。
-验证：`./app/python.sh -c "import onnxruntime, scipy"`。
+### 6.1 已有参考跟踪与新轨迹生成的依赖
+
+后续 HALO **每个新场景、机器人或任务变体都使用 Kimodo 重新生成候选轨迹**，记录场景约束、机器人映射、
+提示词、随机种子和模型版本；随后经过对应控制器的真实物理跟踪和任务验收。已验收历史结果保留。
+Kimodo 生成参考，SONIC 执行 G1 全身闭环跟踪，二者是不同阶段。仅重采历史参考不需要加载 Kimodo。
+
+唯一运行时仍为仓库根目录的 `./app/python.sh`，不新建 `.venv`。本机为 Linux x86_64、Isaac Sim
+`6.2.0-rc.14+release.52805.02189a84.gl`、SDK Python 3.12.14；`app` 当前链接到 `/home/fufa/isaacsim`。
+公共依赖 NumPy、Pillow、PyArrow、Dynaconf、Pydantic、PyYAML、structlog、Typer 以及 pytest / Ruff 的用途、
+版本和安装位置见 [公共依赖表](../README.md#公共依赖与安装位置)。
+PhysX 与 SONIC ONNX 目前使用 CPU；Kit / RTX 视频仍需 NVIDIA GPU，本地 Kimodo 默认在 CUDA 上生成。
+视频编码与独立校验使用 `/usr/bin/ffmpeg`、`/usr/bin/ffprobe`（6.1.1，需 `libx264`）；
+Ubuntu/Debian 缺失时安装系统 `ffmpeg` 包。历史参考的跟踪采集不编译预算时钟补丁；
+C 编译器只用于本节完整 Kimodo wheel 的重建，不是已安装 wheel 推理的必需品。
+当前 Kimodo 和新增依赖通过 pip 安装到：
+
+```text
+/home/fufa/isaacsim/kit/python/lib/python3.12/site-packages/
+├── kimodo/
+├── motion_correction/             wheel 内的 CPython 3.12 原生扩展
+├── transformers/                 5.1.0
+├── peft/                         0.18.1
+├── huggingface_hub/              1.4.1
+└── torchvision/                  0.26.0+cu128，匹配现有 torch 2.11.0+cu128
+```
+
+`halo` 可选依赖组定义在 `pyproject.toml`，不加入项目核心依赖；固定上述文本编码器版本及
+`tokenizers==0.22.2`、`omegaconf==2.3.1`。本次保留了所有原有包的版本，未替换 Isaac 的 NumPy、Torch、Warp 等。
+完整安装新增 31 个发行包，还包括 Hydra、einops、accelerate、safetensors，以及上游声明的
+Gradio 6.20.0 / gradio_client 2.5.0、ScenePic 1.1.2、PyAV 19.0.2 和 bvhio 1.5.4 等；
+完整包版本和安装来源见 `outputs/debug/halo/kimodo_setup/install_report.json` 与 `pip_after.json`。
+
+SONIC 使用 `onnxruntime` 1.26.0 的 `CPUExecutionProvider`；重采样和几何计算使用 Isaac 自带的 SciPy 1.17.0。
+ONNX Runtime 当前有两份：默认裸 `python.sh` 加载 `site-packages/onnxruntime/`（发行包为 `onnxruntime-gpu`，
+有 pip 安装记录），Isaac 还在 `exts/isaacsim.pip.onnx/pip_prebundle/onnxruntime/` 附带同版本。
+不需要为 Kimodo 再装 ONNX Runtime。
+
+原 HALO 的 Kimodo 1.0.0 安装在 `/home/fufa/Projects/halo/output/v1/.venv/`，是指向
+`output/v1/vendor/kimodo` 的 editable 安装；该旧环境不作为 rsr 的运行依赖。
+
+### 6.2 首选 wheel 安装
+
+上游：[nv-tlabs/kimodo](https://github.com/nv-tlabs/kimodo)，本次固定提交
+`e1c219c99b4b94ba48be1fb6a1cbc64ecee4c954`（源码 Apache-2.0）。当前上游包没有可直接使用的 PyPI 发行版，
+已从该提交的干净源码构建并安装完整 wheel，包含 MotionCorrection、骨架资源和许可证：
+
+```text
+wheels/halo/kimodo-1.0.0-cp312-cp312-linux_x86_64.whl
+SHA-256: ccd25c8ce4273d0c260c8eb3656ae57dcd22df6a358b876003dc2753cd2eb6b5
+```
+
+这个 wheel 适用于当前 Linux x86_64 / CPython 3.12 环境，不是跨平台 wheel。
+`wheels/` 是被 git 忽略的本地安装包目录，迁机时需另行携带或重建。新机器先准备相同 Isaac 运行时，然后：
+
+```bash
+# 在仓库根执行。保存安装前约束，阻止替换 Isaac 已有包。
+mkdir -p outputs/debug/halo/kimodo_install
+./app/python.sh -m pip list --format=freeze \
+  > outputs/debug/halo/kimodo_install/isaac_constraints.txt
+
+# 当前 torch 为 2.11.0+cu128，torchvision 从相同 CUDA 索引取 wheel。
+./app/python.sh -m pip download --no-deps \
+  --index-url https://download.pytorch.org/whl/cu128 \
+  --dest wheels/halo 'torchvision==0.26.0+cu128'
+
+./app/python.sh -m pip install --dry-run \
+  -c outputs/debug/halo/kimodo_install/isaac_constraints.txt \
+  --find-links wheels/halo -e '.[dev,halo]'
+./app/python.sh -m pip install \
+  -c outputs/debug/halo/kimodo_install/isaac_constraints.txt \
+  --find-links wheels/halo -e '.[dev,halo]'
+
+./app/python.sh -c 'import kimodo, motion_correction, torch, torchvision; print(kimodo.__file__, torch.__version__, torchvision.__version__)'
+./app/python.sh -m kimodo.scripts.generate --help
+./app/python.sh -m pip check
+```
+
+预检查若与另一版 Isaac 已有包冲突，应核对兼容版本后重建，不移除约束强行升级。
+`uv lock` 使用 `tool.uv.sources` 中的固定上游源码解析 Kimodo；pip 使用 `wheels/halo` 的已构建 wheel。
+不要 `uv sync`。本机安装前 `pip check` 已有 3 项缺失报告（两个 simready 包缺 `usd-validation-nvidia`，
+`msal` 缺 `pyjwt`），本次安装后仍仅为这 3 项。
+
+需重建 wheel 时，在临时构建目录保存源码，避免修改原 HALO 项目：
+
+```bash
+mkdir -p outputs/debug/halo/kimodo_build wheels/halo
+git clone https://github.com/nv-tlabs/kimodo.git outputs/debug/halo/kimodo_build/source
+git -C outputs/debug/halo/kimodo_build/source checkout e1c219c99b4b94ba48be1fb6a1cbc64ecee4c954
+./app/python.sh -m pip install --target outputs/debug/halo/kimodo_build/tools \
+  'cmake==3.31.10' 'pybind11==2.13.6'
+PATH="$PWD/outputs/debug/halo/kimodo_build/tools/cmake/data/bin:$PATH" \
+CMAKE_PREFIX_PATH="$PWD/outputs/debug/halo/kimodo_build/tools/pybind11/share/cmake" \
+  /usr/local/bin/wybuild -- ./app/python.sh -m pip wheel --no-build-isolation --no-deps \
+  --wheel-dir wheels/halo outputs/debug/halo/kimodo_build/source
+```
+
+本机已通过 `wybuild.slice` 隔离验证，构建使用上游默认 4 并发；C++17 编译器由系统提供，
+CMake 自动取得 Eigen 3.4.0。其它机器没有 `wybuild` 时使用当地构建隔离入口。
+**只有完整 wheel 确实无法构建或安装时**，才新建 `third_party/kimodo/`，检出相同提交后用
+`./app/python.sh -m pip install --no-deps -e third_party/kimodo` 回退；其余依赖仍按约束安装。
+源码安装仍可能需要同一原生工具链，不能绕过缺失的编译器或不兼容 API。本次未触发回退，不创建源码副本。
+
+### 6.3 模型与本地离线生成
+
+wheel 不包含模型权重。模型统一复制到 `assets/Halo/models/kimodo/`，不引用原 HALO 的运行时路径：
+
+```bash
+./app/python.sh scripts/halo/prepare_kimodo_models.py \
+  --source /home/fufa/Projects/halo/output/v1/models
+```
+
+该脚本复制 `Kimodo-G1-RP-v1`、`Meta-Llama-3-8B-Instruct`、LLM2Vec MNTP 和 supervised 两个适配器，
+逐文件核对 SHA-256，保留许可证，已有不同文件拒绝覆盖；记录在该目录的 `provenance.json`。
+来源和条款分别见 [G1 模型卡](https://huggingface.co/nvidia/Kimodo-G1-RP-v1)、
+[Llama 3](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct)、
+[MNTP](https://huggingface.co/McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp) 和
+[supervised](https://huggingface.co/McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised)。
+迁机时这些模型与 HALO 资产一起携带；获取新模型时遵守对应仓库的访问条件。
+
+新增 [generate_halo_reference.py](../scripts/halo/generate_halo_reference.py) 提供无 Kit 的本地生成入口：
+
+```bash
+./app/python.sh scripts/halo/generate_halo_reference.py \
+  --prompt 'A person stands still.' \
+  --scene-config configs/halo/g1_physx_crawl_debug.toml \
+  --robot g1 --model Kimodo-G1-RP-v1 \
+  --duration 1 --samples 1 --steps 4 --seed 42 --device cuda:1 \
+  --output outputs/debug/halo/kimodo_smoke
+```
+
+上例只验证安装与完整推理链路，4 步候选不作为正式任务轨迹。任务生成建议先用 `--steps 80 --samples 2`；
+场景路径、避障和接触姿态通过 `--constraints path/to/constraints.json` 传入 Kimodo 约束。
+`--scene-config` 仅保存配置来源和哈希，**不会自动读取 USD 几何或生成避障约束**。
+约束文件采用 Kimodo 原生 Y-up 坐标；`--origin X_M Y_M YAW_DEG` 将导出的 qpos 放到任务世界坐标中。
+制作约束时，需先把场景世界坐标按该原点和朝向逆变换到生成局部坐标，再转换成 Kimodo 的 Y-up 表示。
+脚本使用本地 Llama 基座与两个适配器，忽略历史适配器元数据中的旧项目绝对路径，
+编码后释放文本模型再加载动作模型；设置 `HF_HUB_OFFLINE=1` 和 `TRANSFORMERS_OFFLINE=1`，不调用外部文本服务。
+
+每次使用新的输出目录，保存 `generation.json`、提示词文本嵌入、场景配置副本、可选约束副本、
+原始 `motion.npz` 和 `sample_000/{qpos.npy,spec.json}` 等候选。`qpos` 为米、Z-up、wxyz、
+基座 7 列 + G1 29 关节，共 36 列；原始 `motion.npz` 保持 Kimodo 坐标，尚未应用 `--origin`。
+候选明确标记 `physics_validated=false`，拒绝输出到 `outputs/halo/` 或覆盖已有目录。
+
+### 6.4 新场景与新机器人的使用约定
+
+1. 从目标场景测量通道、桌高、座面、落足区和接触对象；把目标路径、关键帧、末端约束和阶段时长写成生成输入。
+   每种场景与机器人组合重新采样 Kimodo，并保存所有原始候选、模型/资产哈希、约束、种子及评分依据。
+2. 当前导出脚本仅支持 G1。G1 checkpoint 不会因更换机器人 USD 自动适配：其它人形机器人需先做骨架重定向，
+   校验关节顺序、轴向、限位、尺寸、基座坐标与足底接触，并接入适合该机器人的全身控制器；不能直接复用 G1 的 SONIC。
+   非人形机器人需要另外验证 Kimodo 表示与重定向是否适用，不能承诺任意机器人直接生成可执行轨迹。
+3. G1 模型卡标注单段最长 10 s / 300 帧 @30 Hz。长任务分阶段生成，以相邻段的姿态/速度、落足和接触约束衔接，
+   然后在连续物理中验证完整轨迹；不得拼接失败仿真片段。`spec.json` 中示例的 `generated` 阶段需替换为真实任务阶段，
+   并同步对应场景配置和验收口径，不能直接套用已有 crawl/crouch/sit 的结果。
+4. 几何筛选后，将候选连同生成证据整理到新的 `assets/Halo/reference/<场景>_<机器人>_<任务>/`；
+   配置显式选择该目录，再做只跑物理 → 640 宽 / 15 fps 调试 → 正式采集 → 独立校验。
+   正式视频按仓库规格使用 PathTracing、1K/2K、30 fps。通过前只写 `outputs/debug/halo/`；
+   通过后发布新的 `outputs/halo/<场景>_<机器人>_<任务>/`，保留旧参考与已有正式数据。
+
+### 6.5 本次安装验收（2026-11-16）
+
+- 完整原生 wheel 构建成功；`kimodo`、`motion_correction`、Torch、CUDA 版 torchvision 导入通过。
+  `uv lock` 和 `pip install -e '.[dev,halo]' --find-links wheels/halo` 通过；原有包版本替换数为 0。
+- 模型复制并逐文件验哈希：62 个文件，17,548,853,090 字节；运行时不读取原 HALO 的权重或源码。
+- 全离线推理：`outputs/debug/halo/kimodo_smoke/`，1 候选 × 30 帧 × 36 列、4 步去噪。
+  另在 `kimodo_constraints_smoke/` 验证 80 步、2 候选、首尾全身约束和非零原点/朝向变换。
+  两组输出均有限值，四元数模长最大误差 `5.96e-8`，从原始 motion 到世界 qpos 的坐标变换核对通过。
+  这些是生成器验收用候选，未运行物理验收，不作为正式数据。
+- 全仓 Ruff 通过；pytest 安装前后均为 **377 passed / 3 skipped**；58 份任务配置校验通过，
+  原有后端仍可列出。`pip check` 仅保留第 6.2 节记录的 3 项既有缺失。
+  构建、安装、依赖快照、回归与候选检查记录在 `outputs/debug/halo/kimodo_setup/`。
 
 ## 7. 配置
 

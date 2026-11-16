@@ -57,6 +57,9 @@
 - `physic_solver` 配置全部平铺在 `configs/physic_solver/`；文件名为 `<机器人求解器>_<接触求解器>_<物体ID>_<工况>.toml`，输出文件夹与配置文件 stem 一致，不再设置 `package_cases/` 子目录。
 - 任务之间可以继承（分拣复用物理求解器任务的 `PackageScene` / `PackageRuntime` / `PhysicSolverJob`），
   不要复制代码。
+- HALO 后续新增场景、机器人或任务变体时，用 Kimodo 重新生成候选参考，记录模型、场景/机器人、约束和种子，
+  经目标机器人的控制器连续物理跟踪和独立验收后发布；其它机器人先做骨架重定向与控制器适配，不能直接复用 G1 SONIC。
+  安装、离线生成与验收流程见 `docs/halo.md` 第 6 节；保留历史参考和正式输出。
 - 包内模块顶层不导入 Kit / pxr / Newton / Warp；Warp kernel 和依赖 Newton 的子类在首次使用时定义
   （见 `utils/physic_solver_utils.moving_frame_vbd_class`），保证 `list-backends` 和单元测试不启动 Kit。
 - 输出：`outputs/<task>/` 只放通过验收的结果；调试、对照和失败轨迹放 `outputs/debug/<task>/`。

@@ -1,6 +1,48 @@
 # 机器狗巡检：X30 仓库消防巡检
 
-更新日期：2026-11-12。
+更新日期：2026-11-16（环境核对；历史结果保留）。
+
+## 运行环境与依赖
+
+使用 Linux x86_64 上的 Isaac Sim `6.2.0-rc.14+release.52805.02189a84.gl`、SDK 内 Python 3.12.14。
+在仓库根运行 `./app/python.sh` 或 `./scripts/rsr`；本机 `app -> /home/fufa/isaacsim`，不新建 `.venv`。
+公共依赖为 NumPy、Pillow、PyArrow、Dynaconf、Pydantic、PyYAML、structlog、Typer，开发工具为 pytest / Ruff；
+各自版本、用途、实际安装路径见 [公共依赖表](../README.md#公共依赖与安装位置)。本任务无新增任务专用 pip 包。
+
+| 组件 | 用途与启用方式 | 本机位置 |
+|---|---|---|
+| PhysX / USD / Kit | CPU TGS 120 Hz、关节驱动、场景查询和相机；由 Isaac 提供 | `/home/fufa/isaacsim/` 的物理、USD 与 Kit 扩展 |
+| `omni.flowusd` | 纸箱上的烟火；任务配置 `sim_world.extensions` 显式启用 | `/home/fufa/isaacsim/extscache/omni.flowusd-110.0.4+110.0.0.lx64.r.cp312.u7f4/` |
+| `omni.usd.schema.flow` | Flow 的 USD 类型定义，仅此扩展不足以执行烟火 | 同级 `omni.usd.schema.flow-110.0.0+110.0.0.u7f4/` |
+| RTX | 场景材质、PathTracing、Flow 画面与 RGB 采集 | Isaac SDK 渲染插件；需要可用 RTX GPU |
+| ffmpeg / ffprobe | 双相机视频编码、截图和独立视频校验 | `/usr/bin/ffmpeg`、`/usr/bin/ffprobe`（6.1.1） |
+
+X30 当前为运动学机身 + 项目内脚本化 trot；A*、占用图和指令关键词解析均在任务代码内。
+当前实现不需要额外步态策略、Torch/ONNX 模型、LLM API、cuRobo 或 `isaacsim.asset.gen.omap`。
+Flow 用于视觉烟火，不是 PhysX 火灾动力学；`device="cpu"` 也不表示 Flow / RTX 能在无 GPU 环境下工作。
+当前巡检入口不编译预算时钟补丁，不要求 C 编译器。运行时不要求访问原 `/home/fufa/Projects/x30`；
+复制资产时才需要原仓库/机器人输入。已有 `assets/FireInspection/` 完整资产包即可运行，须包含 USD、MDL、贴图与火焰 manifest。
+
+安装与不启动 Kit 的检查：
+
+```bash
+./app/python.sh -m pip install -e '.[dev]'
+./app/python.sh -c 'import numpy, PIL, pyarrow, pydantic'
+./app/python.sh - <<'PY'
+from pathlib import Path
+sdk = Path("app").resolve()
+for name in ("omni.flowusd-*", "omni.usd.schema.flow-*"):
+    matches = list((sdk / "extscache").glob(name))
+    assert matches, f"Missing Isaac extension: {name}"
+    print(name, matches)
+PY
+command -v ffmpeg ffprobe
+./app/python.sh .agents/skills/rsr-task-development/scripts/check_task_configs.py configs/fire_inspection
+```
+
+2026-11-16 公共包导入、Flow 扩展目录和配置检查通过。目录存在仅验证本地扩展已提供；
+实际烟火、相机和材质仍需第 6、7 节的调试采集及火焰预检确认。本轮没有重跑采集或更改渲染规格。
+系统缺视频工具时安装 Ubuntu/Debian 的 `ffmpeg` 包，并核对 `ffmpeg -encoders` 包含 `libx264`。
 
 ## 1. 任务介绍
 

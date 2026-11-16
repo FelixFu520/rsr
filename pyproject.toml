@@ -17,6 +17,20 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.6"]
+halo = [
+    "kimodo==1.0.0",
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "peft==0.18.1",
+    "huggingface-hub==1.4.1",
+    "tokenizers==0.22.2",
+    "omegaconf==2.3.1",
+]
+
+# Kimodo is not published on PyPI. pip users install the locally built wheel first;
+# uv uses this immutable upstream source when resolving the optional halo dependencies.
+[tool.uv.sources]
+kimodo = { url = "https://github.com/nv-tlabs/kimodo/archive/e1c219c99b4b94ba48be1fb6a1cbc64ecee4c954.zip" }
 
 [project.scripts]
 rsr = "real2sim2real.core.cli:main"

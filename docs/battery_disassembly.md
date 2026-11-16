@@ -1,6 +1,6 @@
 # 电池拆解：双 KUKA KR210 在 c1003b1a1 工厂里拧出四颗螺丝、揭下电池盖
 
-更新日期：2026-11-14（运行时间记 UTC）。
+更新日期：2026-11-16（环境核对；运行时间记 UTC）。
 
 ## 1. 任务介绍
 
@@ -266,6 +266,49 @@ assets/BatteryDisassembly/
 | 电池壳 | x ±0.425，y ±0.629，z 0.7504–0.8147（与螺丝过滤碰撞） |
 | 篮子 | 资产包围盒内 8 mm 壁、15 mm 底 |
 | 螺丝 | 头 r 10.1 mm（底 1.5 mm + 3 mm 深十字槽，槽宽 2.5 mm），螺杆 r 5.1 mm × 32 mm |
+
+## 6. 运行环境、依赖与安装
+
+在仓库根使用 Isaac SDK 的 `./app/python.sh`；本机为 Linux x86_64、Isaac Sim
+`6.2.0-rc.14+release.52805.02189a84.gl`、Python 3.12.14，`app -> /home/fufa/isaacsim`。
+不使用旧 Real2Sim2Real 项目环境，不建立 `.venv`。公共依赖为 NumPy、Pillow、PyArrow、Dynaconf、Pydantic、
+PyYAML、structlog、Typer，开发依赖 pytest / Ruff；完整版本、用途和路径见
+[公共依赖表](../README.md#公共依赖与安装位置)。本任务没有额外任务专用 pip 包。
+
+| 组件 | 用途与本机情况 | 安装 / 输入位置 |
+|---|---|---|
+| PhysX / USD / Kit | CPU TGS 240 Hz、有限力驱动、接触和机器人状态 | `/home/fufa/isaacsim/` 的物理、USD、Kit 扩展 |
+| NumPy | 本任务 URDF 雅可比 IK、轨迹与几何计算，2.3.1 | Isaac `extscache/omni.kit.pip_archive-0.0.0+187cf21b.lx64.cp312/pip_prebundle/` |
+| RTX | PathTracing、双相机和材质；物理用 CPU 也仍需渲染 GPU | Isaac SDK 渲染插件 |
+| ffmpeg / ffprobe | H.264 编码、预览和独立校验，6.1.1 | `/usr/bin/ffmpeg`、`/usr/bin/ffprobe` |
+| `cc` 与系统 C/C++ 运行库 | 正式 1K 配置的单调 GPU 预算时钟补丁，GCC 13.3.0 | `/usr/bin/cc`；Ubuntu/Debian 的 `build-essential` |
+| KR210 URDF 与资产 | 初始化模型和 IK 依据，不是额外 Python 库 | 运行时在 `assets/BatteryDisassembly/Robot/KR210_L150/`；准备时从 SDK 的 `extsDeprecated/isaacsim.robot_motion.motion_generation/` 复制 |
+
+本任务的 KR210 IK 已改为 NumPy 实现，不要求 Lula 的 `Kuka_KR210` 配置，也不调用 cuRobo / cuMotion、
+Newton、MuJoCo、Kimodo 或官方 LeRobot 包。旧源项目中的依赖不等于 rsr 当前依赖。
+工厂、工位、机器人、工具、材质贴图都在 `assets/BatteryDisassembly/`；只在重新准备资产时需要第 5 节的源项目输入。
+
+当前正式入口默认选 `kr210_physx_c1003b1a1_1k.toml`：CPU 物理、双 GPU RTX 渲染，
+`monotonic_render_budget_clock=true`。只有单张 GPU 时可按第 8 节改为单 GPU 并选择新的输出目录，
+不能把某次历史采集的硬件数量视为所有变体的最低要求。
+预算时钟补丁在采集前用 `cc` 编译，链接 libc/libdl/pthread，并拦截当前 libstdc++ 的计时 ABI，
+只在 Kit 子进程用 `LD_PRELOAD` 加载，不需要安装为系统库或全局设置 `LD_PRELOAD`。
+源码/共享库/哈希先存于本次运行的 `capture/native/`，发布时保存为输出的 `native/`。
+该补丁仅验证了当前 Linux x86_64 SDK；其它 SDK/平台须按第 11.1 节重新验证，关闭补丁只改变计时方案。
+
+安装和无 Kit 自检：
+
+```bash
+./app/python.sh -m pip install -e '.[dev]'
+./app/python.sh -c 'import numpy, PIL, pyarrow, pydantic'
+command -v ffmpeg ffprobe cc
+cc --version
+./app/python.sh .agents/skills/rsr-task-development/scripts/check_task_configs.py configs/battery_disassembly
+```
+
+视频工具缺失时安装系统 `ffmpeg` 包；需要补丁而缺编译器时安装 `build-essential`。
+2026-11-16 公共包、工具路径和任务配置核对通过，本轮没有重新执行物理/视频采集；
+系统 `pip check` 的既有 3 项报告见公共环境说明，不将其记为本任务新缺包。
 
 ## 7. 配置
 

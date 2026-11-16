@@ -1,6 +1,58 @@
 # 物理求解器验证
 
-更新日期：2026-11-13。
+更新日期：2026-11-16（环境核对；历史采集日期保留）。
+
+## 运行环境与依赖
+
+在仓库根使用 Isaac Sim 的 `./app/python.sh`；本机为 Linux x86_64、Isaac Sim
+`6.2.0-rc.14+release.52805.02189a84.gl`、Python 3.12.14，`app -> /home/fufa/isaacsim`。
+不创建 `.venv`，不使用源项目 `/home/fufa/Projects/package` 的 Python 环境。
+公共依赖为 NumPy、Pillow、PyArrow、Dynaconf、Pydantic、PyYAML、structlog、Typer，
+开发工具为 pytest / Ruff；逐包版本、用途和路径见 [公共依赖表](../README.md#公共依赖与安装位置)。
+本任务没有新增任务专用 pip 包，也不需要 cuRobo、Kimodo 或官方 `lerobot` 包。
+
+| 路线 / 组件 | 用途与本机版本 | 实际安装位置 |
+|---|---|---|
+| PhysX | 刚体基线；hybrid 中的 Franka 机器人，由 Isaac 提供 | `/home/fufa/isaacsim/extscache/omni.physx-110.4.4+110.4.0.lx64.r.cp312.u7f4/` 等扩展 |
+| Newton | direct / hybrid / SDK 诊断，1.6.1 | `/home/fufa/isaacsim/exts/isaacsim.pip.newton/pip_prebundle/newton/` |
+| MuJoCo / MuJoCo Warp | 原生 CPU / GPU 刚体求解，均 3.12.0 | 同上 `pip_prebundle/mujoco/`、`mujoco_warp/` |
+| Warp | VBD、XPBD、hydroelastic 等 GPU 计算，配套扩展 1.17.0 | `/home/fufa/isaacsim/extscache/omni.warp.core-1.17.0+lx64/warp/` |
+| Lula | 仅 PhysX / hybrid Franka 路线的 IK；Newton / UR5e 路线使用任务内 IK | `/home/fufa/isaacsim/extsDeprecated/isaacsim.robot_motion.lula/pip_prebundle/`，配置在相邻 `isaacsim.robot_motion.motion_generation/` |
+
+`IsaacsimWorld` 在非 PhysX 模式下启用 `isaacsim.pip.newton`；若选择 Newton USD 路线，还启用
+`isaacsim.physics.newton` 和 `.tensors`。裸 `python.sh` 没有启用这些扩展，直接 `import newton` 失败不等于未安装。
+纯 SDK 诊断脚本使用 `isaac_newton_sdk_environment()` 添加 Newton、Warp、USD 库路径，不启动 Kit。
+本机普通 `site-packages/warp` 另有 1.18.0；配套 Newton SDK 检查实际导入的是扩展版 1.17.0，不能混写成同一版本。
+
+配置中的 `device="cuda:0"` 是物理设备；VBD / hydroelastic GPU 路线需要可用 CUDA GPU。
+`mujoco_cpu=true` 只把 MuJoCo 刚体求解移到 CPU，不会同时把 VBD 或 RTX 渲染移到 CPU。
+只有 `newton_diagnostic` 已实现的纯 CPU、无 Kit 案例可以不启动 GPU 渲染；一般 RGB 采集仍需要 RTX GPU。
+视频处理用 `/usr/bin/ffmpeg`、`/usr/bin/ffprobe`，H.264 编码器需包含 `libx264`。
+`collect_screw_arm_demo.py` 的 UR5e / 双 UR5e 采集还会编译预算时钟补丁，需要 `/usr/bin/cc`
+（Ubuntu/Debian：`build-essential`）；普通求解与 `recapture_physic_solver.py` 不因此统一要求 C 编译器。
+补丁使用 libc/libdl/pthread，依赖当前 Linux x86_64 libstdc++ ABI，仅在采集子进程预加载。
+
+安装与不启动 Kit 的自检：
+
+```bash
+./app/python.sh -m pip install -e '.[dev]'
+./app/python.sh -c 'import numpy, PIL, pyarrow, lula; print(lula.__file__)'
+./app/python.sh - <<'PY'
+import subprocess, sys
+from real2sim2real.utils.physic_solver_utils import isaac_newton_sdk_environment
+subprocess.run(
+    [sys.executable, "-c", "import newton, warp, mujoco, mujoco_warp; print(newton.__version__, warp.__version__, mujoco.__version__)"],
+    env=isaac_newton_sdk_environment(), check=True,
+)
+PY
+command -v ffmpeg ffprobe cc
+./app/python.sh .agents/skills/rsr-task-development/scripts/check_task_configs.py configs/physic_solver
+```
+
+2026-11-16 实测公共包、Lula、Newton / Warp / MuJoCo / MuJoCo Warp 导入通过，SDK 版本和路径与上表一致。
+本轮仅核对环境，没有重跑任务采集。资产运行时只读 `assets/PhysicSolver/`；第 8、9 节的资产准备脚本可能
+需要原项目输入或 Isaac 附带资产，已有完整任务资产包时不需要原项目目录。
+
 
 ## 1. 任务与统一分类
 

@@ -1,7 +1,52 @@
 # 分拣包裹：Pro-M6 双臂连续分拣软包与纸箱
 
-更新日期：2026-11-11。本文合并原 `package.md`、`package01.md`、`sorting_package.md` 及夹爪错位、
+更新日期：2026-11-16（环境核对）。本文合并原 `package.md`、`package01.md`、`sorting_package.md` 及夹爪错位、
 1K 重渲染和 LeRobot 组装记录；逐次实验记录可通过 Git 历史查阅。
+
+## 运行环境与依赖
+
+在仓库根运行；唯一解释器为 `./app/python.sh`，`./scripts/rsr` 是同一解释器的 CLI 包装。
+本机 Linux x86_64、Isaac Sim `6.2.0-rc.14+release.52805.02189a84.gl`、Python 3.12.14，
+`app -> /home/fufa/isaacsim`，不建 `.venv`。公共依赖为 NumPy、Pillow、PyArrow、Dynaconf、Pydantic、
+PyYAML、structlog、Typer，开发依赖 pytest / Ruff；版本、用途和安装路径见
+[公共依赖表](../README.md#公共依赖与安装位置)。本任务无额外任务专用 pip 包。
+
+| 组件 | 用途与本机版本 | 实际安装位置 |
+|---|---|---|
+| Newton | 自管模型与步进，1.6.1 | `/home/fufa/isaacsim/exts/isaacsim.pip.newton/pip_prebundle/newton/` |
+| MuJoCo / MuJoCo Warp | 分拣配置的机械臂和纸箱使用原生 MuJoCo CPU；配套库均 3.12.0 | 同上 `pip_prebundle/mujoco/`、`mujoco_warp/` |
+| Warp / CUDA VBD | 柔性衣物与袋膜，配套 Warp 1.17.0 | `/home/fufa/isaacsim/extscache/omni.warp.core-1.17.0+lx64/warp/` |
+| Kit / USD / RTX | 资产装配、零物理步渲染、相机 | Isaac SDK 的 `exts/`、`extscache/` 和原生插件 |
+| ffmpeg / ffprobe | H.264 视频编码、解码、帧数与采样率校验，6.1.1 | `/usr/bin/ffmpeg`、`/usr/bin/ffprobe` |
+
+`configs/sorting/mujoco_vbd_sorting.toml` 选择 `physics_engine="newton"`、`newton_execution="direct"`、
+`device="cuda:0"`。世界自动启用 `isaacsim.pip.newton`；刚体在 CPU，柔体在 CUDA，仍需要可用 NVIDIA GPU，
+不是纯 CPU 仿真。Kit 的 RTX 采集也需要 GPU；`headless=true` 只是不显示窗口。
+本机裸 Python 另能找到 site-packages 的 Warp 1.18.0，配套 Newton SDK 入口使用扩展版 1.17.0；
+不要为了裸 `import newton` 安装另一套 pip Newton，也不要把 Warp 版本混用。
+当前分拣采集入口不编译预算时钟补丁，不要求安装 C 编译器；同样不依赖 cuRobo、cuMotion、Kimodo 或官方 LeRobot 包。
+
+安装和环境检查不运行完整分拣：
+
+```bash
+./app/python.sh -m pip install -e '.[dev]'
+./app/python.sh -c 'import numpy, PIL, pyarrow'
+./app/python.sh - <<'PY'
+import subprocess, sys
+from real2sim2real.utils.physic_solver_utils import isaac_newton_sdk_environment
+subprocess.run(
+    [sys.executable, "-c", "import newton, warp, mujoco, mujoco_warp; print(newton.__version__, warp.__version__, mujoco.__version__)"],
+    env=isaac_newton_sdk_environment(), check=True,
+)
+PY
+command -v ffmpeg ffprobe
+./app/python.sh .agents/skills/rsr-task-development/scripts/check_task_configs.py configs/sorting
+```
+
+2026-11-16 专项 SDK 和公共包导入通过；本轮不重跑完整物理或正式渲染。
+运行资产只来自 `assets/SortingPackage/`；模型可复用 `physic_solver` 的 Python 实现，但资产已独立复制，
+不要求运行时访问 `assets/PhysicSolver/` 或源 `/home/fufa/Projects/package`。迁机需携带整个任务资产目录，
+尤其保留 `Robot/` 与 `Scene/` 的相对层级。视频需要系统 `ffmpeg` 包及 `libx264` 编码能力。
 
 ## 1. 任务介绍
 

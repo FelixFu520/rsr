@@ -15,7 +15,7 @@ Job 都是独立注册的后端，复用同一个 `IsaacsimWorld` 和固定的 J
 | 求解器验证 | Franka 抓放衣服／方块；package01–08 的位置、重量、种类与摇晃／附着矩阵；连续主轴螺纹装配 | Newton（Featherstone、MuJoCo、XPBD、VBD）、PhysX、hybrid、hydroelastic接触 | [configs/physic_solver/](configs/physic_solver/) | [docs/physic_solver.md](docs/physic_solver.md) |
 | 分拣包裹 | Pro-M6 双臂把软包和纸箱依次从入料带经平台送到出料带，四路 1K 视频 | MuJoCo（CPU）+ VBD（CUDA） | [configs/sorting/](configs/sorting/) | [docs/sorting.md](docs/sorting.md) |
 | 机器狗巡检 | X30 一句话指令巡航仓库，发现火点、拍照、警示灯报警 | PhysX（CPU）+ Flow 火焰 | [configs/fire_inspection/](configs/fire_inspection/) | [docs/fire_inspection.md](docs/fire_inspection.md) |
-| HALO G1 | 原生 29 关节 G1 在客厅爬过矮桌（crawl）、弯腰走过颈高桌（crouch）、走到沙发坐下（sit），GEAR-SONIC 闭环 | PhysX（CPU，500 Hz） | [configs/halo/](configs/halo/) | [docs/halo.md](docs/halo.md) |
+| HALO G1 | 原生 29 关节 G1 爬桌（crawl）、弯腰过桌（crouch）、坐沙发（sit），GEAR-SONIC 闭环；Kimodo wheel 安装及新参考生成见任务文档第 6 节 | PhysX（CPU，500 Hz） | [configs/halo/](configs/halo/) | [docs/halo.md](docs/halo.md) |
 | 电池拆解 | 双 KR210：电动螺丝刀靠批头接触拧出四颗螺丝放入篮子，平行夹爪摩擦夹起 12 kg 盖板放到托盘 | PhysX（CPU，240 Hz） | [configs/battery_disassembly/](configs/battery_disassembly/) | [docs/battery_disassembly.md](docs/battery_disassembly.md) |
 | 桌面抓放 | 家居桌面上 Franka 用 Isaac Sim 自带 cuMotion 规划，摩擦抓起木块放到放置位（苹果为障碍），2 集位置抖动 | PhysX（CPU，120 Hz） | [configs/tabletop_pickplace/](configs/tabletop_pickplace/) | [docs/tabletop_pickplace.md](docs/tabletop_pickplace.md) |
 | 桌面轨迹回放 | 在源布局下回放桌面抓放数据集的 LeRobot `action`，不调规划器，复验抓放与轨迹一致性 | PhysX（CPU，120 Hz） | [configs/tabletop_replay/](configs/tabletop_replay/) | [docs/tabletop_replay.md](docs/tabletop_replay.md) |
@@ -82,6 +82,60 @@ uv lock                                    # 更新 uv.lock（不创建运行时
 `assets/TabletopReplay/`（桌面轨迹回放）；
 其余资产在 `assets/bak/`。
 本项目同时运行的 Isaac Sim 实例不超过两个。
+
+### 公共依赖与安装位置
+
+2026-11-16 本机核对：Linux x86_64，Isaac Sim `6.2.0-rc.14+release.52805.02189a84.gl`，
+SDK 内 Python **3.12.14**。`app` 实际指向 `/home/fufa/isaacsim`；以下是当前环境快照，
+不是其它 Isaac 版本的兼容保证。两张 GPU 均为 RTX5880-Ada-48Q（每张 49152 MiB），驱动 `570.172.18`。
+PhysX 使用 CPU 不代表可以省去 RTX GPU：Kit 相机与渲染仍使用 GPU；纯 SDK、无 Kit 的 CPU 诊断路径另见物理求解器文档。
+
+| 公共依赖 | 本机版本 | 用途 | 相对于 `/home/fufa/isaacsim/` 的安装目录 |
+|---|---|---|---|
+| NumPy / Pillow | 2.3.1 / 12.3.0 | 数值、图像和预览 | `extscache/omni.kit.pip_archive-0.0.0+187cf21b.lx64.cp312/pip_prebundle/` |
+| PyArrow | 26.0.0 | LeRobot v3 Parquet 读写 | `kit/python/lib/python3.12/site-packages/` |
+| Dynaconf / structlog / Typer | 3.3.5 / 26.1.0 / 0.27.3 | 配置、日志、CLI | `kit/python/lib/python3.12/site-packages/` |
+| Pydantic | 2.11.10 | 配置校验 | 同上方 `omni.kit.pip_archive` 的 `pip_prebundle/` |
+| PyYAML | 6.0.3 | YAML 配置和模型描述 | `exts/omni.pip.compute/pip_prebundle/` |
+| pytest / Ruff（dev） | 9.2.0 / 0.17.3 | 测试、代码检查 | `kit/python/lib/python3.12/site-packages/` |
+
+项目自身通过 editable 安装注册在 Isaac 的 `site-packages`，源码仍是仓库中的 `real2sim2real/`。
+各任务的基础 Python 依赖通过 `.[dev]` 安装；HALO 新动作生成另需 Kimodo wheel、可选依赖和权重，见任务文档。
+Newton、MuJoCo、Warp、cuMotion、Lula、Flow 等优先使用 Isaac 已提供的扩展，具体版本、位置及启用方式分别写在任务文档中，
+不把它们当成普通 pip 缺包直接安装或升级。LeRobot v3 是数据格式，本仓库的任务读写代码不要求安装官方 `lerobot` 包。
+
+系统工具当前为 `/usr/bin/ffmpeg`、`/usr/bin/ffprobe`（均 6.1.1），以及 `/usr/bin/cc`（GCC 13.3.0）。
+录制/视频校验需要前两项；启用 GPU 预算时钟补丁的采集器还需要 `cc`、libc、libdl、pthread 和 libstdc++，
+补丁当前只适用于 Linux x86_64。Ubuntu/Debian 缺工具时分别安装 `ffmpeg`、`build-essential` 系统包，
+不用 pip 包代替这些可执行文件。具体任务是否需要编译器见下表。
+
+| 任务环境说明 | 额外运行组件 | C 编译器适用范围 |
+|---|---|---|
+| [物理求解器验证](docs/physic_solver.md) | Newton / MuJoCo / Warp，PhysX Franka 路线另用 Lula | UR5e / 双 UR5e 电批正式采集入口 |
+| [分拣包裹](docs/sorting.md) | Newton / MuJoCo CPU / CUDA VBD | 当前分拣入口不编译预算时钟补丁 |
+| [机器狗巡检](docs/fire_inspection.md) | PhysX + Flow 烟火扩展 | 当前巡检入口不需要 |
+| [HALO](docs/halo.md#6-依赖与安装) | PhysX + ONNX Runtime / SciPy；新轨迹另用 Kimodo | 重建完整 Kimodo wheel 时需要 |
+| [电池拆解](docs/battery_disassembly.md) | PhysX + 项目内 NumPy IK | 启用 `monotonic_render_budget_clock` 的采集 |
+| [桌面抓放](docs/tabletop_pickplace.md) | PhysX + 内置 cuMotion | 正式采集器默认启用补丁 |
+| [桌面轨迹回放](docs/tabletop_replay.md) | PhysX + 已验收抓放数据集 | 正式采集器默认启用补丁 |
+
+`./scripts/rsr` 可用 `RSR_ISAACSIM_HOME` 指定另一份 SDK，`RSR_ASSETS_ROOT` 指定资产根目录；
+显式写 `./app/python.sh` 的命令仍使用 `app`，迁机时应一并核对软链接。CLI `-c` 选择配置并设置 `RSR_SETTINGS_FILE`，
+`RSR_<SECTION>__<FIELD>` 覆盖对应配置字段；不要把旧项目 `.venv` 或整个 `site-packages` 放到全局 `PYTHONPATH`。
+
+无 Kit 的公共自检：
+
+```bash
+./app/python.sh -c 'import sys, numpy, PIL, pyarrow, dynaconf, pydantic, yaml, structlog, typer; print(sys.executable, sys.version)'
+command -v ffmpeg ffprobe
+ffmpeg -hide_banner -encoders | rg libx264
+./app/python.sh -m real2sim2real.core.cli list-backends
+./app/python.sh -m pip check
+```
+
+本次公共包及各任务专项导入、SDK 路径检查通过。`pip check` 当前仍有 3 项既有缺失：两个 simready 包缺
+`usd-validation-nvidia`，`msal` 缺 `pyjwt`；这些不是本次任务依赖变动，不将该命令记作通过。
+文档核对未重新执行各任务的完整物理或正式渲染；任务章节中的历史结果仍按原运行环境解读。
 
 ## 目录结构
 
