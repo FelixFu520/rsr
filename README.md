@@ -8,11 +8,14 @@ Job 都是独立注册的后端，复用同一个 `IsaacsimWorld` 和固定的 J
 
 > Agent / 贡献者：先读 [`AGENTS.md`](AGENTS.md)（目录约定、扩展后端、配置与 CLI 约定）。
 
+香蕉切割示例已迁入求解器验证任务：运行 `./app/python.sh scripts/physic_solver/collect_banana_cutting.py`，
+配置与验收说明见 [香蕉运行时切割](docs/physic_solver.md#11-香蕉运行时切割从-cuttingv1-迁移)。
+
 ## 任务
 
 | 任务 | 内容 | 物理 | 配置 | 文档 |
 |---|---|---|---|---|
-| 求解器验证 | Franka 抓放衣服／方块；package01–08 的位置、重量、种类与摇晃／附着矩阵；连续主轴螺纹装配 | Newton（Featherstone、MuJoCo、XPBD、VBD）、PhysX、hybrid、hydroelastic接触 | [configs/physic_solver/](configs/physic_solver/) | [docs/physic_solver.md](docs/physic_solver.md) |
+| 求解器验证 | Franka 抓放衣服／方块；package01–08 的位置、重量、种类与摇晃／附着矩阵；连续主轴螺纹装配；香蕉运行时网格切割 | Newton（Featherstone、MuJoCo、XPBD、VBD）、PhysX、hybrid、hydroelastic接触 | [configs/physic_solver/](configs/physic_solver/) | [docs/physic_solver.md](docs/physic_solver.md) |
 | 分拣包裹 | Pro-M6 双臂把软包和纸箱依次从入料带经平台送到出料带，四路 1K 视频 | MuJoCo（CPU）+ VBD（CUDA） | [configs/sorting/](configs/sorting/) | [docs/sorting.md](docs/sorting.md) |
 | 机器狗巡检 | X30 一句话指令巡航仓库，发现火点、拍照、警示灯报警 | PhysX（CPU）+ Flow 火焰 | [configs/fire_inspection/](configs/fire_inspection/) | [docs/fire_inspection.md](docs/fire_inspection.md) |
 | HALO G1 | 原生 29 关节 G1 爬桌（crawl）、弯腰过桌（crouch）、坐沙发（sit），GEAR-SONIC 闭环；Kimodo wheel 安装及新参考生成见任务文档第 6 节 | PhysX（CPU，500 Hz） | [configs/halo/](configs/halo/) | [docs/halo.md](docs/halo.md) |

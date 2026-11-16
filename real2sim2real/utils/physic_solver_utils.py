@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import cache
 from typing import Any
 
@@ -1093,4 +1094,372 @@ def evaluate_dual_screw_rows(rows: list[dict], config: dict, pitch_m: float) -> 
         thread_contact_fraction=thread_fraction,
         maximum_arm_tracking_error_rad=arm_error,
         **protrusion,
+    )
+
+
+# ================================================================================================
+# Banana runtime plane clipping (migrated from cutting/v1); no FEM or cutting-force solver.
+# ================================================================================================
+
+
+@dataclass
+class CuttingMesh:
+    vertices: np.ndarray
+    faces: np.ndarray
+    materials: np.ndarray
+
+
+def cutting_banana() -> CuttingMesh:
+    """Generate the source demo's closed 29 cm banana in world metres."""
+    vertices, faces, mats = ([], [], [])
+    rings, sides = (65, 40)
+    for i in range(rings):
+        t = i / (rings - 1)
+        x = (t - 0.5) * 0.29
+        y = 0.035 * (2 * t - 1) ** 2 - 0.012
+        r = 0.021 * (0.12 + 0.88 * np.sin(np.pi * t) ** 0.38)
+        for j in range(sides):
+            a = 2 * np.pi * j / sides
+            ridge = 1 + 0.045 * np.cos(5 * a)
+            vertices.append([x, y + r * np.cos(a) * ridge, 0.058 + r * 0.9 * np.sin(a) * ridge])
+    for i in range(rings - 1):
+        for j in range(sides):
+            a = i * sides + j
+            b = i * sides + (j + 1) % sides
+            c = b + sides
+            d = a + sides
+            faces.extend([[a, b, c], [a, c, d]])
+            material_id = 1 if j % 8 in (0, 1) else 0
+            if i < 2 or i > rings - 4:
+                material_id = 2
+            mats.extend([material_id, material_id])
+    for ring, reverse in [(0, True), (rings - 1, False)]:
+        center = len(vertices)
+        vertices.append(np.mean(vertices[ring * sides : (ring + 1) * sides], axis=0))
+        for j in range(sides):
+            tri = [center, ring * sides + j, ring * sides + (j + 1) % sides]
+            faces.append(tri[::-1] if reverse else tri)
+            mats.append(2)
+    return CuttingMesh(np.asarray(vertices), np.asarray(faces), np.asarray(mats))
+
+
+def cutting_plane_basis(normal: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Construct orthonormal coordinates in a cutting plane."""
+    normal = np.asarray(normal, dtype=float)
+    normal /= np.linalg.norm(normal)
+    ref = np.array([0.0, 0.0, 1.0]) if abs(normal[2]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = np.cross(ref, normal)
+    u /= np.linalg.norm(u)
+    return (u, np.cross(normal, u))
+
+
+def cutting_clip_half(
+    mesh: CuttingMesh, origin: np.ndarray, normal: np.ndarray, sign: int
+) -> CuttingMesh | None:
+    """Sutherland–Hodgman triangles + ordered planar intersection cap.
+
+    v1 supports a single simple convex cross section (banana cross sections).
+    Existing material assignments survive repeated cuts. Vertices are welded.
+    """
+    vertices = []
+    faces = []
+    mats = []
+    index = {}
+    segments = []
+
+    def vi(p):
+        key = tuple(np.round(p, 9))
+        if key not in index:
+            index[key] = len(vertices)
+            vertices.append(p)
+        return index[key]
+
+    def triangle(tri, mat):
+        ids = [vi(p) for p in tri]
+        if (
+            len(set(ids)) == 3
+            and np.linalg.norm(np.cross(tri[1] - tri[0], tri[2] - tri[0])) > 1e-13
+        ):
+            faces.append(ids)
+            mats.append(mat)
+
+    for face, mat in zip(mesh.faces, mesh.materials, strict=True):
+        poly = mesh.vertices[face]
+        result = []
+        hits = []
+        ds = (poly - origin) @ normal * sign
+        for i in range(3):
+            a, b = (poly[i], poly[(i + 1) % 3])
+            da, db = (ds[i], ds[(i + 1) % 3])
+            if da >= -1e-10:
+                result.append(a)
+            if abs(da) <= 1e-10:
+                hits.append(a)
+            if da > 1e-10 and db < -1e-10 or (da < -1e-10 and db > 1e-10):
+                p = a + (b - a) * da / (da - db)
+                result.append(p)
+                hits.append(p)
+        if hits:
+            unique_hits = np.unique(np.round(np.asarray(hits), 9), axis=0)
+            if len(unique_hits) == 2:
+                segments.extend(unique_hits)
+        for i in range(1, len(result) - 1):
+            triangle([result[0], result[i], result[i + 1]], int(mat))
+    if not segments:
+        return None
+    ring = np.unique(np.round(np.asarray(segments), 9), axis=0)
+    center = ring.mean(axis=0)
+    u, v = cutting_plane_basis(normal)
+    angles = np.arctan2((ring - center) @ v, (ring - center) @ u)
+    ring = ring[np.argsort(angles)]
+    for i in range(len(ring)):
+        tri = [center, ring[i], ring[(i + 1) % len(ring)]]
+        if sign > 0:
+            tri = tri[::-1]
+        triangle(tri, 3)
+    return CuttingMesh(np.asarray(vertices), np.asarray(faces), np.asarray(mats))
+
+
+def cutting_split(
+    mesh: CuttingMesh, origin: Any, normal: Any
+) -> tuple[CuttingMesh, CuttingMesh] | None:
+    """Split a straddling simple convex section and cap both new boundaries."""
+    normal = np.asarray(normal, dtype=float)
+    normal /= np.linalg.norm(normal)
+    origin = np.asarray(origin, dtype=float)
+    distances = (mesh.vertices - origin) @ normal
+    if distances.min() > -1e-05 or distances.max() < 1e-05:
+        return None
+    return (cutting_clip_half(mesh, origin, normal, -1), cutting_clip_half(mesh, origin, normal, 1))
+
+
+def cutting_signed_volume(mesh: CuttingMesh) -> float:
+    """Integrate oriented triangle volume in cubic metres."""
+    a, b, c = mesh.vertices[mesh.faces].transpose(1, 0, 2)
+    return float(np.sum(np.einsum("ij,ij->i", a, np.cross(b, c))) / 6)
+
+
+def cutting_mesh_report(mesh: CuttingMesh) -> dict:
+    """Count manifold edges and measure enclosed volume."""
+    edges = {}
+    for a, b, c in mesh.faces:
+        for i, j in [(a, b), (b, c), (c, a)]:
+            edge = tuple(sorted((int(i), int(j))))
+            edges[edge] = edges.get(edge, 0) + 1
+    return dict(
+        vertices=len(mesh.vertices),
+        triangles=len(mesh.faces),
+        nonmanifold_edges=sum(n != 2 for n in edges.values()),
+        volume_m3=abs(cutting_signed_volume(mesh)),
+    )
+
+
+def cutting_material(
+    stage: Any,
+    name: str,
+    color: tuple[float, float, float],
+    rough: float = 0.4,
+    metal: float = 0,
+    texture: Any = None,
+) -> Any:
+    """Author a PreviewSurface with optional task-local texture."""
+    from pxr import Gf, Sdf, UsdShade
+
+    m = UsdShade.Material.Define(stage, "/World/Looks/" + name)
+    s = UsdShade.Shader.Define(stage, m.GetPath().AppendChild("Surface"))
+    s.CreateIdAttr("UsdPreviewSurface")
+    s.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*color))
+    s.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(rough)
+    s.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(metal)
+    m.CreateSurfaceOutput().ConnectToSource(s.ConnectableAPI(), "surface")
+    if texture:
+        uv = UsdShade.Shader.Define(stage, m.GetPath().AppendChild("UV"))
+        uv.CreateIdAttr("UsdPrimvarReader_float2")
+        uv.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+        tex = UsdShade.Shader.Define(stage, m.GetPath().AppendChild("Texture"))
+        tex.CreateIdAttr("UsdUVTexture")
+        tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(str(texture))
+        tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
+            uv.ConnectableAPI(), "result"
+        )
+        tex.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("sRGB")
+        s.GetInput("diffuseColor").ConnectToSource(tex.ConnectableAPI(), "rgb")
+    return m
+
+
+def cutting_author_mesh(
+    stage: Any,
+    path: str,
+    mesh: CuttingMesh,
+    materials: list[Any],
+    offset: Any = None,
+) -> Any:
+    """Author triangle geometry, smooth peel normals and independent flat cap UVs."""
+    from pxr import Sdf, UsdGeom, UsdShade, Vt
+
+    vertices = mesh.vertices if offset is None else mesh.vertices - offset
+    prim = UsdGeom.Mesh.Define(stage, path)
+    prim.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(vertices.astype("float32")))
+    prim.CreateFaceVertexCountsAttr([3] * len(mesh.faces))
+    prim.CreateFaceVertexIndicesAttr(mesh.faces.flatten().tolist())
+    prim.CreateSubdivisionSchemeAttr("none")
+    prim.CreateDoubleSidedAttr(True)
+    tri = vertices[mesh.faces]
+    fn = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    fn /= np.maximum(np.linalg.norm(fn, axis=1)[:, None], 1e-12)
+    vn = np.zeros_like(vertices)
+    for j in range(3):
+        np.add.at(vn, mesh.faces[:, j], fn)
+    vn /= np.maximum(np.linalg.norm(vn, axis=1)[:, None], 1e-12)
+    normals = vn[mesh.faces]
+    normals[mesh.materials == 3] = fn[mesh.materials == 3, None, :]
+    prim.CreateNormalsAttr(Vt.Vec3fArray.FromNumpy(normals.reshape(-1, 3).astype("float32")))
+    prim.SetNormalsInterpolation("faceVarying")
+    uv = np.zeros((len(mesh.faces), 3, 2))
+    groups = {}
+    for i in np.flatnonzero(mesh.materials == 3):
+        key = tuple(np.round(np.r_[fn[i], fn[i] @ tri[i, 0]], 5))
+        groups.setdefault(key, []).append(i)
+    for ids in groups.values():
+        points = np.unique(np.round(tri[ids].reshape(-1, 3), 8), axis=0)
+        normal = fn[ids[0]]
+        u, v = cutting_plane_basis(normal)
+        lo = np.array([(points @ u).min(), (points @ v).min()])
+        hi = np.array([(points @ u).max(), (points @ v).max()])
+        for i in ids:
+            uv[i] = (np.stack([tri[i] @ u, tri[i] @ v], axis=-1) - lo) / np.maximum(hi - lo, 1e-05)
+    UsdGeom.PrimvarsAPI(prim).CreatePrimvar(
+        "st", Sdf.ValueTypeNames.TexCoord2fArray, "faceVarying"
+    ).Set(Vt.Vec2fArray.FromNumpy(uv.reshape(-1, 2).astype("float32")))
+    for i, m in enumerate(materials):
+        ids = np.flatnonzero(mesh.materials == i).tolist()
+        if not ids:
+            continue
+        subset = UsdGeom.Subset.Define(stage, path + f"/Material_{i}")
+        subset.CreateElementTypeAttr("face")
+        subset.CreateFamilyNameAttr("materialBind")
+        subset.CreateIndicesAttr(ids)
+        UsdShade.MaterialBindingAPI.Apply(subset.GetPrim()).Bind(m)
+    return prim
+
+
+def cutting_knife_pose(
+    time_s: float,
+    positions: tuple[float, ...],
+    angles_deg: tuple[float, ...],
+    start_s: float = 1.0,
+    cycle_s: float = 1.8,
+) -> tuple[int, float, np.ndarray, np.ndarray, np.ndarray]:
+    """Return the source demo's continuous downward slice, draw and lift trajectory."""
+    cycle = int(np.clip((time_s - start_s) / cycle_s, 0, len(positions) - 1))
+    phase = float(np.clip((time_s - start_s - cycle * cycle_s) / cycle_s, 0, 1))
+    angle = np.radians(angles_deg[cycle])
+    x = positions[cycle]
+    if phase < 0.2:
+        z, draw = 0.15, -0.018
+    elif phase < 0.62:
+        u = (phase - 0.2) / 0.42
+        u = u * u * (3 - 2 * u)
+        z, draw = 0.15 - 0.117 * u, -0.018 + 0.025 * u
+    elif phase < 0.82:
+        z, draw = 0.033, 0.007
+    else:
+        u = (phase - 0.82) / 0.18
+        u = u * u * (3 - 2 * u)
+        z, draw = 0.033 + 0.117 * u, 0.007 - 0.025 * u
+    end_s = start_s + len(positions) * cycle_s
+    if time_s > end_s:
+        u = float(np.clip((time_s - end_s) / 0.8, 0, 1))
+        u = u * u * (3 - 2 * u)
+        z, x, draw = 0.15 + 0.04 * u, positions[-1] + 0.366 * u, -0.018 + 0.268 * u
+    normal = np.array([np.cos(angle), np.sin(angle), 0])
+    tangent = np.array([-np.sin(angle), np.cos(angle), 0])
+    xyz = np.array([x, 0, z]) + draw * tangent
+    return cycle, phase, np.r_[xyz, angle], normal, tangent
+
+
+def cutting_evaluate(
+    events: list[dict],
+    rows: list[dict],
+    *,
+    expected_cuts: int,
+    maximum_volume_relative_error: float,
+    minimum_fragment_motion_m: float,
+    maximum_support_penetration_m: float,
+    meshes: dict[str, CuttingMesh],
+    duration_s: float,
+    physics_dt: float,
+) -> dict:
+    """Recompute topology, volume, rigid motion and support checks from persisted inputs."""
+    reports = {path: cutting_mesh_report(mesh) for path, mesh in meshes.items()}
+    errors = []
+    for event in events:
+        before = reports[event["old_path"]]["volume_m3"]
+        after = sum(reports[event[key]]["volume_m3"] for key in ("fragment_path", "remaining_path"))
+        errors.append(abs(after - before) / before)
+    motion, drops, final_gaps, penetration = {}, {}, {}, 0.0
+    expected_pieces = expected_cuts + 1
+    finite = True
+    for row in rows:
+        finite &= bool(np.isfinite(row["knife"]).all())
+        for piece in row["pieces"]:
+            transform = np.asarray(piece["transform"])
+            center = np.asarray(piece["birth_center_m"])
+            finite &= bool(np.isfinite(transform).all())
+            path = piece["path"]
+            displacement = float(np.linalg.norm(np.asarray(piece["position_m"]) - center))
+            motion[path] = max(motion.get(path, 0), displacement)
+            drops[path] = max(drops.get(path, 0), float(center[2] - piece["position_m"][2]))
+            vertices = meshes[path].vertices - center
+            world = vertices @ transform[:3, :3] + transform[3, :3]
+            on_board = (np.abs(world[:, 0]) <= 0.2325) & (np.abs(world[:, 1]) <= 0.1475)
+            support = np.where(on_board, 0.032, 0.0)
+            penetration = max(penetration, float(np.max(support - world[:, 2])))
+            final_gaps[path] = float(np.min(world[:, 2] - support))
+    times = np.array([row["time_s"] for row in rows])
+    checks = dict(
+        cut_count=len(events) == expected_cuts,
+        closed_meshes=bool(reports) and all(r["nonmanifold_edges"] == 0 for r in reports.values()),
+        volume_conservation=len(errors) == expected_cuts
+        and max(errors, default=1.0) <= maximum_volume_relative_error,
+        fragment_motion=len(motion) == expected_pieces
+        and all(x >= minimum_fragment_motion_m for x in motion.values()),
+        all_final_pieces_dynamic=len(motion) == expected_pieces
+        and bool(events)
+        and events[-1]["remaining_path"] in motion,
+        gravity_drop=len(drops) == expected_pieces
+        and all(drop >= minimum_fragment_motion_m for drop in drops.values()),
+        final_support=len(final_gaps) == expected_pieces
+        and all(abs(gap) <= maximum_support_penetration_m for gap in final_gaps.values()),
+        support_penetration=penetration <= maximum_support_penetration_m,
+        finite_states=finite and bool(rows),
+        full_duration=len(times) > 1 and abs(times[-1] - duration_s) <= physics_dt * 0.01,
+        physics_cadence=len(times) > 1
+        and bool(np.allclose(np.diff(times), physics_dt, atol=1e-8, rtol=0)),
+        unmodified_birth=bool(events)
+        and all(
+            e["birth_offset_m"] == [0, 0, 0]
+            and e["initial_velocity_mps"] == [0, 0, 0]
+            and e.get("initial_angular_velocity_deg_s") == [0, 0, 0]
+            for e in events
+        ),
+    )
+    checks = {key: bool(value) for key, value in checks.items()}
+    return dict(
+        success=all(checks.values()),
+        checks=checks,
+        failed_checks=[key for key, value in checks.items() if not value],
+        cuts=len(events),
+        pieces=len(events) + 1,
+        maximum_volume_relative_error=max(errors, default=0),
+        fragment_motion_m=motion,
+        fragment_gravity_drop_m=drops,
+        final_support_gap_m=final_gaps,
+        dynamic_pieces=len(motion),
+        maximum_support_penetration_m=penetration,
+        mesh_reports=reports,
+        scope="runtime_mesh_split_and_physx_fragments",
+        remainder_fixed=not bool(events and events[-1]["remaining_path"] in motion),
+        knife_contact_force_model=False,
+        fem=False,
     )

@@ -39,7 +39,7 @@
 
 | 任务 | 后缀 | 资产目录 | 后端名（scene / robot / planner / job） |
 |------|------|----------|------------------------------------------|
-| 物理求解器验证（含包裹矩阵／螺纹装配） | `physic_solver` | `assets/PhysicSolver/` | `pickplace_cloth`、`pickplace_rigid`、`newton_cloth_franka`、`pickplace_package`、`pickplace_carton`、`screw_assembly`、`dual_screw_assembly` / `screw_spindle`、`ur5e_screwdriver`、`dual_ur5e_screwdriver`、`franka_carton_gripper`、`franka_newton`、`franka_physx`、`franka_package_pads` / `pickplace_cloth`、`newton_cloth_franka`、`pickplace_package`、`pickplace_carton`、`screw_assembly`、`ur5e_screwdriver`、`dual_ur5e_screwdriver` / `pickplace_cloth`、`pickplace_carton`、`screw_assembly` |
+| 物理求解器验证（含包裹矩阵／螺纹装配／香蕉切割） | `physic_solver` | `assets/PhysicSolver/` | `pickplace_cloth`、`pickplace_rigid`、`newton_cloth_franka`、`pickplace_package`、`pickplace_carton`、`screw_assembly`、`dual_screw_assembly`、`banana_cutting` / `scripted_knife`、`screw_spindle`、`ur5e_screwdriver`、`dual_ur5e_screwdriver`、`franka_carton_gripper`、`franka_newton`、`franka_physx`、`franka_package_pads` / `banana_cutting`、`pickplace_cloth`、`newton_cloth_franka`、`pickplace_package`、`pickplace_carton`、`screw_assembly`、`ur5e_screwdriver`、`dual_ur5e_screwdriver` / `banana_cutting`、`pickplace_cloth`、`pickplace_carton`、`screw_assembly` |
 | 分拣包裹 | `sorting` | `assets/SortingPackage/` | `sorting_package` / `pro_m6_newton` / `sorting_package`、`sorting_stream` / `sorting_package` |
 | 机器狗巡检 | `fire_inspection` | `assets/FireInspection/` | `fire_warehouse` / `x30_kinematic` / `fire_patrol` / `fire_inspection` |
 | HALO G1（爬行／弯腰过桌、落座） | `halo` | `assets/Halo/` | `halo_home` / `g1_sonic` / `sonic_tracking` / `halo` |
@@ -176,6 +176,7 @@ Entry point 组名以 `pyproject.toml` / `core/registry.py` 为准，勿自创�
     （双臂穿出螺母及旋转涂装：加 `--config configs/physic_solver/mujoco_hydroelastic_screw04_dual_through.toml`；
     松螺母版本使用 `configs/physic_solver/mujoco_hydroelastic_screw05_dual_release.toml`；
     松螺栓端并保持螺母使用 `configs/physic_solver/mujoco_hydroelastic_screw06_bolt_release.toml`）。
+  - 香蕉运行时切割：`./app/python.sh scripts/physic_solver/collect_banana_cutting.py`（调试配置 `configs/physic_solver/kinematic_tgs_banana01_five_cuts_debug.toml`；详见 `docs/physic_solver.md` 第 11 节）。
   - 分拣包裹：`./scripts/sorting/run_sorting_showcase.sh outputs/sorting`（内部调用 `rsr collect render-sorting`）
   - 机器狗巡检：`./scripts/rsr collect run -c configs/fire_inspection/x30_physx_warehouse.toml`
   - HALO G1：`./scripts/rsr collect run -c configs/halo/g1_physx_{crawl,crouch,sit}.toml`（调试用 `*_debug.toml`）

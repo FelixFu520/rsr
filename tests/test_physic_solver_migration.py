@@ -70,10 +70,13 @@ def test_flat_configs_match_output_names_and_640_capture_contract():
         "mujoco_hydroelastic_screw06_bolt_release",
         "mujoco_hydroelastic_screw06_bolt_release_debug",
     }
-    assert {p.stem for p in paths} == set(PHYSIC_SOLVER_CASE_NAMES.values()) | arm_cases
+    banana_cases = {"kinematic_tgs_banana01_five_cuts", "kinematic_tgs_banana01_five_cuts_debug"}
+    assert {p.stem for p in paths} == set(
+        PHYSIC_SOLVER_CASE_NAMES.values()
+    ) | arm_cases | banana_cases
     assert len(PHYSIC_SOLVER_PACKAGE_CASES) == 18
     for path in paths:
-        if path.stem in arm_cases:
+        if path.stem in arm_cases | banana_cases:
             continue  # New demos have their own formal/debug rendering contract below.
         config = tomllib.loads(path.read_text())
         assert "inherit" not in config

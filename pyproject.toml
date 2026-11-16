@@ -59,6 +59,7 @@ stub = "real2sim2real.simworld.stub:StubSimWorld"
 isaacsim = "real2sim2real.simworld.isaacsim:IsaacsimWorld"
 
 [project.entry-points."real2sim2real.scene.backends"]
+banana_cutting = "real2sim2real.scene.scene_physic_solver:BananaScene"
 pickplace_carton = "real2sim2real.scene.scene_physic_solver:CartonScene"
 screw_assembly = "real2sim2real.scene.scene_physic_solver:ScrewScene"
 dual_screw_assembly = "real2sim2real.scene.scene_physic_solver:DualScrewScene"
@@ -74,6 +75,7 @@ battery_workcell = "real2sim2real.scene.scene_battery_disassembly:BatteryWorkcel
 tabletop_home = "real2sim2real.scene.scene_tabletop_pickplace:TabletopHomeScene"
 
 [project.entry-points."real2sim2real.robot.backends"]
+scripted_knife = "real2sim2real.robot.robot_physic_solver:ScriptedKnifeRobot"
 franka_carton_gripper = "real2sim2real.robot.robot_physic_solver:CartonGripperRobot"
 screw_spindle = "real2sim2real.robot.robot_physic_solver:ScrewSpindleRobot"
 ur5e_screwdriver = "real2sim2real.robot.robot_physic_solver:Ur5eScrewdriverRobot"
@@ -89,6 +91,7 @@ kr210_dual = "real2sim2real.robot.robot_battery_disassembly:Kr210DualRobot"
 franka_tabletop = "real2sim2real.robot.robot_tabletop_pickplace:FrankaTabletopRobot"
 
 [project.entry-points."real2sim2real.planner.backends"]
+banana_cutting = "real2sim2real.planner.planner_physic_solver:BananaPlanner"
 pickplace_carton = "real2sim2real.planner.planner_physic_solver:CartonPlanner"
 screw_assembly = "real2sim2real.planner.planner_physic_solver:ScrewPlanner"
 ur5e_screwdriver = "real2sim2real.planner.planner_physic_solver:ScrewArmPlanner"
@@ -106,6 +109,7 @@ cumotion_pickplace = "real2sim2real.planner.planner_tabletop_pickplace:CumotionP
 lerobot_replay = "real2sim2real.planner.planner_tabletop_replay:LeRobotReplayPlanner"
 
 [project.entry-points."real2sim2real.job.backends"]
+banana_cutting = "real2sim2real.job.job_physic_solver:BananaJob"
 pickplace_carton = "real2sim2real.job.job_physic_solver:CartonJob"
 screw_assembly = "real2sim2real.job.job_physic_solver:ScrewJob"
 stub = "real2sim2real.job.job_stub:StubJob"

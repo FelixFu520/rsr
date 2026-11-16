@@ -1,0 +1,71 @@
+# Scripted knife + runtime plane clipping + gravity-driven PhysX rigid fragments.
+[sim_world]
+backend = "isaacsim"
+physics_engine = "physx"
+physx_solver = "TGS"
+physx_enable_ccd = true
+device = "cpu"
+physics_dt = 0.0020833333333333333
+rendering_dt = 0.03333333333333333
+headless = true
+renderer = "PathTracing"
+width = 1024
+height = 576
+active_gpu = 1
+multi_gpu = false
+samples_per_pixel_per_frame = 64
+pathtracing_max_bounces = 6
+pathtracing_denoiser = true
+synchronous_capture = true
+rt_subframes = 4
+warmup_frames = 2
+
+[scene]
+backend = "banana_cutting"
+asset_dir = "assets/PhysicSolver/Banana"
+density_kg_m3 = 950
+static_friction = 0.48
+dynamic_friction = 0.35
+restitution = 0.04
+fragment_contact_offset_m = 0.0025
+[[scene.cameras]]
+name = "overview"
+prim_path = "/World/Camera"
+pose_relative_to = "/World"
+resolution = [1024, 576]
+focal_length = 36
+horizontal_aperture = 20.955
+clipping_range = [0.005, 100]
+[scene.cameras.pose]
+position = [0.43, -0.65, 0.52]
+orientation_wxyz = [0.8304660215179844, 0.47679734133313983, 0.1434369519934488, 0.2498325903571605]
+
+[robot]
+backend = "scripted_knife"
+mesh_path = "assets/PhysicSolver/Banana/knife.json"
+
+[planner]
+backend = "banana_cutting"
+cut_positions_m = [-0.096, -0.052, -0.008, 0.038, 0.084]
+cut_angles_deg = [0, 12, -12, 16, -6]
+start_s = 1.0
+cycle_s = 1.8
+duration_s = 13
+blade_half_length_m = 0.105
+maximum_volume_relative_error = 0.000001
+minimum_fragment_motion_m = 0.001
+maximum_support_penetration_m = 0.002
+
+[job]
+backend = "banana_cutting"
+output_dir = "outputs/physic_solver/kinematic_tgs_banana01_five_cuts"
+max_steps = 6240
+timeout_s = 3600
+record_rgb = true
+[job.recorder]
+format = "lerobot_v3"
+fps = 30
+width = 1024
+height = 576
+task = "Five runtime mesh cuts of a banana with PhysX rigid fragments; scripted knife; all six pieces fall freely after the final cut."
+save_failed_episodes = true

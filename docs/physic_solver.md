@@ -788,3 +788,185 @@ MuJoCo迭代上限设为100，提高接触精度和收敛精度，其他任务�
 [任务开发skill](../.agents/skills/rsr-task-development/SKILL.md) 的
 “PathTracing 正式渲染期间不要并行其它 Kit/GPU 任务”，正式版须待GPU可独占时重新采集。
 已通过验收的高精度预览保留；所有对照、终止原因和实际参数见开发目录的 `run_note.json`。
+
+## 11. 香蕉运行时切割（从 cutting/v1 迁移）
+
+### 11.1 范围、模型和选型
+
+2026-11-16 从用户提供的 `/home/fufa/Projects/cutting/v1` 迁入本任务，源目录保持不变。
+这是 **运行时三角网格平面切割 + PhysX TGS 自由刚体切块**；没有 DiSECt、FEM、软组织形变、
+刀具接触力或真实裂纹传播。切割期间未切完的香蕉暂时固定，最后一刀后六块全部释放；刀具按脚本运动，无机械臂。当前实现仅支持香蕉的
+单个简单近凸截面，不能据此验证软材料切割力学。沿用源例子的 13 秒五刀、正切/斜切及六块闭合网格，
+交付 LeRobot v3、逐物理步轨迹、网格快照、USD 回放和验收报告；暂按单集、一路俯视斜相机采集。
+`/World/TopCamera` 保留为可切换的顶视相机，不额外录视频。
+
+本场景没有关节或柔体，使用公共 `IsaacsimWorld` 的 PhysX CPU TGS，480 Hz、CCD；
+Newton VBD/XPBD 没有为该例增加已验证的切割能力，因此不更换求解器。
+厨房 USD 为米制、Z-up，27 个 Mesh，无源动态刚体或碰撞 schema；运行时添加与可见砧板中央平面
+和台面相符的静态碰撞盒，切块用 convexHull。砧板顶面为 32 mm，避免源例子 31 mm 碰撞面与
+32 mm 可见平面的偏差。切块密度 950 kg/m³，静/动摩擦 0.48/0.35，恢复系数 0.04，
+接触预判距离 2.5 mm、rest offset 0.1 mm，位置/速度迭代 16/4。最终全部切块参与刚体碰撞；切割期间固定的未切部分仍无接触力模型。
+
+源例子在切块出生时额外施加 `[-3,-8,+8] mm` 位移、`[-0.055,-0.13,+0.04] m/s` 线速度，
+以及 `[40,110,-25] deg/s` 角速度。迁移版全部取消，切块在几何原位、零初始速度下进入 PhysX，
+靠重力和实际碰撞运动；分离程度因此小于原演示。数据语义是 scripted cutting simulation demo，
+不是机器人策略示教或 FEM 力学基准。
+
+### 11.2 迁移对照和资产
+
+| 源文件/内容 | 仓库中的实现 |
+|---|---|
+| `scripts/geometry.py` | `utils/physic_solver_utils.py` 的 `CuttingMesh`、`cutting_*`：香蕉、裁剪、封口、体积与验收 |
+| `run_demo.py` 场景、材质、切块出生 | `scene/scene_physic_solver.py` 的 `BananaScene` |
+| 原厨刀网格与位姿 | `robot/robot_physic_solver.py` 的 `ScriptedKnifeRobot`（后端 `scripted_knife`） |
+| 五刀轨迹与触发 | `planner/planner_physic_solver.py` 的 `BananaPlanner` |
+| 原独立 App、采集与回放 | `job/job_physic_solver.py` 的 `BananaJob`，走公共固定生命周期 |
+| `assets/` | `assets/PhysicSolver/Banana/`，原始资产逐字节复制 |
+| 原视频/验证脚本 | 新采集器、无 Kit 独立校验、独立 USD 回放校验；不复用源输出冒充迁移结果 |
+
+资产准备和复现：
+
+```bash
+./app/python.sh scripts/physic_solver/prepare_banana_assets.py /home/fufa/Projects/cutting/v1
+./app/python.sh -m pip install -e ".[dev]"
+./app/python.sh -m real2sim2real.core.cli list-backends
+```
+
+共 9 个资产文件 5,963,481 字节（约 5.69 MiB），包括可编辑 `.blend`、厨房 USD、刀具 JSON、木纹/石材/果肉贴图及其依赖；
+`provenance.json` 记录源目录、逐文件 SHA-256、大小、源代码哈希和未提供许可的事实。
+未新增 pip 包；使用 Isaac 自带 PhysX/USD 及现有 NumPy、Pillow、PyArrow、ffmpeg/ffprobe。
+运行时扫描厨房 USD 的全部 layer/贴图依赖，拒绝缺失依赖或任务资产目录外的引用；实际缺失数为 0。
+只复制资源，不在运行时写入资产目录，也不依赖源项目路径。
+
+### 11.3 运行与输出
+
+```bash
+# 调试：640×360 / 15 fps，MinimalRendering（RTX 低成本纹理预览）
+./app/python.sh scripts/physic_solver/collect_banana_cutting.py \
+  --config configs/physic_solver/kinematic_tgs_banana01_five_cuts_debug.toml
+
+# 仅物理：显式写入新的 debug 目录，仍执行完整生命周期
+RSR_JOB__RECORD_RGB=false RSR_JOB__OUTPUT_DIR=outputs/debug/physic_solver/banana_probe_new \
+  ./scripts/rsr collect run -c configs/physic_solver/kinematic_tgs_banana01_five_cuts_debug.toml
+
+# 正式：1024×576 / 30 fps，PathTracing 64 spp、6次反弹、降噪
+./app/python.sh scripts/physic_solver/collect_banana_cutting.py
+
+# 采集器会打印暂存目录，将下面的 <staging> 替换为该目录
+./app/python.sh scripts/physic_solver/validate_banana_cutting.py <staging>
+./app/python.sh scripts/physic_solver/validate_banana_replay.py <staging>
+# 查看 qa/overview_keyframes.jpg 和视频，在 qa/visual_review.json 记录 passed=true 及复核范围后发布
+./app/python.sh scripts/physic_solver/collect_banana_cutting.py --publish <staging>
+```
+
+正式/调试仅采集参数不同，物理步长和验收门限完全相同，前者 390 帧、后者 195 帧。
+采集器先在 `outputs/debug/physic_solver/` 暂存，物理和独立校验失败时保留证据；发布拒绝覆盖已有目录。
+正式目的目录为 `outputs/physic_solver/kinematic_tgs_banana01_five_cuts/`。
+CLI 也能直接运行相应 TOML；正式采集应使用上述采集器，避免把失败结果留在正式树。
+
+每次运行保存 `configuration.json`、`result.json`、`cut_events.json`、`trajectory.json`、
+`mesh_paths.json`、`meshes.npz`、`banana_cutting_replay.usdc`；RGB 开启时额外保存 `lerobot_v3/`。
+状态与动作都是 `[knife_x_m, knife_y_m, knife_z_m, knife_yaw_rad]` 四维脚本刀具坐标，
+RGB 与物理时间严格对齐。回放关闭所有刚体积分，用真实测得的变换和出生/隐藏时间，不重算物理。
+保持任务资产目录一起打包即可加载材质。
+
+### 11.4 验收与失败修复
+
+门限在 `BananaPlannerConfig` 和正式 TOML 中：五刀六块；所有网格边恰有两个邻面；
+每刀体积相对误差 ≤ `1e-6`；最终六块必须全部进入物理记录，每块真实位移及重力方向下落均 ≥ 1 mm；
+最终每块距支撑面的间隙绝对值 ≤ 2 mm，逐步支撑面穿透 ≤ 2 mm；
+状态有限，连续 13 秒、6240 个物理步，出生无位移或速度注入。
+独立校验从 NPZ 网格和每步轨迹重算，不照抄 Job 的成功字段；另查资产哈希、依赖闭包、
+切块出生时的几何位置、LeRobot 状态/动作对齐、H.264 全解码、帧数/fps/分辨率及关键帧。
+回放校验逐个检查 6241 个物理采样的可见块数、刚体姿态和刀具位置。
+
+失败证据均保留在 `outputs/debug/physic_solver/`：
+
+- `banana_physics_probe01`：120 Hz，穿透 2.54 mm；运行末尾遇到 NumPy bool JSON 序列化错误，
+  已改为原生 bool，保留原始轨迹/网格，未补写成功结果。
+- `banana_physics_probe02_ccd`：仅打开刚体 CCD，穿透仍为 2.54 mm；CCD 不能消除该离散接触误差。
+- `banana_physics_probe03_contact`：接触距离从 0.5 mm 提至 2.5 mm，穿透为 2.34 mm，仍拒收。
+- `banana_physics_probe04_240hz`：物理提高到 240 Hz并校准砧板碰撞顶面，最大穿透约 1.26 mm，通过。
+- 首次调试视频首帧材质尚未就绪；增加采集相机下 48 次渲染预热后重新采集，物理时间保持为零。
+
+正式结果与最终回归数见下面的实测记录。未使用官方 LeRobot SDK 加载；当前验收使用本仓库的
+Parquet/元数据和完整视频解码校验，不能据此声称已验证 SDK 训练兼容性。
+
+### 11.5 历史版结果（2026-11-16 UTC，已被第 11.6 节替代）
+
+此版漏掉末端第六块的刚体释放与验收，以下通过结论仅对应当时不完整的五块验收口径，
+不能作为六块均自由下落的结果。原文件保留用于对照。历史采集发布到 [kinematic_tgs_banana01_five_cuts](../outputs/physic_solver/kinematic_tgs_banana01_five_cuts/)，
+可直接查看 [视频](../outputs/physic_solver/kinematic_tgs_banana01_five_cuts/banana_cutting.mp4)
+和 [九帧拼图](../outputs/physic_solver/kinematic_tgs_banana01_five_cuts/qa/overview_keyframes.jpg)。
+
+| 验收项 | 实测 | 门限/要求 |
+|---|---|---|
+| 时长/物理步/视频帧 | 13 s / 3120 / 390 | 240 Hz 物理，30 fps，完整连续过程 |
+| 切割/最终块数 | 5 / 6 | 5 / 6 |
+| 所有历史及最终网格非流形边 | 0 | 0 |
+| 每刀最大体积相对误差 | `3.473677059522047e-16` | ≤ `1e-6` |
+| 五个自由切块的最大真实位移 | 15.252、11.556、7.711、10.718、9.306 mm | 每块 ≥ 1 mm |
+| 逐物理步最大支撑面穿透 | 1.263 mm | ≤ 2 mm |
+| 切块出生位移/线速度/角速度注入 | 全部为 0 | 全部为 0 |
+| 回放刚体姿态/刀具位置最大误差 | 0 / 0 | < `1e-8`，3121 个采样 |
+| 依赖缺失、任务资产目录外引用 | 0 / 0 | 0 / 0 |
+| LeRobot、完整 H.264 解码与帧同步 | 通过 | 390 帧、1024×576、30 fps |
+
+正式渲染循环约 786.4 秒。正式与预热后调试版的完整 `trajectory.json` 逐项相同，
+证明本次分辨率/fps/渲染质量变化没有改变测得的物理轨迹。已实际查看首帧、切割中原始 1K 图像、
+第五刀撤离画面以及覆盖 0–12.9 秒的九张解码关键帧；完整视频通过解码校验，未声称逐帧人工审阅。
+`validation.json` 和 `replay_validation.json` 均为 `success=true`，具体复核范围记录在
+`qa/visual_review.json`。运行对照保存在 `outputs/debug/physic_solver/banana_migration_runs.json`。
+
+回归：Ruff 通过，pytest 386 passed / 3 skipped（基线 377 / 3），全部 60 份配置校验通过，
+原有后端均仍可列举，stub 生命周期通过；没有改动其它任务的配置、资产或输出。
+资产实际复制 5,963,481 字节（约 5.69 MiB），不含小型 provenance 清单。
+已有正式结果时，重新采集加 `--output outputs/physic_solver/<新目录名>`，保留本次结果。
+
+### 11.6 修复末端第六块悬空（2026-11-16 UTC）
+
+用户指出历史视频中右端香蕉块悬空。根因：每刀仅释放左半块，最后 `Banana_5` 仍是无
+`RigidBodyAPI` 的固定网格；旧验收只统计五个 `Slice_*`，漏掉第六块。这是迁移遗漏。
+当前代码在最后一刀完成后，将最后剩余网格复用相同质量、摩擦和碰撞配置交给 PhysX，
+在几何原位、零线速度和零角速度下释放，不加入向下位移或推动。
+
+新增验收同时覆盖六块：动态记录数量必须是 6，最后 `remaining_path` 必须包含在内，
+每块重力方向下落和位移都至少 1 mm；最终每块网格到支撑面的间隙绝对值不超过 2 mm。
+该间隙和逐步穿透沿用原 2 mm 门限；独立校验同时验证最后一刀的两个新块都在出生时刻
+以原始几何位置进入轨迹。新增回归测试拒绝“只有五块动态记录”和“第六块没有下落”。
+
+240 Hz 释放第六块时，下落约 14.57 mm，但首次落板瞬间穿透达到 3.012 mm，拒收。
+只将物理频率提高为 480 Hz 后，最大穿透降至 1.477 mm，通过；正式/调试统一更新为
+480 Hz、6240 个物理步，13 秒时长与 30/15 fps 采集设置不变。六块最大竖直下落分别为
+14.169、10.136、7.542、8.737、8.755、13.571 mm；第六块最终最低顶点与砧板面的差为
+−0.784 mm。末端现在在最后一刀后自然落下并转动到砧板支撑面。
+
+物理探针、240 Hz 失败记录和调试视频保存在 `outputs/debug/physic_solver/banana_six_dynamic_*`
+及 `kinematic_tgs_banana01_five_cuts_six_dynamic_debug/`；对照记录见
+`outputs/debug/physic_solver/banana_six_dynamic_run_note.json`。旧视频保持不变并标为历史遗漏版本，
+新正式采集使用新的输出目录：
+
+```bash
+./app/python.sh scripts/physic_solver/collect_banana_cutting.py \
+  --output outputs/physic_solver/kinematic_tgs_banana01_five_cuts_six_dynamic
+```
+
+当前无 Kit 回归为 390 passed / 3 skipped；60 个配置校验和 Ruff 通过。
+
+本轮只跑物理的 240/480 Hz 对照分别耗时 5.27/8.76 秒；降低步长提高了接触质量，
+未改变几何、摩擦或 2 mm 门限。复现修正版正式采集：
+
+```bash
+./app/python.sh scripts/physic_solver/collect_banana_cutting.py \
+  --output outputs/physic_solver/kinematic_tgs_banana01_five_cuts_six_dynamic
+```
+
+修正版正式结果已完成，目录为
+[kinematic_tgs_banana01_five_cuts_six_dynamic](../outputs/physic_solver/kinematic_tgs_banana01_five_cuts_six_dynamic/)，
+[修正版视频](../outputs/physic_solver/kinematic_tgs_banana01_five_cuts_six_dynamic/banana_cutting.mp4)。
+本次 390 帧、1024×576、30 fps、PathTracing 64 spp，6240 个连续物理步；六块动态记录齐全，
+末块实测竖直下落 **13.571 mm**，六块最大支撑面穿透 **1.477 mm**，均通过 2 mm 门限。
+正式与本轮调试的完整物理轨迹逐值相同；正式采集循环耗时 1027.74 秒。
+九张解码关键帧和原始第 285 帧已视觉复核，确认右端块下落、旋转并在砧板上得到支撑，
+视频完整解码与独立数据校验通过。回归结果为 **390 passed / 3 skipped**、Ruff 通过、
+全部 60 份配置通过。原视频与源资产保持不变。

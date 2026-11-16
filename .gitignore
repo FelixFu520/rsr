@@ -233,3 +233,5 @@ __marimo__/
 .streamlit/secrets.toml
 
 !tests/test_physic_solver_migration.py
+
+!tests/test_banana_cutting.py

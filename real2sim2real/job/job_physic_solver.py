@@ -486,3 +486,216 @@ class CartonJob(ScrewJob):
         """Mount the Franka on the measured table instead of the screw-fixture origin."""
         self.robot.config.base_position = tuple(self.scene.robot_base_position)
         self.planner.prepare_initial_joints(self.robot, self.scene)
+
+
+# ================================================================================================
+# Banana mesh-cutting demonstration: measured PhysX poses, LeRobot data and independent USD replay.
+# ================================================================================================
+
+
+class BananaJobConfig(PhysicSolverJobConfig):
+    """Finite cutting capture; failed runs belong in the debug tree."""
+
+    backend: str = "banana_cutting"
+    output_dir: str = "outputs/debug/physic_solver/kinematic_tgs_banana01_five_cuts_debug"
+    record_rgb: bool = True
+    render_warmup_updates: int = Field(default=48, ge=0)
+
+
+class BananaJob(BaseJob):
+    """Reuse the common world lifecycle and keep cutting-specific recording in this Job."""
+
+    config_cls = BananaJobConfig
+
+    def __init__(self, config: BananaJobConfig | None = None) -> None:
+        super().__init__(config=config)
+        if self.sim_world.physics_engine != "physx":
+            raise ValueError("Banana fragments require PhysX")
+        if (self.scene.config.backend, self.robot.config.backend, self.planner.config.backend) != (
+            "banana_cutting",
+            "scripted_knife",
+            "banana_cutting",
+        ):
+            raise ValueError("Banana cutting requires its declared scene, knife and planner")
+        ratio = 1 / (self.config.recorder.fps * self.sim_world.config.physics_dt)
+        if not math.isclose(ratio, round(ratio), abs_tol=1e-8):
+            raise ValueError("Recorder fps must divide the physics frequency")
+        total = self.planner.config.duration_s / self.sim_world.config.physics_dt
+        if not math.isclose(total, round(total), abs_tol=1e-8) or self.config.max_steps < round(
+            total
+        ):
+            raise ValueError("duration_s must contain whole physics steps within max_steps")
+        frames = self.planner.config.duration_s * self.config.recorder.fps
+        if not math.isclose(frames, round(frames), abs_tol=1e-8):
+            raise ValueError("duration_s must contain whole recording frames")
+        self.record_stride = round(ratio)
+        self.recording_cameras = validate_camera_list(self.scene.config.cameras)
+        if self.config.record_rgb and not self.recording_cameras:
+            raise ValueError("RGB capture requires at least one named scene camera")
+        output = Path(self.config.output_dir)
+        if output.exists() and any(output.iterdir()):
+            raise FileExistsError(f"Choose a fresh banana output directory: {output}")
+
+    def before_start_simulation_hook(self) -> None:
+        """Require USD pose publication so the trace contains actual PhysX transforms."""
+        import carb
+        from isaacsim.core.simulation_manager import SimulationManager
+
+        carb.settings.get_settings().set_bool("/physics/updateToUsd", True)
+        carb.settings.get_settings().set_bool("/physics/updateVelocitiesToUsd", True)
+        if self.sim_world.config.renderer == "MinimalRendering":
+            carb.settings.get_settings().set_bool("/rtx/indirectDiffuse/enabled", False)
+        SimulationManager.enable_fabric(False)
+        self.planner.begin_episode(self.scene)
+        self.sim_world.reset()
+
+    def setup_gui_hook(self) -> None:
+        """Warm the loaded materials at the recording camera before physical time starts."""
+        PhysicSolverJob.setup_gui_hook(self)
+        if self.config.record_rgb:
+            for _ in range(self.config.render_warmup_updates):
+                self.sim_world.update()
+
+    def simulate(self) -> None:
+        """Sample every physical step, capture RGB at exact cadence, and retain failure evidence."""
+        import numpy as np
+
+        output = Path(self.config.output_dir).resolve()
+        output.mkdir(parents=True, exist_ok=True)
+        configs = {
+            name: getattr(self, name).config.model_dump(mode="json")
+            for name in ("sim_world", "scene", "robot", "planner")
+        }
+        configs["job"] = self.config.model_dump(mode="json")
+        (output / "configuration.json").write_text(json.dumps(configs, indent=2) + "\n")
+        recorder = None
+        result, error = {}, None
+        started = time.monotonic()
+        try:
+            if self.config.record_rgb:
+                settings = self.config.recorder
+                recorder = LeRobotV3Recorder(
+                    output / "lerobot_v3",
+                    fps=settings.fps,
+                    width=settings.width,
+                    height=settings.height,
+                    task=settings.task,
+                    robot_type="scripted_knife",
+                    joint_names=self.planner.action_names,
+                    action_names=self.planner.action_names,
+                    cameras={c.name: c.resolution for c in self.recording_cameras},
+                )
+            self.sim_world.play()
+            next_report = 0.0
+            while not self.planner.on_physics_step(self.robot):
+                if time.monotonic() - started > self.config.timeout_s:
+                    raise TimeoutError("Banana capture exceeded timeout_s")
+                self.planner.observe()
+                if recorder is not None and self.sim_world.physics_steps % self.record_stride == 0:
+                    PhysicSolverJob._capture_cameras(self, recorder)
+                    recorder.add_frame(self.robot.coordinates, self.robot.coordinates)
+                self.sim_world.step(render=False)
+                if time.monotonic() - started >= next_report:
+                    self.log.info(
+                        "Banana cutting progress",
+                        physics_steps=self.sim_world.physics_steps,
+                        cuts=len(self.scene.events),
+                        wall_s=time.monotonic() - started,
+                    )
+                    next_report = time.monotonic() - started + 30
+            self.planner.observe()
+            result = self.planner.result()
+            self._export_replay(output)
+            if recorder is not None:
+                if result["success"] or self.config.recorder.save_failed_episodes:
+                    dataset = recorder.finalize(episode_success=result["success"])
+                    result.update(
+                        frames=len(recorder.rows),
+                        dataset_use="simulation_demo" if result["success"] else "diagnostic",
+                    )
+                    (dataset / "meta/task_outcome.json").write_text(
+                        json.dumps({"physical_result": result, "configuration": configs}, indent=2)
+                        + "\n"
+                    )
+                else:
+                    recorder.discard(output / "diagnostics")
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            if recorder is not None and recorder.staging.exists():
+                recorder.discard(output / "diagnostics")
+            raise
+        finally:
+            if not result:
+                result = self.planner.result()
+            arrays = {}
+            for index, mesh in enumerate(self.scene.meshes.values()):
+                arrays[f"v{index}"] = mesh.vertices
+                arrays[f"f{index}"] = mesh.faces
+                arrays[f"m{index}"] = mesh.materials
+            np.savez_compressed(output / "meshes.npz", **arrays)
+            (output / "mesh_paths.json").write_text(json.dumps(list(self.scene.meshes)) + "\n")
+            (output / "cut_events.json").write_text(json.dumps(self.scene.events, indent=2) + "\n")
+            (output / "trajectory.json").write_text(json.dumps(self.planner.rows) + "\n")
+            result.update(
+                success=bool(result.get("success") and error is None),
+                error=error,
+                elapsed_s=time.monotonic() - started,
+                physics_steps=self.sim_world.physics_steps,
+                simulation_time_s=self.sim_world.physics_steps * self.sim_world.config.physics_dt,
+                physics_engine="physx",
+                contact_solver=self.sim_world.config.physx_solver,
+                capture_advances_physics=False,
+                asset_dependencies=self.scene.asset_dependencies,
+            )
+            self.state["result"] = result
+            (output / "result.json").write_text(
+                json.dumps(result, indent=2, allow_nan=False) + "\n"
+            )
+            self.log.info(
+                "Banana cutting result", success=result["success"], cuts=result["cuts"], error=error
+            )
+        if not result["success"]:
+            raise RuntimeError(f"Banana acceptance failed: {result['failed_checks']}")
+
+    def _export_replay(self, output: Path) -> None:
+        """Bake visibility and actual poses into a replay with all rigid integration disabled."""
+        from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+        fps = self.config.recorder.fps
+        layer = self.sim_world.stage.Flatten()
+        replay = Usd.Stage.Open(layer)
+        replay.SetTimeCodesPerSecond(fps)
+        replay.SetStartTimeCode(0)
+        replay.SetEndTimeCode(self.planner.config.duration_s * fps - 1)
+        for prim in replay.Traverse():
+            body = UsdPhysics.RigidBodyAPI(prim)
+            if body:
+                body.CreateRigidBodyEnabledAttr(False)
+        for path in self.scene.meshes:
+            vis = UsdGeom.Imageable(replay.GetPrimAtPath(path)).CreateVisibilityAttr()
+            vis.Clear()
+            vis.Set("inherited" if path.endswith("Banana_0") else "invisible", 0)
+        for event in self.scene.events:
+            t = event["time_s"] * fps
+            UsdGeom.Imageable(replay.GetPrimAtPath(event["old_path"])).GetVisibilityAttr().Set(
+                "invisible", t
+            )
+            for name in ("fragment_path", "remaining_path"):
+                UsdGeom.Imageable(replay.GetPrimAtPath(event[name])).GetVisibilityAttr().Set(
+                    "inherited", t
+                )
+        knife = replay.GetPrimAtPath("/World/Knife").GetAttribute("xformOp:transform")
+        transforms = {}
+        for path in self.scene.fragments:
+            xform = UsdGeom.Xformable(replay.GetPrimAtPath(path))
+            xform.ClearXformOpOrder()
+            transforms[path] = xform.AddTransformOp().GetAttr()
+        for row in self.planner.rows:
+            t = row["time_s"] * fps
+            x, y, z, yaw = row["knife"]
+            matrix = Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d(0, 0, 1), math.degrees(yaw)))
+            matrix.SetTranslateOnly(Gf.Vec3d(x, y, z))
+            knife.Set(matrix, t)
+            for piece in row["pieces"]:
+                transforms[piece["path"]].Set(Gf.Matrix4d(piece["transform"]), t)
+        layer.Export(str(output / "banana_cutting_replay.usdc"))

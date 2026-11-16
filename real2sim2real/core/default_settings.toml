@@ -19,6 +19,8 @@ backend = "stub"  # 不启动 Kit
 # renderer_multithreading=None：沿用 RTX 的 CPU 命令录制线程设置；false 不关闭多 GPU 或改变画质。
 
 [scene]
+# banana_cutting：asset_dir="assets/PhysicSolver/Banana"；density_kg_m3=950、static_friction=0.48、
+# dynamic_friction=0.35、restitution=0.04、fragment_contact_offset_m=0.0025；砧板顶面32 mm。
 backend = "stub"
 # pickplace_cloth / pickplace_rigid 支持 [[scene.cameras]] 固定相机列表。
 # 每项含 name、prim_path、pose_relative_to、pose、resolution 和可选镜头参数。
@@ -58,6 +60,7 @@ backend = "stub"
 # cameras 为 SensorCameraConfig：usd_path+optical_prim 引用传感器 USD（仅视口采集），hide_housing=true；为空时同 CameraConfig 建针孔相机。
 
 [robot]
+# scripted_knife：mesh_path="assets/PhysicSolver/Banana/knife.json"；视觉刀具，无机械臂或接触力模型。
 backend = "stub"
 # franka_newton / franka_physx 支持 [[robot.cameras]] 机载相机列表，字段与场景相机一致。
 # 官方 cloth_franka 场景使用 franka_newton 的 control_mode="velocity"。
@@ -90,6 +93,9 @@ backend = "stub"
 # initial_joint_positions=USD 驱动目标（0.012,-0.570,0,-2.810,0,3.037,0.741,0.04,0.04）、gripper_open_m=0.04、gripper_closed_m=0。
 
 [planner]
+# banana_cutting：cut_positions_m=[-0.096,-0.052,-0.008,0.038,0.084]、cut_angles_deg=[0,12,-12,16,-6]。
+# start_s=1、cycle_s=1.8、duration_s=13、blade_half_length_m=0.105。
+# maximum_volume_relative_error=1e-6、minimum_fragment_motion_m=0.001、maximum_support_penetration_m=0.002。
 backend = "stub"
 # newton_cloth_franka：keyframe_limit=7（首轮抓放）；完整官方序列见 planner_physic_solver.OFFICIAL_KEYFRAMES。
 # final_settle_s=2；shape_contact_stiffness=50000、shape_contact_damping=50、shape_contact_friction=1.5。
@@ -210,6 +216,8 @@ backend = "stub"
 # lerobot_replay：source_dir 指向 tabletop_pickplace 输出、episodes=[]（全部）、interpolation="linear"、require_demonstrations=true。
 
 [job]
+# banana_cutting：record_rgb=true、render_warmup_updates=48；4维刀具坐标的 LeRobot v3 + 网格/轨迹/USD回放。
+# 使用专用 collect_banana_cutting.py 暂存，独立验收与视觉复核后发布；480 Hz 物理、正式1K/30fps/PT64spp；最终六块全部释放。
 # screw_assembly：record_rgb=true；物理诊断设 false，仍走完整 BaseJob 生命周期。
 backend = "stub"  # StubJob 只串工厂,不采集
 # pickplace_cloth 的 timeout_s=1800：包含采集与渲染的墙钟时限；运行中约每 30 秒记录进度。

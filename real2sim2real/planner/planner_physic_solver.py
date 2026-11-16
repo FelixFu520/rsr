@@ -3544,3 +3544,119 @@ class DualScrewPlanner(ScrewArmPlanner):
         result["checks"]["sequence_completed"] = bool(self.state.get("done"))
         result["success"] = all(result["checks"].values())
         return result
+
+
+# ================================================================================================
+# Banana cutting schedule and acceptance; PhysX owns the released fragment dynamics.
+# ================================================================================================
+
+
+class BananaPlannerConfig(BaseConfig):
+    """Five prescribed cuts; quality thresholds are identical in debug and formal configs."""
+
+    backend: str = "banana_cutting"
+    cut_positions_m: tuple[FiniteFloat, ...] = (-0.096, -0.052, -0.008, 0.038, 0.084)
+    cut_angles_deg: tuple[FiniteFloat, ...] = (0, 12, -12, 16, -6)
+    start_s: PositiveFloat = 1.0
+    cycle_s: PositiveFloat = 1.8
+    duration_s: PositiveFloat = 13.0
+    blade_half_length_m: PositiveFloat = 0.105
+    maximum_volume_relative_error: PositiveFloat = 1e-6
+    minimum_fragment_motion_m: PositiveFloat = 0.001
+    maximum_support_penetration_m: PositiveFloat = 0.002
+
+    @model_validator(mode="after")
+    def _validate_cuts(self) -> BananaPlannerConfig:
+        if not self.cut_positions_m or len(self.cut_positions_m) != len(self.cut_angles_deg):
+            raise ValueError("Each cut position requires an angle")
+        if any(
+            b <= a for a, b in zip(self.cut_positions_m, self.cut_positions_m[1:], strict=False)
+        ):
+            raise ValueError("Cut positions must increase along the banana")
+        if self.duration_s < self.start_s + len(self.cut_positions_m) * self.cycle_s + 1:
+            raise ValueError("Reserve at least one second after the final cutting cycle")
+        return self
+
+
+class BananaPlanner(BasePlanner):
+    """Drive the knife and trigger topology changes only after its finite blade sweeps through."""
+
+    config_cls = BananaPlannerConfig
+    action_names = ["knife_x_m", "knife_y_m", "knife_z_m", "knife_yaw_rad"]
+
+    def __init__(self, config: BananaPlannerConfig | None = None) -> None:
+        super().__init__()
+        self.config = config or self.config_cls.from_settings("planner")
+        self.rows = []
+        self.done_cuts = set()
+
+    def init_planner(self, robot: Any) -> None:
+        """Bind the tool without constructing an additional simulation runtime."""
+        self.robot = robot
+        self.state.update(ready=True, done=False)
+
+    def begin_episode(self, scene: Any) -> None:
+        """Bind scene-owned geometry before the world initializes PhysX."""
+        self.scene = scene
+
+    def on_physics_step(self, robot: Any) -> bool:
+        """Command the knife at the current physical instant; never teleport a free fragment."""
+        from real2sim2real.utils.physic_solver_utils import cutting_knife_pose
+
+        time_s = self.scene.sim_world.physics_steps * self.scene.sim_world.config.physics_dt
+        self.state["done"] = time_s >= self.config.duration_s - 1e-9
+        if self.state["done"]:
+            return True
+        cycle, phase, coordinates, normal, tangent = cutting_knife_pose(
+            time_s,
+            self.config.cut_positions_m,
+            self.config.cut_angles_deg,
+            self.config.start_s,
+            self.config.cycle_s,
+        )
+        robot.command(coordinates)
+        self.state["phase"] = f"cut_{cycle + 1}"
+        self.state["last_action"] = coordinates
+        mesh = self.scene.mesh
+        origin = np.array([self.config.cut_positions_m[cycle], 0, 0])
+        distance = (mesh.vertices - origin) @ normal
+        horizontal = np.abs((mesh.vertices - coordinates[:3]) @ tangent)
+        if (
+            cycle not in self.done_cuts
+            and 0.60 < phase < 0.82
+            and coordinates[2] <= 0.034
+            and distance.min() < -1e-5
+            and distance.max() > 1e-5
+            and horizontal.max() < self.config.blade_half_length_m
+        ):
+            if self.scene.split(origin, normal, time_s) is not None:
+                self.done_cuts.add(cycle)
+                if len(self.done_cuts) == len(self.config.cut_positions_m):
+                    self.scene.release_remaining()
+        return False
+
+    def observe(self) -> dict:
+        """Read the physical scene once per step, including the initial birth state."""
+        row = dict(
+            time_s=self.scene.sim_world.physics_steps * self.scene.sim_world.config.physics_dt,
+            knife=self.robot.coordinates.tolist(),
+            pieces=self.scene.snapshot(),
+        )
+        self.rows.append(row)
+        return row
+
+    def result(self) -> dict:
+        """Evaluate actual meshes and measured trajectories using the configured thresholds."""
+        from real2sim2real.utils.physic_solver_utils import cutting_evaluate
+
+        return cutting_evaluate(
+            self.scene.events,
+            self.rows,
+            expected_cuts=len(self.config.cut_positions_m),
+            maximum_volume_relative_error=self.config.maximum_volume_relative_error,
+            minimum_fragment_motion_m=self.config.minimum_fragment_motion_m,
+            maximum_support_penetration_m=self.config.maximum_support_penetration_m,
+            meshes=self.scene.meshes,
+            duration_s=self.config.duration_s,
+            physics_dt=self.scene.sim_world.config.physics_dt,
+        )

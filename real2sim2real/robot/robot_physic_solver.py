@@ -19,6 +19,7 @@ from pydantic import Field, FiniteFloat, PositiveFloat, field_validator
 
 from real2sim2real.core.config import BaseConfig
 from real2sim2real.robot.base import BaseRobot
+from real2sim2real.simworld.base import BaseSimWorld
 from real2sim2real.utils.asset_utils import resolve_usd_path
 from real2sim2real.utils.cameras import CameraConfig, create_cameras, validate_camera_list
 
@@ -1263,4 +1264,78 @@ class DualUr5eScrewRobot(Ur5eScrewdriverRobot):
         self.poses_realtime["holder_tcp"] = (
             pose[:3].astype(float) + self.config.base_position,
             pose[[6, 3, 4, 5]].astype(float),
+        )
+
+
+# ================================================================================================
+# Scripted kitchen knife; a visual tool without a hidden manipulator or contact-force model.
+# ================================================================================================
+
+
+class ScriptedKnifeConfig(BaseConfig):
+    """Knife meshes supplied with the cutting example."""
+
+    backend: str = "scripted_knife"
+    mesh_path: str = "assets/PhysicSolver/Banana/knife.json"
+
+
+class ScriptedKnifeRobot(BaseRobot):
+    """Expose the prescribed knife pose through the ordinary robot lifecycle."""
+
+    config_cls = ScriptedKnifeConfig
+
+    def __init__(self, config: ScriptedKnifeConfig | None = None) -> None:
+        super().__init__()
+        self.config = config or self.config_cls.from_settings("robot")
+
+    def init_robot(self, sim_world: BaseSimWorld) -> None:
+        """Create the original blade, handle, bolster and rivets without physical contact."""
+        import json
+
+        from pxr import UsdGeom
+
+        from real2sim2real.utils.physic_solver_utils import (
+            CuttingMesh,
+            cutting_author_mesh,
+            cutting_material,
+        )
+
+        self.sim_world = sim_world
+        path = Path(self.config.mesh_path).resolve()
+        if not path.is_relative_to(Path("assets/PhysicSolver").resolve()):
+            raise ValueError("Knife mesh must stay inside assets/PhysicSolver")
+        root = UsdGeom.Xform.Define(sim_world.stage, "/World/Knife")
+        self.transform = root.AddTransformOp()
+        steel = cutting_material(sim_world.stage, "Steel", (0.52, 0.57, 0.62), 0.21, 1)
+        handle = cutting_material(sim_world.stage, "Handle", (0.012, 0.016, 0.018), 0.26)
+        for part in json.loads(path.read_text()):
+            mesh = CuttingMesh(
+                np.array(part["vertices"]),
+                np.array(part["faces"]),
+                np.zeros(len(part["faces"]), dtype=int),
+            )
+            cutting_author_mesh(
+                sim_world.stage,
+                "/World/Knife/" + part["name"],
+                mesh,
+                [steel if part["material"] == "steel" else handle],
+            )
+
+    def arrange(self) -> None:
+        """Start with the knife raised above the first cut."""
+        self.command(np.array([-0.096, -0.018, 0.15, 0.0]))
+        self.poses.update(self.poses_realtime)
+
+    def command(self, coordinates: np.ndarray) -> None:
+        """Set x/y/z metres and yaw radians for this explicitly scripted tool."""
+        from pxr import Gf
+
+        x, y, z, yaw = coordinates
+        matrix = Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d(0, 0, 1), float(np.degrees(yaw))))
+        matrix.SetTranslateOnly(Gf.Vec3d(float(x), float(y), float(z)))
+        self.transform.Set(matrix)
+        self.coordinates = np.asarray(coordinates, dtype=float)
+        self.poses_realtime["knife"] = (
+            self.coordinates[:3].copy(),
+            np.array([np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]),
         )

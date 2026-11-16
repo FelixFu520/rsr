@@ -813,3 +813,231 @@ class DualScrewScene(ScrewScene):
         )
         support.AddScaleOp().Set(Gf.Vec3f(0.03, 0.03, self.config.nut_support_height_m * 0.5))
         support.CreateDisplayColorAttr([Gf.Vec3f(0.18, 0.30, 0.38)])
+
+
+# ================================================================================================
+# Banana cutting: static kitchen and dynamically born PhysX fragments; topology is scene-owned.
+# ================================================================================================
+
+
+class BananaSceneConfig(BaseConfig):
+    """Task-local assets and rigid-fragment material, in metres and kilograms."""
+
+    backend: str = "banana_cutting"
+    asset_dir: str = "assets/PhysicSolver/Banana"
+    density_kg_m3: float = Field(default=950, gt=0)
+    static_friction: float = Field(default=0.48, ge=0)
+    dynamic_friction: float = Field(default=0.35, ge=0)
+    restitution: float = Field(default=0.04, ge=0, le=1)
+    fragment_contact_offset_m: float = Field(default=0.0025, gt=0.0001)
+    cameras: list[CameraConfig] = Field(default_factory=list)
+
+
+class BananaScene(BaseScene):
+    """Hold the uncut stock during slicing; release all six final pieces to gravity."""
+
+    config_cls = BananaSceneConfig
+
+    def __init__(self, config: BananaSceneConfig | None = None) -> None:
+        super().__init__()
+        self.config = config or self.config_cls.from_settings("scene")
+        self.fragments = {}
+        self.meshes = {}
+        self.events = []
+
+    def init_scene(self, sim_world: BaseSimWorld) -> None:
+        """Mount the kitchen, materials, support collisions and initial complete banana."""
+        from pxr import Gf, UsdGeom, UsdLux, UsdPhysics, UsdShade, UsdUtils
+
+        from real2sim2real.utils.physic_solver_utils import cutting_banana, cutting_material
+
+        self.sim_world = sim_world
+        self.assets = Path(self.config.asset_dir).resolve()
+        task_root = Path("assets/PhysicSolver").resolve()
+        if not self.assets.is_relative_to(task_root):
+            raise ValueError("Banana assets must stay inside assets/PhysicSolver")
+        for name in ("kitchen.usdc", "knife.json", "flesh.png", "provenance.json"):
+            if not (self.assets / name).is_file():
+                raise FileNotFoundError(
+                    f"Missing {self.assets / name}; "
+                    "run scripts/physic_solver/prepare_banana_assets.py"
+                )
+        stage = sim_world.stage
+        layers, textures, unresolved = UsdUtils.ComputeAllDependencies(
+            str(self.assets / "kitchen.usdc")
+        )
+        files = sorted(
+            {
+                str(Path(path).resolve())
+                for path in [*(layer.realPath for layer in layers), *textures]
+                if path
+            }
+        )
+        if unresolved or any(not Path(path).is_relative_to(self.assets) for path in files):
+            raise ValueError(f"Kitchen dependencies must be task-local and resolved: {unresolved}")
+        self.asset_dependencies = dict(files=files, unresolved=list(unresolved))
+        UsdGeom.Xform.Define(stage, "/World/Kitchen").GetPrim().GetReferences().AddReference(
+            str(self.assets / "kitchen.usdc")
+        )
+        self.materials = [
+            cutting_material(stage, "Peel", (0.89, 0.69, 0.018), 0.36),
+            cutting_material(stage, "Peel_ridges", (0.69, 0.53, 0.012), 0.43),
+            cutting_material(stage, "Stem", (0.24, 0.18, 0.025), 0.55),
+            cutting_material(
+                stage, "Flesh", (0.96, 0.89, 0.66), 0.5, texture=self.assets / "flesh.png"
+            ),
+        ]
+        self.contact = UsdShade.Material.Define(stage, "/World/Looks/FruitContact")
+        physics = UsdPhysics.MaterialAPI.Apply(self.contact.GetPrim())
+        physics.CreateStaticFrictionAttr(self.config.static_friction)
+        physics.CreateDynamicFrictionAttr(self.config.dynamic_friction)
+        physics.CreateRestitutionAttr(self.config.restitution)
+        # These collision boxes match the visible counter and the board's flat central surface.
+        for name, center, size in (
+            ("BoardPhysics", (0, 0, 0.016), (0.465, 0.295, 0.032)),
+            ("CounterPhysics", (0, 0, -0.025), (1.7, 1.1, 0.05)),
+        ):
+            root = UsdGeom.Xform.Define(stage, f"/World/{name}")
+            root.AddTranslateOp().Set(Gf.Vec3d(*center))
+            box = UsdGeom.Cube.Define(stage, f"{root.GetPath()}/Collider")
+            box.CreateSizeAttr(1)
+            box.AddScaleOp().Set(Gf.Vec3f(*size))
+            box.CreateVisibilityAttr("invisible")
+            UsdPhysics.CollisionAPI.Apply(box.GetPrim())
+            UsdShade.MaterialBindingAPI.Apply(box.GetPrim()).Bind(
+                self.contact, materialPurpose="physics"
+            )
+        dome = UsdLux.DomeLight.Define(stage, "/World/Lights/Dome")
+        dome.CreateIntensityAttr(900)
+        for name, pos, intensity, size in (
+            ("Key", (-0.3, -0.15, 0.75), 6500, 0.55),
+            ("Fill", (0.4, 0.15, 0.55), 3500, 0.4),
+        ):
+            light = UsdLux.RectLight.Define(stage, f"/World/Lights/{name}")
+            light.AddTranslateOp().Set(Gf.Vec3d(*pos))
+            light.CreateIntensityAttr(intensity)
+            light.CreateWidthAttr(size)
+            light.CreateHeightAttr(size)
+        self.mesh = cutting_banana()
+        self.remaining_path = "/World/Food/Banana_0"
+        self.remaining = self._author(self.remaining_path, self.mesh)
+        self.sensors = create_cameras(stage, self.config.cameras)
+
+        top = UsdGeom.Camera.Define(stage, "/World/TopCamera")
+        top.AddTransformOp().Set(
+            Gf.Matrix4d()
+            .SetLookAt(Gf.Vec3d(0, -0.12, 0.65), Gf.Vec3d(0, 0, 0.04), Gf.Vec3d(0, 0, 1))
+            .GetInverse()
+        )
+        top.CreateFocalLengthAttr(0.48)
+        top.CreateHorizontalApertureAttr(0.20955)
+        top.CreateClippingRangeAttr(Gf.Vec2f(0.005, 100))
+
+    def arrange(self) -> None:
+        """Cache the fixed remainder's world pose separately from the free fragments."""
+        self.poses["remainder"] = (np.zeros(3), np.array([1.0, 0, 0, 0]))
+        self.poses_realtime.update(self.poses)
+
+    def _author(self, path: str, mesh: Any, center: Any = None) -> Any:
+        from real2sim2real.utils.physic_solver_utils import cutting_author_mesh
+
+        self.meshes[path] = mesh
+        return cutting_author_mesh(self.sim_world.stage, path, mesh, self.materials, center)
+
+    def _release_fragment(self, path: str, mesh: Any) -> Any:
+        """Release a closed mesh at its exact world pose with zero injected velocity."""
+        from pxr import Gf, PhysxSchema, UsdPhysics, UsdShade
+
+        from real2sim2real.utils.physic_solver_utils import cutting_mesh_report
+
+        center = mesh.vertices.mean(axis=0)
+        fragment = self._author(path, mesh, center)
+        fragment.AddTranslateOp().Set(Gf.Vec3d(*center))
+        UsdPhysics.CollisionAPI.Apply(fragment.GetPrim())
+        UsdPhysics.MeshCollisionAPI.Apply(fragment.GetPrim()).CreateApproximationAttr("convexHull")
+        body = UsdPhysics.RigidBodyAPI.Apply(fragment.GetPrim())
+        body.CreateVelocityAttr(Gf.Vec3f(0))
+        body.CreateAngularVelocityAttr(Gf.Vec3f(0))
+        volume = cutting_mesh_report(mesh)["volume_m3"]
+        UsdPhysics.MassAPI.Apply(fragment.GetPrim()).CreateMassAttr(
+            volume * self.config.density_kg_m3
+        )
+        rigid = PhysxSchema.PhysxRigidBodyAPI.Apply(fragment.GetPrim())
+        rigid.CreateEnableCCDAttr(True)
+        rigid.CreateSolverPositionIterationCountAttr(16)
+        rigid.CreateSolverVelocityIterationCountAttr(4)
+        rigid.CreateLinearDampingAttr(0.5)
+        rigid.CreateAngularDampingAttr(0.9)
+        collision = PhysxSchema.PhysxCollisionAPI.Apply(fragment.GetPrim())
+        collision.CreateContactOffsetAttr(self.config.fragment_contact_offset_m)
+        collision.CreateRestOffsetAttr(0.0001)
+        UsdShade.MaterialBindingAPI.Apply(fragment.GetPrim()).Bind(
+            self.contact, materialPurpose="physics"
+        )
+        self.fragments[path] = (fragment, center)
+        return fragment
+
+    def split(self, origin: np.ndarray, normal: np.ndarray, time_s: float) -> dict | None:
+        """Clip and cap both halves; retain the uncut side only until the final cut."""
+        from real2sim2real.utils.physic_solver_utils import cutting_mesh_report, cutting_split
+
+        halves = cutting_split(self.mesh, origin, normal)
+        if halves is None:
+            return None
+        left, right = halves
+        before = cutting_mesh_report(self.mesh)
+        old_path = self.remaining_path
+        self.remaining.CreateVisibilityAttr("invisible")
+        index = len(self.events) + 1
+        path = f"/World/Food/Slice_{index}"
+        self._release_fragment(path, left)
+        self.remaining_path = f"/World/Food/Banana_{index}"
+        self.remaining = self._author(self.remaining_path, right)
+        self.mesh = right
+        event = dict(
+            time_s=time_s,
+            old_path=old_path,
+            fragment_path=path,
+            remaining_path=self.remaining_path,
+            origin=origin.tolist(),
+            normal=normal.tolist(),
+            before=before,
+            left=cutting_mesh_report(left),
+            right=cutting_mesh_report(right),
+            birth_offset_m=[0, 0, 0],
+            initial_velocity_mps=[0, 0, 0],
+            initial_angular_velocity_deg_s=[0, 0, 0],
+            released_paths=[path],
+        )
+        self.events.append(event)
+        return event
+
+    def release_remaining(self) -> None:
+        """Free the last tip after the final cut, rather than leave a visible fixed mesh."""
+        if self.remaining_path in self.fragments:
+            return
+        self.remaining = self._release_fragment(self.remaining_path, self.mesh)
+        self.events[-1]["released_paths"].append(self.remaining_path)
+        self.poses.pop("remainder", None)
+        self.poses_realtime.pop("remainder", None)
+
+    def snapshot(self) -> list[dict]:
+        """Read free fragment transforms written by PhysX, without advancing time."""
+        from pxr import UsdGeom
+
+        pieces = []
+        for path, (prim, center) in self.fragments.items():
+            matrix = UsdGeom.Xformable(prim).GetLocalTransformation()
+            position = np.asarray(matrix.ExtractTranslation())
+            rotation = matrix.ExtractRotationQuat()
+            quaternion = np.array([rotation.GetReal(), *rotation.GetImaginary()])
+            self.poses_realtime[path] = (position, quaternion)
+            pieces.append(
+                dict(
+                    path=path,
+                    position_m=position.tolist(),
+                    birth_center_m=center.tolist(),
+                    transform=np.asarray(matrix).tolist(),
+                )
+            )
+        return pieces
