@@ -351,6 +351,8 @@ class ScrewJob(BaseJob):
         )
         if combination not in {
             ("screw_assembly", "screw_spindle", "screw_assembly"),
+            ("screw_assembly", "ur5e_screwdriver", "ur5e_screwdriver"),
+            ("dual_screw_assembly", "dual_ur5e_screwdriver", "dual_ur5e_screwdriver"),
             ("pickplace_carton", "franka_carton_gripper", "pickplace_carton"),
         }:
             raise ValueError("Assembly requires its declared scene and robot combination")

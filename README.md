@@ -221,3 +221,16 @@ uv build                                                        # 产物：dist/
 物理求解器任务包含 [package01–08 抓取矩阵、摇晃／附着对照及螺纹装配](docs/physic_solver.md#1-任务与统一分类)。
 本轮640×480重新采集及验收已完成：[带算法标签的抓取总片](outputs/physic_solver/grasp_all_comparison_labeled.mp4) · [分类视频与结果](docs/physic_solver.md#7-视频拼接)。
 求解器图表整理见 [物理引擎与求解器](docs/physics_engines.md)。
+
+UR5e 电批拧螺栓 demo（真实 M20 螺纹接触，1K/30 fps）：[观看双视角成品](outputs/physic_solver/mujoco_hydroelastic_screw02_ur5e/demo.mp4)。
+`./app/python.sh scripts/physic_solver/collect_screw_arm_demo.py`，
+配置和验收见 [物理求解器文档第 9 节](docs/physic_solver.md#9-ur5e-电批拧螺栓-demo)。
+
+双 UR5e 版在第二只机械臂夹住并抬起自由螺母后再旋入螺栓：[观看双臂成品](outputs/physic_solver/mujoco_hydroelastic_screw03_dual_ur5e/demo.mp4)。
+配置和运行见 [双臂拧螺栓](docs/physic_solver.md#10-双-ur5e夹起螺母后拧入螺栓)。
+
+加深旋入并加上旋转涂装的版本：[观看螺栓穿出螺母 demo](outputs/physic_solver/mujoco_hydroelastic_screw04_dual_through/demo.mp4)。
+蓝黄条纹和红色角度标记显示真实旋转，停转后尖端露出7.50 mm；[配置与验收](docs/physic_solver.md#105-加深旋入螺栓穿出螺母)。
+
+末段松开螺母夹爪：[观看松爪版 demo](outputs/physic_solver/mujoco_hydroelastic_screw05_dual_release/demo.mp4)。
+夹指打开后螺母仍挂在螺栓上，尖端露出7.25 mm；[参数、验收与浮动下沉说明](docs/physic_solver.md#106-拧完后松开螺母夹爪)。

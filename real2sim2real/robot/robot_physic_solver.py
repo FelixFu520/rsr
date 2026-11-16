@@ -126,6 +126,7 @@ class FrankaNewtonRobot(BaseRobot):
                 wp.quat(quat[1], quat[2], quat[3], quat[0]),
             ),
             floating=False,
+            apply_up_axis_from_stage=True,
             scale=scale,
             enable_self_collisions=False,
             collapse_fixed_joints=True,
@@ -573,3 +574,589 @@ class CartonGripperRobot(PackagePadRobot):
             if "finger_joint" in label:
                 axis = builder.joint_qd_start[joint]
                 builder.joint_limit_upper[axis] = self.config.maximum_finger_opening_m * scale
+
+
+# ================================================================================================
+# UR5e + a flange-mounted electric driver, axial spring and continuous hex socket.
+# The arm and spindle are one solved articulation; only actual body poses are published.
+# ================================================================================================
+
+
+class Ur5eScrewdriverRobotConfig(ScrewSpindleRobotConfig):
+    """UR5e SI drive gains, task-local USD and compliant socket driver dimensions."""
+
+    backend: str = "ur5e_screwdriver"
+    prim_path: str = "/World/robots/UR5eScrewdriver"
+    usd_path: str = "assets/PhysicSolver/Robot/ur5e/ur5e.usda"
+    arm_base_offset_m: tuple[FiniteFloat, FiniteFloat, FiniteFloat] = (-0.45, 0.0, 0.0)
+    tool_length_m: PositiveFloat = 0.30
+    arm_stiffness_nm_rad: PositiveFloat = 12000.0
+    arm_damping_nm_s_rad: PositiveFloat = 400.0
+    arm_max_torque_nm: PositiveFloat = 150.0
+    # Small downward loading move at startup; no pitch-based feed is prescribed.
+    loading_stroke_m: float = Field(default=0.003, ge=0, le=0.005)
+    loading_duration_s: PositiveFloat = 1.0
+
+
+class Ur5eScrewdriverRobot(ScrewSpindleRobot):
+    """A physically articulated UR5e holding a compliant electric socket driver."""
+
+    config_cls = Ur5eScrewdriverRobotConfig
+    recording_robot_type = "ur5e_compliant_electric_socket_driver"
+    recording_joint_names = [
+        "shoulder_pan_rad",
+        "shoulder_lift_rad",
+        "elbow_rad",
+        "wrist_1_rad",
+        "wrist_2_rad",
+        "wrist_3_rad",
+        "axial_displacement_m",
+        "spindle_angle_rad",
+    ]
+
+    def init_robot(self, sim_world: Any) -> None:
+        """Load task-local visual assets; defer solver allocation to episode start."""
+        from pxr import Gf, UsdGeom
+
+        if not sim_world.uses_direct_newton:
+            raise ValueError("UR5e screwdriver requires direct Newton")
+        self.sim_world = sim_world
+        root = UsdGeom.Xform.Define(sim_world.stage, self.config.prim_path)
+        root.AddTranslateOp().Set(Gf.Vec3d(*self.config.base_position))
+        arm = UsdGeom.Xform.Define(sim_world.stage, f"{root.GetPath()}/arm")
+        arm.GetPrim().GetReferences().AddReference(resolve_usd_path(self.config.usd_path))
+        self._variants(arm.GetPrim())
+        self._visual_ops = {}
+        self.sensors.update(create_cameras(sim_world.stage, self.config.cameras))
+
+    def arrange(self) -> None:
+        """Cache the arm's actual table-mounted base, relative to the screw fixture."""
+        position = np.array(self.config.base_position) + self.config.arm_base_offset_m
+        self.poses["base"] = (position, np.array([1.0, 0.0, 0.0, 0.0]))
+        self.poses_realtime.update(self.poses)
+
+    @staticmethod
+    def _variants(root: Any) -> None:
+        for name, value in {
+            "PhysX": "Enabled",
+            "Newton": "Disabled",
+            "MuJoCo": "Disabled",
+            "Gripper": "none",
+            "Sensor": "none",
+        }.items():
+            variant = root.GetVariantSets().GetVariantSet(name)
+            if value in variant.GetVariantNames():
+                variant.SetVariantSelection(value)
+
+    def add_newton_robot(
+        self, builder: Any, *, mount_z_m: float, bolt_mesh: Any, shape_config: Any
+    ) -> int:
+        """Import arm plus driver as one articulation, with real helical bolt collision."""
+        import warp as wp
+        from newton.usd import SchemaResolverPhysx
+        from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+        from real2sim2real.utils.battery_disassembly_utils import (
+            ToolFrame,
+            matrix_to_quat,
+            solve_ik,
+            transform,
+        )
+        from real2sim2real.utils.physic_solver_utils import screw_arm_chain
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+        root = UsdGeom.Xform.Define(stage, "/UR5e")
+        root.GetPrim().GetReferences().AddReference(resolve_usd_path(self.config.usd_path))
+        self._variants(root.GetPrim())
+        # The no-gripper variant leaves a dangling fixed joint; it must not anchor the wrist.
+        UsdPhysics.Joint(
+            stage.GetPrimAtPath("/UR5e/joints/robot_gripper_joint")
+        ).CreateJointEnabledAttr(False)
+        chain, mount = screw_arm_chain(stage, "/UR5e", self.config.tool_length_m)
+        self.chain, self.chain_base = chain, transform(translation=self.config.arm_base_offset_m)
+        self.tool_mount = mount
+        self.mount_z_m = mount_z_m
+        seeds = [
+            [0, -1.2, 1.7, -2, -1.57, 0],
+            [0, -1.5, 2, -2, 1.57, 0],
+            [0.4, -1, 1.5, -2, -1.5, 0],
+        ]
+        for seed in seeds:
+            goal, pe, ae = solve_ik(
+                chain,
+                self.chain_base,
+                ToolFrame(np.zeros(3)),
+                [0, 0, mount_z_m],
+                rotation=np.eye(3),
+                seed=seed,
+                iterations=600,
+                position_tol=1e-8,
+                angle_tol=1e-8,
+            )
+            if pe < 1e-6 and ae < 1e-6:
+                break
+        else:
+            raise ValueError(f"UR5e screwdriver IK unreachable: position={pe}, angle={ae}")
+        self.arm_goal, self.control_time_s = goal, 0.0
+        root.ClearXformOpOrder()
+        root.AddTranslateOp().Set(Gf.Vec3d(*self.config.arm_base_offset_m))
+        wrist = UsdGeom.Xformable(stage.GetPrimAtPath("/UR5e/wrist_3_link"))
+        zero_tip = np.asarray(wrist.ComputeLocalToWorldTransform(Usd.TimeCode.Default())).T @ mount
+
+        def body(path: str, mass: float) -> None:
+            item = UsdGeom.Xform.Define(stage, path)
+            item.AddTransformOp().Set(Gf.Matrix4d(zero_tip.T.tolist()))
+            UsdPhysics.RigidBodyAPI.Apply(item.GetPrim())
+            api = UsdPhysics.MassAPI.Apply(item.GetPrim())
+            api.CreateMassAttr(mass)
+            api.CreateDiagonalInertiaAttr(Gf.Vec3f(1e-4, 1e-4, 1e-4))
+
+        body("/UR5e/driver_float", self.config.carriage_mass_kg)
+        body("/UR5e/driver_spindle", 0.05)
+        axial = UsdPhysics.PrismaticJoint.Define(stage, "/UR5e/joints/driver_axial")
+        axial.CreateBody0Rel().SetTargets(["/UR5e/wrist_3_link"])
+        axial.CreateBody1Rel().SetTargets(["/UR5e/driver_float"])
+        axial.CreateLocalPos0Attr(Gf.Vec3f(*mount[:3, 3]))
+        q = matrix_to_quat(mount[:3, :3])
+        axial.CreateLocalRot0Attr(Gf.Quatf(float(q[0]), *q[1:].tolist()))
+        axial.CreateAxisAttr("Z")
+        axial.CreateLowerLimitAttr(-0.04)
+        axial.CreateUpperLimitAttr(0.005)
+        spin = UsdPhysics.RevoluteJoint.Define(stage, "/UR5e/joints/driver_spin")
+        spin.CreateBody0Rel().SetTargets(["/UR5e/driver_float"])
+        spin.CreateBody1Rel().SetTargets(["/UR5e/driver_spindle"])
+        spin.CreateAxisAttr("Z")
+        parsed = builder.add_usd(
+            stage,
+            root_path="/UR5e",
+            floating=False,
+            enable_self_collisions=False,
+            load_visual_shapes=False,
+            schema_resolvers=[SchemaResolverPhysx()],
+        )
+        joint_map = parsed["path_joint_map"]
+        self.arm_dofs = [
+            builder.joint_q_start[joint_map[f"/UR5e/joints/{name}"]] for name in chain.names
+        ]
+        self.screw_dofs = [
+            builder.joint_q_start[joint_map[f"/UR5e/joints/driver_{name}"]]
+            for name in ("axial", "spin")
+        ]
+        if self.arm_dofs + self.screw_dofs != list(range(8)):
+            raise ValueError(f"Unexpected UR5e joint layout: {self.arm_dofs}, {self.screw_dofs}")
+        for dof, value in zip(self.arm_dofs, goal, strict=True):
+            builder.joint_q[dof] = float(value)
+            builder.joint_target_q[dof] = float(value)
+            builder.joint_target_ke[dof] = self.config.arm_stiffness_nm_rad
+            builder.joint_target_kd[dof] = self.config.arm_damping_nm_s_rad
+            builder.joint_effort_limit[dof] = self.config.arm_max_torque_nm
+            builder.joint_armature[dof] = 0.05
+            builder.joint_target_mode[dof] = 3  # POSITION_VELOCITY
+        a, s = self.screw_dofs
+        builder.joint_target_ke[a] = self.config.axial_stiffness_n_m
+        builder.joint_target_kd[a] = self.config.axial_damping_n_s_m
+        builder.joint_target_mode[a] = 3
+        builder.joint_effort_limit[a] = 10.0
+        builder.joint_target_ke[s] = 0.0
+        builder.joint_target_kd[s] = self.config.spindle_damping_nm_s_rad
+        builder.joint_target_mode[s] = 2  # VELOCITY
+        builder.joint_effort_limit[s] = self.config.maximum_torque_nm
+        spindle = parsed["path_body_map"]["/UR5e/driver_spindle"]
+        self.spindle_body = spindle
+        self.wrist_body = parsed["path_body_map"]["/UR5e/wrist_3_link"]
+        builder.add_shape_mesh(
+            spindle,
+            mesh=bolt_mesh,
+            xform=wp.transform((0, 0, 0), wp.quat(1, 0, 0, 0)),
+            cfg=shape_config,
+            label="socket_clamped_bolt",
+        )
+        self._author_driver_visuals()
+        for path, index in parsed["path_body_map"].items():
+            leaf = path.rsplit("/", 1)[-1]
+            visual_path = (
+                f"{self.config.prim_path}/{leaf}"
+                if leaf.startswith("driver_")
+                else f"{self.config.prim_path}/arm/{leaf}"
+            )
+            prim = self.sim_world.stage.GetPrimAtPath(visual_path)
+            xf = UsdGeom.Xformable(prim)
+            xf.ClearXformOpOrder()
+            self._visual_ops[index] = xf.AddTransformOp()
+        # Keep the full dependency closure verifiable, including materials and textures.
+        self.state["asset_layers"] = [
+            layer.identifier for layer in stage.GetUsedLayers() if not layer.anonymous
+        ]
+        return spindle
+
+    def _author_driver_visuals(self) -> None:
+        from pxr import Gf, UsdGeom
+
+        stage = self.sim_world.stage
+        for body in ("driver_housing", "driver_float", "driver_spindle"):
+            UsdGeom.Xform.Define(stage, f"{self.config.prim_path}/{body}")
+        self._housing_op = UsdGeom.Xformable(
+            stage.GetPrimAtPath(f"{self.config.prim_path}/driver_housing")
+        ).AddTransformOp()
+        # Body is bolted to flange; shaft and visible orange marker rotate with the socket.
+        for parent, name, radius, height, z, color in (
+            ("driver_housing", "motor", 0.032, 0.16, 0.19, (0.12, 0.22, 0.32)),
+            ("driver_housing", "flange_adapter", 0.043, 0.025, 0.2875, (0.25, 0.28, 0.31)),
+            ("driver_float", "nose", 0.022, 0.055, 0.0825, (0.5, 0.53, 0.57)),
+            ("driver_spindle", "shaft", 0.008, 0.055, 0.030, (0.65, 0.68, 0.72)),
+            ("driver_spindle", "hex_socket", 0.019, 0.025, 0.006, (0.23, 0.26, 0.30)),
+        ):
+            mesh = UsdGeom.Cylinder.Define(stage, f"{self.config.prim_path}/{parent}/{name}")
+            mesh.CreateRadiusAttr(radius)
+            mesh.CreateHeightAttr(height)
+            mesh.AddTranslateOp().Set(Gf.Vec3d(0, 0, z))
+            mesh.CreateDisplayColorAttr([Gf.Vec3f(*color)])
+        stripe = UsdGeom.Cube.Define(
+            stage, f"{self.config.prim_path}/driver_spindle/rotation_marker"
+        )
+        stripe.AddTranslateOp().Set(Gf.Vec3d(0.0185, 0, 0.006))
+        stripe.AddScaleOp().Set(Gf.Vec3f(0.0015, 0.004, 0.0125))
+        stripe.CreateDisplayColorAttr([Gf.Vec3f(1.0, 0.25, 0.02)])
+
+    def screw_control(
+        self, measured: np.ndarray, speed: float, hold: bool
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Load the flange by 3mm once, then hold it; the thread determines actual feed."""
+        from real2sim2real.utils.battery_disassembly_utils import ToolFrame, solve_ik
+
+        self.control_time_s += self.sim_world.config.physics_dt
+        u = min(self.control_time_s / self.config.loading_duration_s, 1.0)
+        dz = self.config.loading_stroke_m * u * u * (3 - 2 * u)
+        goal, pe, ae = solve_ik(
+            self.chain,
+            self.chain_base,
+            ToolFrame(np.zeros(3)),
+            [0, 0, self.mount_z_m - dz],
+            rotation=np.eye(3),
+            seed=self.arm_goal,
+            position_tol=1e-7,
+            angle_tol=1e-7,
+        )
+        if pe > 1e-5 or ae > 1e-5:
+            raise ValueError("UR5e loading stroke lost IK continuity")
+        self.arm_goal = goal
+        q = np.zeros(8)
+        q[self.arm_dofs] = goal
+        q[self.screw_dofs[0]] = (
+            measured[self.screw_dofs[0]] if hold else self.config.axial_preload_target_m
+        )
+        qd = np.zeros(8)
+        qd[self.screw_dofs[1]] = speed
+        action = q.copy()
+        action[self.screw_dofs[1]] = speed
+        return q, qd, action
+
+    def publish_newton(self, poses: np.ndarray) -> None:
+        """Publish solved link transforms; source material bindings remain intact."""
+        from pxr import Gf
+
+        from real2sim2real.utils.battery_disassembly_utils import quat_to_matrix, transform
+
+        wrist = poses[self.wrist_body]
+        housing = transform(quat_to_matrix(wrist[[6, 3, 4, 5]]), wrist[:3]) @ self.tool_mount
+        self._housing_op.Set(Gf.Matrix4d(housing.T.tolist()))
+
+        for index, op in self._visual_ops.items():
+            pose = poses[index]
+            matrix = Gf.Matrix4d().SetRotate(Gf.Quatd(float(pose[6]), *pose[3:6].astype(float)))
+            matrix.SetTranslateOnly(Gf.Vec3d(*pose[:3].astype(float)))
+            op.Set(matrix)
+        pose = poses[self.spindle_body]
+        self.poses_realtime["tool"] = (
+            pose[:3].astype(float) + self.config.base_position,
+            pose[[6, 3, 4, 5]].astype(float),
+        )
+        self.poses.setdefault("tool", self.poses_realtime["tool"])
+        self.state["arm_target_rad"] = self.arm_goal.copy()
+
+
+# ================================================================================================
+# Dual UR5e assembly: the second arm closes two explicit fingers around the free M20 nut.
+# ================================================================================================
+
+
+class DualUr5eScrewRobotConfig(Ur5eScrewdriverRobotConfig):
+    """Two physical UR5e arms, an electric driver and an explicit parallel nut gripper."""
+
+    backend: str = "dual_ur5e_screwdriver"
+    nut_arm_base_offset_m: tuple[FiniteFloat, FiniteFloat, FiniteFloat] = (0.45, 0.28, 0.0)
+    gripper_length_m: PositiveFloat = 0.14
+    finger_open_m: float = Field(default=0.028, gt=0.02, le=0.04)
+    finger_closed_m: float = Field(default=0.013, gt=0.01, lt=0.015)
+    finger_stiffness_n_m: PositiveFloat = 30000.0
+    finger_damping_ns_m: PositiveFloat = 150.0
+    finger_max_force_n: PositiveFloat = 100.0
+    finger_friction: PositiveFloat = 1.5
+    finger_hydroelastic_stiffness: PositiveFloat = 1e10
+
+
+class DualUr5eScrewRobot(Ur5eScrewdriverRobot):
+    """One driver arm and one contact-only nut-holding arm in the same Newton model."""
+
+    config_cls = DualUr5eScrewRobotConfig
+    recording_robot_type = "dual_ur5e_nut_grip_and_electric_driver"
+    recording_joint_names = [
+        f"driver_{name}" for name in Ur5eScrewdriverRobot.recording_joint_names
+    ] + [
+        "holder_shoulder_pan_rad",
+        "holder_shoulder_lift_rad",
+        "holder_elbow_rad",
+        "holder_wrist_1_rad",
+        "holder_wrist_2_rad",
+        "holder_wrist_3_rad",
+        "holder_finger_n_m",
+        "holder_finger_p_m",
+    ]
+
+    def init_robot(self, sim_world: Any) -> None:
+        """Reference a second complete arm; generate only its visible gripper geometry."""
+        from pxr import UsdGeom
+
+        super().init_robot(sim_world)
+        arm = UsdGeom.Xform.Define(sim_world.stage, f"{self.config.prim_path}/nut_arm")
+        arm.GetPrim().GetReferences().AddReference(resolve_usd_path(self.config.usd_path))
+        self._variants(arm.GetPrim())
+        self._holder_ops = {}
+
+    def add_newton_robot(
+        self, builder: Any, *, mount_z_m: float, bolt_mesh: Any, shape_config: Any
+    ) -> int:
+        """Import both driven arms, followed by two independent prismatic fingers."""
+        import newton
+        import warp as wp
+        from newton.usd import SchemaResolverPhysx
+        from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+        from real2sim2real.utils.battery_disassembly_utils import matrix_to_quat, transform
+        from real2sim2real.utils.physic_solver_utils import screw_arm_chain
+
+        spindle = super().add_newton_robot(
+            builder, mount_z_m=mount_z_m, bolt_mesh=bolt_mesh, shape_config=shape_config
+        )
+        self.bolt_shape = builder.shape_count - 1
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+        root = UsdGeom.Xform.Define(stage, "/NutArm")
+        root.GetPrim().GetReferences().AddReference(resolve_usd_path(self.config.usd_path))
+        self._variants(root.GetPrim())
+        UsdPhysics.Joint(
+            stage.GetPrimAtPath("/NutArm/joints/robot_gripper_joint")
+        ).CreateJointEnabledAttr(False)
+        self.holder_chain, mount = screw_arm_chain(stage, "/NutArm", self.config.gripper_length_m)
+        self.holder_base = transform(translation=self.config.nut_arm_base_offset_m)
+        # Local Y opens along world X (the hex flats); local Z points back toward +Y.
+        self.holder_rotation = np.array([[0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0]])
+        self.holder_goal = self._solve_pose(
+            self.holder_chain, self.holder_base, [0, 0, self.pickup_z_m], self.holder_rotation
+        )
+        root.ClearXformOpOrder()
+        root.AddTranslateOp().Set(Gf.Vec3d(*self.config.nut_arm_base_offset_m))
+        wrist = UsdGeom.Xformable(stage.GetPrimAtPath("/NutArm/wrist_3_link"))
+        zero_tip = np.asarray(wrist.ComputeLocalToWorldTransform(Usd.TimeCode.Default())).T @ mount
+        for name, mass in (("holder_mount", 0.5), ("jaw_p", 0.08), ("jaw_n", 0.08)):
+            body = UsdGeom.Xform.Define(stage, f"/NutArm/{name}")
+            body.AddTransformOp().Set(Gf.Matrix4d(zero_tip.T.tolist()))
+            UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+            api = UsdPhysics.MassAPI.Apply(body.GetPrim())
+            api.CreateMassAttr(mass)
+            api.CreateDiagonalInertiaAttr(Gf.Vec3f(0.001, 0.001, 0.001))
+        fixed = UsdPhysics.FixedJoint.Define(stage, "/NutArm/joints/holder_mount_joint")
+        fixed.CreateBody0Rel().SetTargets(["/NutArm/wrist_3_link"])
+        fixed.CreateBody1Rel().SetTargets(["/NutArm/holder_mount"])
+        fixed.CreateLocalPos0Attr(Gf.Vec3f(*mount[:3, 3]))
+        q = matrix_to_quat(mount[:3, :3])
+        fixed.CreateLocalRot0Attr(Gf.Quatf(float(q[0]), *q[1:].tolist()))
+        for side in ("p", "n"):
+            joint = UsdPhysics.PrismaticJoint.Define(stage, f"/NutArm/joints/finger_{side}")
+            joint.CreateBody0Rel().SetTargets(["/NutArm/holder_mount"])
+            joint.CreateBody1Rel().SetTargets([f"/NutArm/jaw_{side}"])
+            joint.CreateAxisAttr("Y")
+            # Both coordinates are positive openings; reflect the negative finger frame.
+            if side == "n":
+                joint.CreateLocalRot0Attr(Gf.Quatf(0.0, 0.0, 0.0, 1.0))
+                joint.CreateLocalRot1Attr(Gf.Quatf(0.0, 0.0, 0.0, 1.0))
+            joint.CreateLowerLimitAttr(0.009)
+            joint.CreateUpperLimitAttr(0.035)
+        parsed = builder.add_usd(
+            stage,
+            root_path="/NutArm",
+            floating=False,
+            enable_self_collisions=False,
+            load_visual_shapes=False,
+            schema_resolvers=[SchemaResolverPhysx()],
+        )
+        joint_map = parsed["path_joint_map"]
+        self.holder_dofs = [
+            builder.joint_q_start[joint_map[f"/NutArm/joints/{name}"]]
+            for name in self.holder_chain.names
+        ]
+        self.finger_dofs = [
+            builder.joint_q_start[joint_map[f"/NutArm/joints/finger_{side}"]] for side in ("p", "n")
+        ]
+        if self.holder_dofs != list(range(8, 14)) or self.finger_dofs != [15, 14]:
+            raise ValueError(f"Unexpected nut arm DOFs: {self.holder_dofs}, {self.finger_dofs}")
+        for dof, value in zip(self.holder_dofs, self.holder_goal, strict=True):
+            builder.joint_q[dof] = float(value)
+            builder.joint_target_q[dof] = float(value)
+            builder.joint_target_ke[dof] = self.config.arm_stiffness_nm_rad
+            builder.joint_target_kd[dof] = self.config.arm_damping_nm_s_rad
+            builder.joint_effort_limit[dof] = self.config.arm_max_torque_nm
+            builder.joint_armature[dof] = 0.05
+            builder.joint_target_mode[dof] = 3
+        cfg = newton.ModelBuilder.ShapeConfig(
+            is_hydroelastic=True,
+            sdf_max_resolution=64,
+            kh=self.config.finger_hydroelastic_stiffness,
+            ke=1e7,
+            kd=1e4,
+            mu=self.config.finger_friction,
+            margin=0,
+            gap=0,
+            density=1000,
+        )
+        self.finger_shapes, self.finger_bodies = [], []
+        for side, dof in zip(("p", "n"), self.finger_dofs, strict=True):
+            builder.joint_q[dof] = self.config.finger_open_m
+            builder.joint_target_q[dof] = self.config.finger_open_m
+            builder.joint_target_ke[dof] = self.config.finger_stiffness_n_m
+            builder.joint_target_kd[dof] = self.config.finger_damping_ns_m
+            builder.joint_effort_limit[dof] = self.config.finger_max_force_n
+            builder.joint_target_mode[dof] = 3
+            body = parsed["path_body_map"][f"/NutArm/jaw_{side}"]
+            self.finger_bodies.append(body)
+            sign = 1 if side == "p" else -1
+            shape = builder.add_shape_box(
+                body,
+                hx=0.006,
+                hy=0.004,
+                hz=0.05,
+                xform=wp.transform((0, sign * 0.004, 0.03), wp.quat_identity()),
+                cfg=cfg,
+                label=f"visible_nut_jaw_{side}",
+            )
+            self.finger_shapes.append(shape)
+        self.holder_tcp_body = parsed["path_body_map"]["/NutArm/holder_mount"]
+        for path, index in parsed["path_body_map"].items():
+            leaf = path.rsplit("/", 1)[-1]
+            visual_path = (
+                f"{self.config.prim_path}/{leaf}"
+                if leaf.startswith(("holder_", "jaw_"))
+                else f"{self.config.prim_path}/nut_arm/{leaf}"
+            )
+            prim = UsdGeom.Xform.Define(self.sim_world.stage, visual_path)
+            prim.ClearXformOpOrder()
+            self._holder_ops[index] = prim.AddTransformOp()
+        self._gripper_visuals()
+        self.state["asset_layers"] = sorted(
+            set(self.state["asset_layers"])
+            | {layer.identifier for layer in stage.GetUsedLayers() if not layer.anonymous}
+        )
+        return spindle
+
+    @staticmethod
+    def _solve_pose(
+        chain: Any,
+        base: np.ndarray,
+        point: Any,
+        rotation: np.ndarray,
+        seed: np.ndarray | None = None,
+    ) -> np.ndarray:
+        from real2sim2real.utils.battery_disassembly_utils import ToolFrame, solve_ik
+
+        seeds = ([seed] if seed is not None else []) + [
+            [2.6, -1.2, 1.7, -2, -1.57, 0],
+            [0, -1.2, 1.7, -2, -1.57, 0],
+            [0, -1.5, 2, -2, 1.57, 0],
+            [-2.6, -1.2, 1.7, -2, -1.57, 0],
+        ]
+        for candidate in seeds:
+            q, pe, ae = solve_ik(
+                chain,
+                base,
+                ToolFrame(np.zeros(3)),
+                point,
+                rotation=rotation,
+                seed=candidate,
+                iterations=600,
+                position_tol=1e-7,
+                angle_tol=1e-7,
+            )
+            if pe < 1e-5 and ae < 1e-5:
+                return q
+        raise ValueError(f"Dual UR5e pose unreachable: {point}, residual={pe}, {ae}")
+
+    def _gripper_visuals(self) -> None:
+        from pxr import Gf, UsdGeom
+
+        stage = self.sim_world.stage
+        for side in ("p", "n"):
+            sign = 1 if side == "p" else -1
+            jaw = UsdGeom.Cube.Define(stage, f"{self.config.prim_path}/jaw_{side}/visible_finger")
+            jaw.AddTranslateOp().Set(Gf.Vec3d(0, sign * 0.004, 0.03))
+            jaw.AddScaleOp().Set(Gf.Vec3f(0.006, 0.004, 0.05))
+            jaw.CreateDisplayColorAttr([Gf.Vec3f(0.9, 0.38, 0.06)])
+        palm = UsdGeom.Cube.Define(stage, f"{self.config.prim_path}/holder_mount/palm")
+        palm.AddTranslateOp().Set(Gf.Vec3d(0, 0, 0.11))
+        palm.AddScaleOp().Set(Gf.Vec3f(0.025, 0.045, 0.03))
+        palm.CreateDisplayColorAttr([Gf.Vec3f(0.12, 0.20, 0.28)])
+
+    def dual_control(
+        self,
+        *,
+        holder_z_m: float,
+        driver_z_m: float,
+        finger_m: float,
+        preload: bool,
+        speed: float,
+        hold: bool,
+        measured: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Command both arms and the two fingers, without prescribing nut or thread motion."""
+        self.arm_goal = self._solve_pose(
+            self.chain, self.chain_base, [0, 0, driver_z_m], np.eye(3), self.arm_goal
+        )
+        self.holder_goal = self._solve_pose(
+            self.holder_chain,
+            self.holder_base,
+            [0, 0, holder_z_m],
+            self.holder_rotation,
+            self.holder_goal,
+        )
+        q, qd = np.zeros(16), np.zeros(16)
+        q[self.arm_dofs], q[self.holder_dofs] = self.arm_goal, self.holder_goal
+        q[self.finger_dofs] = finger_m
+        q[self.screw_dofs[0]] = (
+            measured[self.screw_dofs[0]]
+            if hold
+            else self.config.axial_preload_target_m
+            if preload
+            else 0.0
+        )
+        qd[self.screw_dofs[1]] = speed
+        action = q.copy()
+        action[self.screw_dofs[1]] = speed
+        return q, qd, action
+
+    def publish_newton(self, poses: np.ndarray) -> None:
+        """Publish both solved arms and fingers at the same physical sample."""
+        from pxr import Gf
+
+        super().publish_newton(poses)
+        for index, op in self._holder_ops.items():
+            pose = poses[index]
+            matrix = Gf.Matrix4d().SetRotate(Gf.Quatd(float(pose[6]), *pose[3:6].astype(float)))
+            matrix.SetTranslateOnly(Gf.Vec3d(*pose[:3].astype(float)))
+            op.Set(matrix)
+        pose = poses[self.holder_tcp_body]
+        self.poses_realtime["holder_tcp"] = (
+            pose[:3].astype(float) + self.config.base_position,
+            pose[[6, 3, 4, 5]].astype(float),
+        )

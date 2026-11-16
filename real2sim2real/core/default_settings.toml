@@ -32,6 +32,8 @@ backend = "stub"
 # pickplace_package：garment_mass_kg=None、bag_mass_kg=None，按原逐点比例覆盖各部分总质量。
 # screw_assembly：bolt_mesh_path/nut_mesh_path 位于 assets/PhysicSolver/Screw/M20/。
 # thread_pitch_m=0.0025、initial_engagement_m=0.004；固定螺母、真实螺纹网格。
+# dual_screw_assembly 继承 M20 资产字段；nut_support_height_m=0.10，抬升后螺母为自由刚体。
+# screw_assembly：bolt_texture_path=None 保留旧金属外观；可指定任务内的旋转标记贴图。
 # sorting_package：station_usd_path 指向旧分拣工位，cloth_usd_path 默认 v7_sorting 快照（正式配置用 v10_station）。
 # infeed_path/platform_path/outfeed_path 读取各自 USD 支撑面；support_depth_m=0.04。
 # garment_mass_kg=0.2；bag_mass_kg 默认不覆盖袋膜质量。可显式设置两者并保持各自质量分布。
@@ -63,6 +65,13 @@ backend = "stub"
 # pad_center_m=[0,0.007,0.055]；pad_density_kg_m3=1000 为未硬件标定的仿真密度。
 # screw_spindle：axial_stiffness_n_m=100、axial_damping_n_s_m=5、axial_preload_target_m=-0.04。
 # spindle_damping_nm_s_rad=0.02、maximum_torque_nm=0.3、carriage_mass_kg=0.05；无限旋转。
+# ur5e_screwdriver 继承上述主轴字段；usd_path="assets/PhysicSolver/Robot/ur5e/ur5e.usda"，
+# prim_path="/World/robots/UR5eScrewdriver"、arm_base_offset_m=[-0.45,0,0]、tool_length_m=0.30。
+# arm_stiffness_nm_rad=12000、arm_damping_nm_s_rad=400、arm_max_torque_nm=150。
+# loading_stroke_m=0.003、loading_duration_s=1.0；机身固定法兰，轴向弹簧驱动套筒进给。
+# dual_ur5e_screwdriver：第二臂 nut_arm_base_offset_m=[0.45,0.28,0]、gripper_length_m=0.14；
+# finger_open_m=0.028、finger_closed_m=0.013（示例配置为0.012）、finger_stiffness_n_m=30000；
+# finger_damping_ns_m=150、finger_max_force_n=100、finger_friction=1.5、finger_hydroelastic_stiffness=1e10。
 # pro_m6_newton：保留原 USD 世界位姿、惯量与原生 Robotiq 碰撞近似。
 # arm_stiffness/arm_damping=6000/300、finger_stiffness/finger_damping=40/1。
 # finger_friction=1.4；cameras 支持头部及左右腕部挂载。
@@ -99,6 +108,14 @@ backend = "stub"
 # attachment_vertices_per_group=8、attachment_capture_distance_m=0.004、attachment_stiffness_n_m=30。
 # attachment_damping_n_s_m=0.015、attachment_max_force_n=0.5；释放时只关闭力，不改节点状态。
 # screw_assembly：sdf_resolution=128、hydroelastic_stiffness=1e11、friction=0.01、contact_capacity=40000。
+# ur5e_screwdriver 继承 screw_assembly 的螺纹字段；maximum_arm_tracking_error_rad=0.02。
+# dual_ur5e_screwdriver：clamp_s=0.8、lift_s=1.5、align_s=1.5、nut_lift_m=0.16；
+# driver_clearance_m=0.07、minimum_nut_lift_m=0.13、maximum_nut_grasp_slip_m=0.003；
+# maximum_nut_yaw_rad=0.05、minimum_bilateral_grip_fraction=0.95、mujoco_impratio=10。
+# minimum_tip_protrusion_m=0 保留原行为；穿透演示设 0.005，要求整个停止阶段露出至少 5mm。
+# release_s/post_release_s=0 禁用末段松爪；两者同时为正时在保持后张开并观察自由螺母。
+# minimum_released_finger_m=0.025，检查实测张开坐标和双侧零接触；夹持门限检查至松爪之前。
+# latch_axial_hold=false 保留旧行为；true 在首次停转时锁存轴向驱动位置目标，保持为有限刚度驱动。
 # spindle_speed_rad_s=-4、engage_s/screw_s/hold_s=0.5/5/1、minimum_turns=2、minimum_advance_m=0.006。
 # maximum_pitch_error_fraction=0.25、maximum_hold_drift_m=0.001、initial_yaw_deg=22.5。
 # hold_s/post_shake_hold_s=0、realign_before_release=false；新矩阵统一延长保持并重算下放航点。

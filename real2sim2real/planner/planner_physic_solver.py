@@ -27,7 +27,7 @@ from types import SimpleNamespace
 from typing import Any, Literal
 
 import numpy as np
-from pydantic import Field, FiniteFloat, model_validator
+from pydantic import Field, FiniteFloat, PositiveFloat, model_validator
 
 from real2sim2real.core.config import BaseConfig
 from real2sim2real.planner.base import BasePlanner
@@ -2498,17 +2498,9 @@ class ScrewRuntime:
                 cache_dir=str(Path("outputs/debug/physic_solver/sdf_cache").resolve()),
             )
             meshes[name] = mesh
-        nut_pose = wp.transform((0, 0, scene.nut_height_m), wp.quat(1, 0, 0, 0))
-        builder.add_shape_mesh(
-            -1, mesh=meshes["nut"], xform=nut_pose, cfg=shape_cfg, label="fixed_nut"
-        )
-        spindle = robot.add_newton_robot(
-            builder,
-            mount_z_m=scene.initial_bolt_z_m,
-            bolt_mesh=meshes["bolt"],
-            shape_config=shape_cfg,
-        )
-        builder.joint_q[1] = np.deg2rad(config.initial_yaw_deg)
+        spindle = self._build_assembly(builder, meshes, shape_cfg)
+        self.screw_dofs = getattr(robot, "screw_dofs", [0, 1])
+        builder.joint_q[self.screw_dofs[1]] = np.deg2rad(config.initial_yaw_deg)
         self.spindle_body = spindle
         self.model = builder.finalize(device=robot.sim_world.config.device)
         self.state_0, self.state_1 = self.model.state(), self.model.state()
@@ -2525,6 +2517,7 @@ class ScrewRuntime:
             njmax=config.contact_capacity,
             nconmax=config.contact_capacity,
             iterations=30,
+            **self._solver_options(),
         )
         self.pipeline = newton.CollisionPipeline(
             self.model,
@@ -2540,8 +2533,32 @@ class ScrewRuntime:
         self.target_q = np.array([robot.config.axial_preload_target_m, 0.0])
         self.publish()
 
+    def _build_assembly(self, builder: Any, meshes: dict, shape_cfg: Any) -> int:
+        """Build the original fixed-nut case; variants can supply a free gripped nut."""
+        wp = self.wp
+        nut_pose = wp.transform((0, 0, self.scene.nut_height_m), wp.quat(1, 0, 0, 0))
+        builder.add_shape_mesh(
+            -1, mesh=meshes["nut"], xform=nut_pose, cfg=shape_cfg, label="fixed_nut"
+        )
+        return self.robot.add_newton_robot(
+            builder,
+            mount_z_m=self.scene.initial_bolt_z_m,
+            bolt_mesh=meshes["bolt"],
+            shape_config=shape_cfg,
+        )
+
+    def _solver_options(self) -> dict[str, Any]:
+        """Keep the original solver defaults unless a task variant explicitly overrides them."""
+        return {}
+
     def command(self, speed: float, *, hold: bool = False) -> None:
         """Set spindle speed and a constant axial spring preload; never prescribe thread lead."""
+        if hasattr(self.robot, "screw_control"):
+            q, qd, action = self.robot.screw_control(self.state_0.joint_q.numpy(), speed, hold)
+            self.control.joint_target_q.assign(q)
+            self.control.joint_target_qd.assign(qd)
+            self.target_q = action
+            return
         axial = (
             float(self.state_0.joint_q.numpy()[0])
             if hold
@@ -2591,6 +2608,9 @@ class ScrewRuntime:
         transform = self.wp.transform(pose[:3], pose[3:])
         bolt = transform * self.wp.transform((0, 0, 0), self.wp.quat(1, 0, 0, 0))
         self.scene.publish_fastener("bolt", np.array(bolt, dtype=float))
+        if hasattr(self.robot, "publish_newton"):
+            self.robot.publish_newton(self.state_0.body_q.numpy())
+            return
         matrix = Gf.Matrix4d().SetRotate(Gf.Quatd(float(pose[6]), Gf.Vec3d(*pose[3:6].tolist())))
         matrix.SetTranslateOnly(Gf.Vec3d(*pose[:3].tolist()))
         self.robot.tool_transform.Set(matrix)
@@ -2604,6 +2624,16 @@ class ScrewRuntime:
     def recording_coordinates(self) -> tuple[np.ndarray, np.ndarray]:
         """Read axial displacement/continuous spindle angle and actual control targets."""
         return self.state_0.joint_q.numpy().astype(float), self.target_q.copy()
+
+    def screw_coordinates(self) -> np.ndarray:
+        """Read the axial spring and continuous spindle DOFs in either robot layout."""
+        result = self.state_0.joint_q.numpy()[self.screw_dofs].astype(float)
+        if hasattr(self.robot, "screw_control"):
+            result[0] = (
+                float(self.state_0.body_q.numpy()[self.spindle_body, 2])
+                - self.scene.initial_bolt_z_m
+            )
+        return result
 
 
 class ScrewPlanner(BasePlanner):
@@ -2639,7 +2669,7 @@ class ScrewPlanner(BasePlanner):
     def on_physics_step(self, robot: Any) -> bool:
         """Set motor controls and save measurements before the next physical step."""
         del robot
-        state, _ = self.runtime.recording_coordinates()
+        state = self.runtime.screw_coordinates()
         phase = (
             "engage"
             if self.elapsed < self.config.engage_s
@@ -3043,3 +3073,369 @@ class CartonPlanner(BasePlanner):
             carton_mass_kg=self.scene.config.carton_mass_kg,
             gripper="explicit 260mm-stroke parallel gripper with 90mm jaws",
         )
+
+
+# ================================================================================================
+# UR5e screw assembly uses the same real-thread runtime and unchanged thread acceptance.
+# ================================================================================================
+
+
+class ScrewArmPlannerConfig(ScrewPlannerConfig):
+    """Same thread requirements plus explicit UR5e servo tracking acceptance."""
+
+    backend: str = "ur5e_screwdriver"
+    maximum_arm_tracking_error_rad: PositiveFloat = 0.02
+
+
+class ScrewArmPlanner(ScrewPlanner):
+    """Record all arm DOFs and independently observable bolt motion."""
+
+    config_cls = ScrewArmPlannerConfig
+    action_names = [
+        f"{name}_target_rad"
+        for name in ("shoulder_pan", "shoulder_lift", "elbow", "wrist_1", "wrist_2", "wrist_3")
+    ] + ["axial_spring_target_m", "spindle_velocity_target_rad_s"]
+    recording_task = "Use the UR5e electric socket driver to screw an M20 bolt into the fixed nut."
+
+    def on_physics_step(self, robot: Any) -> bool:
+        """Log solved arm coordinates and bolt position with every thread measurement."""
+        done = super().on_physics_step(robot)
+        self.rows[-1].update(
+            arm_q_rad=self.runtime.state_0.joint_q.numpy()[robot.arm_dofs].astype(float).tolist(),
+            arm_target_rad=robot.arm_goal.tolist(),
+            joint_q=self.runtime.state_0.joint_q.numpy().astype(float).tolist(),
+            action=self.runtime.target_q.tolist(),
+            bolt_position_local_m=self.runtime.state_0.body_q.numpy()[self.runtime.spindle_body, :3]
+            .astype(float)
+            .tolist(),
+        )
+        return done
+
+    def result(self) -> dict[str, Any]:
+        """Keep all original thread gates and also require a finite, tracking arm."""
+        result = super().result()
+        if not self.rows:
+            return result
+        q = np.array([row["arm_q_rad"] for row in self.rows])
+        goals = np.array([row["arm_target_rad"] for row in self.rows])
+        error = float(np.max(np.abs(q - goals)))
+        result["checks"].update(
+            arm_finite=bool(np.isfinite(q).all()),
+            arm_tracks_driver=error <= self.config.maximum_arm_tracking_error_rad,
+        )
+        result.update(
+            success=all(result["checks"].values()),
+            maximum_arm_tracking_error_rad=error,
+            arm_joint_motion_rad=np.ptp(q, axis=0).tolist(),
+            fixture="fixed nut; UR5e flange-mounted electric driver with axial spring",
+            tool_clamp="ideal rigid hex socket gripping pre-engaged bolt; no screw/nut helix joint",
+            asset_layers=self.robot.state.get("asset_layers", []),
+        )
+        return result
+
+
+# ================================================================================================
+# Dual UR5e: close visible fingers, lift a free nut, approach with the driver, then thread.
+# ================================================================================================
+
+
+class DualScrewPlannerConfig(ScrewArmPlannerConfig):
+    """Timed pickup and the original thread gates plus measurable contact-only nut holding."""
+
+    backend: str = "dual_ur5e_screwdriver"
+    clamp_s: PositiveFloat = 0.8
+    lift_s: PositiveFloat = 1.5
+    align_s: PositiveFloat = 1.5
+    nut_lift_m: float = Field(default=0.16, ge=0.14, le=0.25)
+    driver_clearance_m: float = Field(default=0.07, ge=0.04, le=0.12)
+    minimum_nut_lift_m: PositiveFloat = 0.13
+    maximum_nut_grasp_slip_m: PositiveFloat = 0.003
+    maximum_nut_yaw_rad: PositiveFloat = 0.05
+    minimum_bilateral_grip_fraction: float = Field(default=0.95, gt=0, le=1)
+    mujoco_impratio: PositiveFloat = 10.0
+    minimum_tip_protrusion_m: float = Field(default=0.0, ge=0)
+    release_s: FiniteFloat = Field(default=0.0, ge=0)
+    post_release_s: FiniteFloat = Field(default=0.0, ge=0)
+    minimum_released_finger_m: PositiveFloat = 0.025
+    latch_axial_hold: bool = False
+
+    @model_validator(mode="after")
+    def _release_has_observation(self) -> DualScrewPlannerConfig:
+        if (self.release_s > 0) != (self.post_release_s > 0):
+            raise ValueError("release_s and post_release_s must both be zero or both positive")
+        return self
+
+
+class DualScrewRuntime(ScrewRuntime):
+    """Both arms and a freely moving nut use the same contact and rigid-body solver."""
+
+    def _solver_options(self) -> dict[str, Any]:
+        return {"impratio": self.config.mujoco_impratio}
+
+    def _build_assembly(self, builder: Any, meshes: dict, shape_cfg: Any) -> int:
+        from dataclasses import replace
+
+        wp, newton = self.wp, self.newton
+        scene, config, robot = self.scene, self.config, self.robot
+        robot.pickup_z_m = scene.nut_grasp_z_m
+        # Stop with the bolt tip 1mm above the raised nut; spring feed establishes contact.
+        self.driver_work_z_m = (
+            scene.config.nut_support_height_m
+            + config.nut_lift_m
+            + scene.nut_top_m
+            + scene.bolt_tip_m
+            + 0.001
+        )
+        self.driver_hover_z_m = self.driver_work_z_m + config.driver_clearance_m
+        spindle = robot.add_newton_robot(
+            builder,
+            mount_z_m=self.driver_hover_z_m,
+            bolt_mesh=meshes["bolt"],
+            shape_config=shape_cfg,
+        )
+        self.nut_body = builder.add_link(
+            xform=wp.transform((0, 0, scene.nut_initial_z_m), wp.quat_identity()),
+            label="free_m20_nut",
+        )
+        self.nut_shape = builder.add_shape_mesh(
+            self.nut_body,
+            mesh=meshes["nut"],
+            xform=wp.transform((0, 0, 0), wp.quat(1, 0, 0, 0)),
+            cfg=shape_cfg,
+            label="freely_gripped_threaded_nut",
+        )
+        joint = builder.add_joint_free(self.nut_body, label="unconstrained_nut_6dof")
+        self.nut_joint = joint
+        builder.add_articulation([joint], label="free_nut_not_attached_to_gripper")
+        support_cfg = newton.ModelBuilder.ShapeConfig(
+            ke=1e7, kd=1e4, mu=0.8, margin=0, gap=0, density=0
+        )
+        self.table_shape = builder.add_shape_box(
+            -1,
+            hx=0.85,
+            hy=0.65,
+            hz=0.025,
+            xform=wp.transform((0, 0, -0.025), wp.quat_identity()),
+            cfg=support_cfg,
+            label="physical_tabletop",
+        )
+        h = scene.config.nut_support_height_m
+        self.support_shape = builder.add_shape_box(
+            -1,
+            hx=0.03,
+            hy=0.03,
+            hz=h * 0.5,
+            xform=wp.transform((0, 0, h * 0.5), wp.quat_identity()),
+            cfg=replace(support_cfg),
+            label="visible_nut_pickup_support",
+        )
+        return spindle
+
+    def publish(self) -> None:
+        """Publish the nut from its free-body state, never from a holder attachment."""
+        super().publish()
+        pose = self.state_0.body_q.numpy()[self.nut_body]
+        transformed = self.wp.transform(pose[:3], pose[3:]) * self.wp.transform(
+            (0, 0, 0), self.wp.quat(1, 0, 0, 0)
+        )
+        self.scene.publish_fastener("nut", np.array(transformed, dtype=float))
+
+    def command_dual(
+        self,
+        *,
+        holder_z_m: float,
+        driver_z_m: float,
+        finger_m: float,
+        preload: bool,
+        speed: float,
+        hold: bool,
+    ) -> None:
+        q, qd, action = self.robot.dual_control(
+            holder_z_m=holder_z_m,
+            driver_z_m=driver_z_m,
+            finger_m=finger_m,
+            preload=preload,
+            speed=speed,
+            hold=hold,
+            measured=self.state_0.joint_q.numpy(),
+        )
+        if self.config.latch_axial_hold:
+            if not hold:
+                self.axial_hold_target_m = None
+            else:
+                dof = self.robot.screw_dofs[0]
+                if getattr(self, "axial_hold_target_m", None) is None:
+                    self.axial_hold_target_m = float(q[dof])
+                q[dof] = action[dof] = self.axial_hold_target_m
+        full_q = np.zeros(self.model.joint_dof_count)
+        full_qd = np.zeros_like(full_q)
+        full_q[:16], full_qd[:16] = q, qd
+        self.control.joint_target_q.assign(full_q)
+        self.control.joint_target_qd.assign(full_qd)
+        self.target_q = action
+
+    def recording_coordinates(self) -> tuple[np.ndarray, np.ndarray]:
+        """Record the 16 robot DOFs; the independent nut pose is in the physical log."""
+        return self.state_0.joint_q.numpy()[:16].astype(float), self.target_q.copy()
+
+    def contact_counts(self) -> dict[str, int]:
+        """Count actual nut/thread, bilateral jaw and support contacts separately."""
+        count = int(self.contacts.rigid_contact_count.numpy()[0])
+        a = self.contacts.rigid_contact_shape0.numpy()[:count]
+        b = self.contacts.rigid_contact_shape1.numpy()[:count]
+
+        def pairs(other: int) -> int:
+            return int(
+                np.count_nonzero(
+                    ((a == self.nut_shape) & (b == other)) | ((b == self.nut_shape) & (a == other))
+                )
+            )
+
+        return dict(
+            thread=pairs(self.robot.bolt_shape),
+            jaw_p=pairs(self.robot.finger_shapes[0]),
+            jaw_n=pairs(self.robot.finger_shapes[1]),
+            support=pairs(self.support_shape) + pairs(self.table_shape),
+        )
+
+
+class DualScrewPlanner(ScrewArmPlanner):
+    """Close, lift and hold with arm two before driving the bolt with arm one."""
+
+    config_cls = DualScrewPlannerConfig
+    action_names = (
+        [f"driver_{name}" for name in ScrewArmPlanner.action_names]
+        + [
+            f"holder_{name}_target_rad"
+            for name in ("shoulder_pan", "shoulder_lift", "elbow", "wrist_1", "wrist_2", "wrist_3")
+        ]
+        + ["holder_finger_n_target_m", "holder_finger_p_target_m"]
+    )
+    recording_task = (
+        "Grip and lift a free M20 nut with the second UR5e, then screw the bolt into it."
+    )
+
+    @property
+    def expected_duration_s(self) -> float:
+        from real2sim2real.utils.physic_solver_utils import dual_screw_phases
+
+        return sum(duration for _, duration in dual_screw_phases(self.config))
+
+    def begin_episode(self, scene: Any) -> None:
+        """Allocate the free nut and both physical arms once, without later resets."""
+        self.scene = scene
+        self.runtime = DualScrewRuntime(self.robot, scene, self.config)
+        self.elapsed, self.relative_angle, self.previous_yaw = 0.0, 0.0, None
+        self.rows.clear()
+        self.state.update(done=False, phase="clamp")
+
+    def on_physics_step(self, robot: Any) -> bool:
+        """Plan both arm targets and log the independently moving nut every physics step."""
+        from real2sim2real.utils.battery_disassembly_utils import quat_to_matrix
+        from real2sim2real.utils.physic_solver_utils import dual_screw_phase
+
+        phase, u = dual_screw_phase(self.elapsed, self.config)
+        smooth = u * u * (3 - 2 * u)
+        holder_z = self.scene.nut_grasp_z_m
+        if phase == "lift":
+            holder_z += self.config.nut_lift_m * smooth
+        elif phase not in {"clamp"}:
+            holder_z += self.config.nut_lift_m
+        driver_z = self.runtime.driver_hover_z_m
+        if phase == "align":
+            driver_z -= self.config.driver_clearance_m * smooth
+        elif phase in {"engage", "screw", "hold", "release", "released"}:
+            driver_z = self.runtime.driver_work_z_m
+        finger = robot.config.finger_closed_m
+        if phase == "clamp":
+            finger = robot.config.finger_open_m + smooth * (
+                robot.config.finger_closed_m - robot.config.finger_open_m
+            )
+        elif phase == "release":
+            finger += smooth * (robot.config.finger_open_m - robot.config.finger_closed_m)
+        elif phase == "released":
+            finger = robot.config.finger_open_m
+        done = self.elapsed + 1e-10 >= self.expected_duration_s
+        self.runtime.command_dual(
+            holder_z_m=holder_z,
+            driver_z_m=driver_z,
+            finger_m=finger,
+            preload=phase in {"engage", "screw", "hold", "release", "released"},
+            speed=self.config.spindle_speed_rad_s if phase == "screw" else 0.0,
+            hold=phase in {"hold", "release", "released"},
+        )
+        poses = self.runtime.state_0.body_q.numpy().astype(float)
+        nut, bolt = poses[self.runtime.nut_body], poses[self.runtime.spindle_body]
+        holder = poses[robot.holder_tcp_body]
+        nut_r = quat_to_matrix(nut[[6, 3, 4, 5]])
+        holder_r = quat_to_matrix(holder[[6, 3, 4, 5]])
+        bolt_r = quat_to_matrix(bolt[[6, 3, 4, 5]])
+        relative_r = nut_r.T @ bolt_r
+        yaw = float(np.arctan2(relative_r[1, 0], relative_r[0, 0]))
+        if self.previous_yaw is None:
+            self.relative_angle = yaw
+        else:
+            self.relative_angle += np.arctan2(
+                np.sin(yaw - self.previous_yaw), np.cos(yaw - self.previous_yaw)
+            )
+        self.previous_yaw = yaw
+        relative_z = float((nut_r.T @ (bolt[:3] - nut[:3]))[2])
+        contacts = self.runtime.contact_counts()
+        q, action = self.runtime.recording_coordinates()
+        self.rows.append(
+            dict(
+                time_s=self.elapsed,
+                phase=phase,
+                axial_displacement_m=relative_z,
+                spindle_angle_rad=float(self.relative_angle),
+                tip_protrusion_m=float(
+                    -self.scene.nut_height_m
+                    - (
+                        nut_r.T
+                        @ (bolt[:3] + bolt_r @ np.array([0, 0, -self.scene.bolt_tip_m]) - nut[:3])
+                    )[2]
+                ),
+                contacts=contacts["thread"],
+                jaw_p_contacts=contacts["jaw_p"],
+                jaw_n_contacts=contacts["jaw_n"],
+                support_contacts=contacts["support"],
+                joint_q=q.tolist(),
+                action=action.tolist(),
+                arm_q_rad=q[[*robot.arm_dofs, *robot.holder_dofs]].tolist(),
+                arm_target_rad=np.r_[robot.arm_goal, robot.holder_goal].tolist(),
+                bolt_pose_local_xyzw=bolt.tolist(),
+                nut_pose_local_xyzw=nut.tolist(),
+                holder_pose_local_xyzw=holder.tolist(),
+                bolt_position_local_m=bolt[:3].tolist(),
+                nut_center_local_m=(nut[:3] + nut_r @ np.array([0, 0, -0.028])).tolist(),
+                nut_relative_holder_m=(holder_r.T @ (nut[:3] - holder[:3])).tolist(),
+                nut_yaw_rad=float(np.arctan2(nut_r[1, 0], nut_r[0, 0])),
+            )
+        )
+        self.state.update(done=done, phase="done" if done else phase)
+        if not done:
+            self.elapsed += robot.sim_world.config.physics_dt
+        return done
+
+    def result(self) -> dict[str, Any]:
+        """Require actual pickup, bilateral support, no attachment and measured thread advance."""
+        from real2sim2real.utils.physic_solver_utils import evaluate_dual_screw_rows
+
+        result = evaluate_dual_screw_rows(
+            self.rows, self.config.model_dump(), self.scene.config.thread_pitch_m
+        )
+        result.update(
+            maximum_contacts=self.runtime.maximum_contacts,
+            contact_model="Newton hydroelastic SDF; one solver for both arms and the free nut",
+            fixture="second UR5e contact-only parallel gripper; no fixed nut or grasp attachment",
+            tool_clamp="ideal rigid hex socket gripping bolt; nut has six unconstrained DOFs",
+            nut_attachments_used=False,
+            newton_version=self.runtime.newton.__version__,
+            asset_layers=self.robot.state.get("asset_layers", []),
+        )
+        result["checks"]["no_contact_overflow"] = (
+            self.runtime.maximum_contacts < self.config.contact_capacity
+        )
+        result["checks"]["sequence_completed"] = bool(self.state.get("done"))
+        result["success"] = all(result["checks"].values())
+        return result

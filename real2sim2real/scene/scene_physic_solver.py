@@ -620,6 +620,7 @@ class ScrewSceneConfig(PickPlaceClothSceneConfig):
     nut_mesh_path: str = "assets/PhysicSolver/Screw/M20/nut.obj"
     initial_engagement_m: float = Field(default=0.004, gt=0, le=0.008)
     thread_pitch_m: float = Field(default=0.0025, gt=0)
+    bolt_texture_path: str | None = None
 
 
 class ScrewScene(PickPlaceClothScene):
@@ -648,6 +649,8 @@ class ScrewScene(PickPlaceClothScene):
             mesh.CreateFaceVertexIndicesAttr(triangles.ravel().tolist())
             mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
             mesh.CreateDisplayColorAttr([Gf.Vec3f(0.48, 0.53, 0.6)])
+            if name == "bolt" and self.config.bolt_texture_path:
+                self._bind_bolt_texture(mesh, vertices, triangles)
         self.nut_height_m = float(self.fastener_meshes["nut"][0][:, 2].max())
         nut_min = float(self.fastener_meshes["nut"][0][:, 2].min())
         self.nut_top_m = self.nut_height_m - nut_min
@@ -656,6 +659,45 @@ class ScrewScene(PickPlaceClothScene):
         # The nut and bolt are both flipped so the bolt head faces the overhead driver.
         self.publish_fastener("nut", np.array([0, 0, self.nut_height_m, 1, 0, 0, 0]))
         self.publish_fastener("bolt", np.array([0, 0, self.initial_bolt_z_m, 1, 0, 0, 0]))
+
+    def _bind_bolt_texture(self, mesh: Any, vertices: np.ndarray, triangles: np.ndarray) -> None:
+        """Paint rotation markers on the original mesh without changing its physical geometry."""
+        from pxr import Sdf, UsdGeom, UsdShade, Vt
+
+        from real2sim2real.utils.physic_solver_utils import screw_cylindrical_uv
+
+        texture = self._asset(self.config.bolt_texture_path)
+        uv = screw_cylindrical_uv(vertices, triangles)
+        UsdGeom.PrimvarsAPI(mesh).CreatePrimvar(
+            "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.faceVarying
+        ).Set(Vt.Vec2fArray.FromNumpy(uv))
+        stage = self.sim_world.stage
+        path = f"{self.config.prim_path}/bolt_rotation_material"
+        material = UsdShade.Material.Define(stage, path)
+        reader = UsdShade.Shader.Define(stage, f"{path}/UV")
+        reader.CreateIdAttr("UsdPrimvarReader_float2")
+        reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+        reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+        image = UsdShade.Shader.Define(stage, f"{path}/Texture")
+        image.CreateIdAttr("UsdUVTexture")
+        image.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(str(texture))
+        image.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("sRGB")
+        image.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("repeat")
+        image.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("clamp")
+        image.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
+            reader.ConnectableAPI(), "result"
+        )
+        image.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+        shader = UsdShade.Shader.Define(stage, f"{path}/Surface")
+        shader.CreateIdAttr("UsdPreviewSurface")
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(
+            image.ConnectableAPI(), "rgb"
+        )
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.45)
+        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.1)
+        shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
+        material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+        UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(material)
 
     def publish_fastener(self, name: str, pose_xyzw: np.ndarray) -> None:
         """Publish a local solver pose into the metre-scale world, caching measured poses."""
@@ -737,3 +779,37 @@ class CartonScene(PickPlaceClothScene):
         matrix.SetTranslateOnly(Gf.Vec3d(*pose[:3]))
         self.carton_visual.Set(matrix)
         self._cache_pose(self.target_prim_path, self._runtime_target_pose())
+
+
+# ================================================================================================
+# Dual-arm nut pickup: the nut starts on a visible raised support, then remains a free body.
+# ================================================================================================
+
+
+class DualScrewSceneConfig(ScrewSceneConfig):
+    """A raised pickup support leaves room for a horizontal, visible parallel gripper."""
+
+    backend: str = "dual_screw_assembly"
+    nut_support_height_m: float = Field(default=0.10, gt=0.06, le=0.20)
+
+
+class DualScrewScene(ScrewScene):
+    """Reuse M20 meshes and table, adding only the explicit nut pickup pedestal."""
+
+    config_cls = DualScrewSceneConfig
+
+    def _arrange_target(self) -> None:
+        from pxr import Gf, UsdGeom
+
+        super()._arrange_target()
+        self.nut_initial_z_m = self.nut_height_m + self.config.nut_support_height_m
+        self.nut_grasp_z_m = self.config.nut_support_height_m + self.nut_top_m * 0.5
+        self.publish_fastener("nut", np.array([0, 0, self.nut_initial_z_m, 1, 0, 0, 0]))
+        nut_mesh = UsdGeom.Mesh.Get(self.sim_world.stage, f"{self.config.prim_path}/nut/mesh")
+        nut_mesh.GetDisplayColorAttr().Set([Gf.Vec3f(0.75, 0.78, 0.82)])
+        support = UsdGeom.Cube.Define(self.sim_world.stage, f"{self.config.prim_path}/nut_support")
+        support.AddTranslateOp().Set(
+            Gf.Vec3d(*(self.screw_origin + [0, 0, self.config.nut_support_height_m * 0.5]))
+        )
+        support.AddScaleOp().Set(Gf.Vec3f(0.03, 0.03, self.config.nut_support_height_m * 0.5))
+        support.CreateDisplayColorAttr([Gf.Vec3f(0.18, 0.30, 0.38)])

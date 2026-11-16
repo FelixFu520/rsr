@@ -75,8 +75,13 @@ def initialize() -> tuple[Path, Path]:
         run = DEBUG / "recapture" / run_id
         snapshots = run / "prepared_configs"
         snapshots.mkdir(parents=True)
-        paths = sorted((ROOT / "configs/physic_solver").glob("*.toml"))
-        assert {p.stem for p in paths} == set(PHYSIC_SOLVER_CASE_NAMES.values())
+        # This historical 640px matrix stays fixed when independent demos are added.
+        paths = sorted(
+            ROOT / "configs/physic_solver" / f"{name}.toml"
+            for name in PHYSIC_SOLVER_CASE_NAMES.values()
+        )
+        if not all(path.is_file() for path in paths):
+            raise FileNotFoundError("A configured historical matrix case is missing")
         for path in paths:
             shutil.copy2(path, snapshots / path.name)
         POINTER.parent.mkdir(parents=True, exist_ok=True)

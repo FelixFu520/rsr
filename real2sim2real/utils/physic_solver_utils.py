@@ -791,3 +791,205 @@ def isaac_newton_sdk_environment() -> dict[str, str]:
         str(usd / "bin") + os.pathsep + environment.get("LD_LIBRARY_PATH", "")
     )
     return environment
+
+
+# ================================================================================================
+# UR5e screwdriver: source USD joint frames -> reusable SI serial-chain kinematics.
+# ================================================================================================
+
+
+def screw_arm_chain(stage: Any, root: str, tool_length_m: float) -> tuple[Any, np.ndarray]:
+    """Read the six UR5e joints and flange TCP without hard-coding DH dimensions."""
+    from pxr import Usd, UsdGeom, UsdPhysics
+
+    from real2sim2real.utils.battery_disassembly_utils import (
+        SerialChain,
+        quat_to_matrix,
+        transform,
+    )
+
+    def local_frame(joint: Any, side: int) -> np.ndarray:
+        q = getattr(joint, f"GetLocalRot{side}Attr")().Get()
+        p = getattr(joint, f"GetLocalPos{side}Attr")().Get()
+        return transform(quat_to_matrix([q.GetReal(), *q.GetImaginary()]), p)
+
+    names = [
+        "shoulder_pan_joint",
+        "shoulder_lift_joint",
+        "elbow_joint",
+        "wrist_1_joint",
+        "wrist_2_joint",
+        "wrist_3_joint",
+    ]
+    origins, axes, lower, upper = [], [], [], []
+    pending = np.eye(4)
+    for name in names:
+        joint = UsdPhysics.RevoluteJoint(stage.GetPrimAtPath(f"{root}/joints/{name}"))
+        origins.append(pending @ local_frame(joint, 0))
+        pending = np.linalg.inv(local_frame(joint, 1))
+        axes.append(np.eye(3)["XYZ".index(joint.GetAxisAttr().Get())])
+        lower.append(np.deg2rad(joint.GetLowerLimitAttr().Get()))
+        upper.append(np.deg2rad(joint.GetUpperLimitAttr().Get()))
+    wrist = np.asarray(
+        UsdGeom.Xformable(stage.GetPrimAtPath(f"{root}/wrist_3_link")).ComputeLocalToWorldTransform(
+            Usd.TimeCode.Default()
+        )
+    ).T
+    flange = np.asarray(
+        UsdGeom.Xformable(
+            stage.GetPrimAtPath(f"{root}/wrist_3_link/flange")
+        ).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+    ).T
+    mount = (
+        np.linalg.inv(wrist)
+        @ flange
+        @ transform(np.diag([1.0, -1.0, -1.0]), [0.0, 0.0, tool_length_m])
+    )
+    return SerialChain(
+        origins, axes, np.array(lower), np.array(upper), pending @ mount, names
+    ), mount
+
+
+# ================================================================================================
+# Dual-arm screw phase scheduling and acceptance (no Kit imports).
+# ================================================================================================
+
+
+def dual_screw_phases(config: Any) -> list[tuple[str, float]]:
+    """List active phases, preserving the original sequence when release is disabled."""
+    phases = []
+    for name in ("clamp", "lift", "align", "engage", "screw", "hold"):
+        duration = float(
+            config[f"{name}_s"] if isinstance(config, dict) else getattr(config, f"{name}_s")
+        )
+        phases.append((name, duration))
+    for name, key in (("release", "release_s"), ("released", "post_release_s")):
+        duration = float(
+            config.get(key, 0) if isinstance(config, dict) else getattr(config, key, 0)
+        )
+        if duration > 0:
+            phases.append((name, duration))
+    return phases
+
+
+def dual_screw_phase(time_s: float, config: Any) -> tuple[str, float]:
+    """Return ordered progress, clamped at the last active phase."""
+    remaining = time_s
+    phases = dual_screw_phases(config)
+    for index, (name, duration) in enumerate(phases):
+        if remaining < duration or index == len(phases) - 1:
+            return name, float(np.clip(remaining / duration, 0.0, 1.0))
+        remaining -= duration
+    raise RuntimeError("Unreachable dual screw phase")
+
+
+def screw_cylindrical_uv(vertices: np.ndarray, triangles: np.ndarray) -> np.ndarray:
+    """Return face-varying UVs fixed to the bolt, unwrapping triangles across the seam."""
+    corners = np.asarray(vertices)[triangles]
+    u = np.mod(np.arctan2(corners[..., 1], corners[..., 0]) / (2 * np.pi), 1.0)
+    seam = np.ptp(u, axis=1) > 0.5
+    u = np.where(seam[:, None] & (u < 0.5), u + 1.0, u)
+    z = np.asarray(vertices)[:, 2]
+    v = (corners[..., 2] - z.min()) / (z.max() - z.min())
+    return np.stack([u, v], axis=-1).reshape(-1, 2).astype(np.float32)
+
+
+def evaluate_dual_screw_rows(rows: list[dict], config: dict, pitch_m: float) -> dict:
+    """Measure threading relative to the free nut and actual contact-only pickup stability."""
+    screw = [i for i, row in enumerate(rows) if row["phase"] == "screw"]
+    hold = [i for i, row in enumerate(rows) if row["phase"] == "hold"]
+    carried = [
+        i for i, row in enumerate(rows) if row["phase"] not in {"clamp", "release", "released"}
+    ]
+    if not rows or not screw or not hold or not carried:
+        return {"success": False, "checks": {"sequence_completed": False}}
+    q = np.array([[r["axial_displacement_m"], r["spindle_angle_rad"]] for r in rows])
+    threaded = np.array(screw + hold)
+    start, end = q[screw[0]], q[hold[0]]
+    turns = abs(end[1] - start[1]) / (2 * np.pi)
+    advance = start[0] - end[0]
+    expected = turns * pitch_m
+    error = abs(advance - expected) / max(expected, 1e-12)
+    drift = float(np.ptp(q[hold, 0]))
+    residual = q[threaded, 0] - start[0] - (q[threaded, 1] - start[1]) * pitch_m / (2 * np.pi)
+    unthreaded = float(np.max(np.abs(residual)))
+    centers = np.array([r["nut_center_local_m"] for r in rows])
+    lift = float(np.min(centers[threaded, 2]) - centers[0, 2])
+    relative = np.array([rows[i]["nut_relative_holder_m"] for i in carried])
+    slip = float(np.max(np.linalg.norm(relative - relative[0], axis=1)))
+    yaw = np.unwrap(np.array([r["nut_yaw_rad"] for r in rows]))
+    nut_rotation = float(np.max(np.abs(yaw[carried] - yaw[carried[0]])))
+    bilateral = float(
+        np.mean([rows[i]["jaw_p_contacts"] > 0 and rows[i]["jaw_n_contacts"] > 0 for i in carried])
+    )
+    thread_fraction = float(np.mean([rows[i]["contacts"] > 0 for i in screw]))
+    arms = np.array([r["arm_q_rad"] for r in rows])
+    targets = np.array([r["arm_target_rad"] for r in rows])
+    arm_error = float(np.max(np.abs(arms - targets)))
+    duration = sum(duration for _, duration in dual_screw_phases(config))
+    checks = dict(
+        sequence_completed=rows[-1]["time_s"] >= duration - 1e-8,
+        finite_state=bool(np.isfinite(q).all() and np.isfinite(arms).all()),
+        spindle_rotated=turns >= config["minimum_turns"],
+        bolt_advanced=advance >= config["minimum_advance_m"],
+        thread_lead_matches=error <= config["maximum_pitch_error_fraction"],
+        helical_contact_observed=thread_fraction >= 0.95,
+        retained_during_hold=drift <= config["maximum_hold_drift_m"],
+        no_unthreaded_push_through=unthreaded <= config["maximum_unthreaded_advance_m"],
+        nut_actually_lifted=lift >= config["minimum_nut_lift_m"],
+        bilateral_finger_contact=bilateral >= config["minimum_bilateral_grip_fraction"],
+        nut_held_without_slip=slip <= config["maximum_nut_grasp_slip_m"],
+        nut_held_against_rotation=nut_rotation <= config["maximum_nut_yaw_rad"],
+        nut_clear_of_support_while_threading=all(
+            rows[i]["support_contacts"] == 0 for i in threaded
+        ),
+        both_arms_track=arm_error <= config["maximum_arm_tracking_error_rad"],
+    )
+    checks = {name: bool(value) for name, value in checks.items()}
+    protrusion = {}
+    if config.get("minimum_tip_protrusion_m", 0) > 0:
+        minimum_tip = float(np.min([rows[i]["tip_protrusion_m"] for i in hold]))
+        checks["bolt_protrudes_through_nut"] = bool(
+            np.isfinite(minimum_tip) and minimum_tip >= config["minimum_tip_protrusion_m"]
+        )
+        protrusion["minimum_hold_tip_protrusion_m"] = minimum_tip
+    if config.get("release_s", 0) > 0:
+        released = [r for r in rows if r["phase"] == "released"]
+        checks["released_observation_recorded"] = bool(released)
+        if released:
+            opening = float(np.min([r["joint_q"][14:16] for r in released]))
+            fraction = float(np.mean([r["contacts"] > 0 for r in released]))
+            tip = float(np.min([r["tip_protrusion_m"] for r in released]))
+            checks.update(
+                gripper_actually_reopened=opening >= config["minimum_released_finger_m"],
+                nut_clear_of_both_fingers=all(
+                    r["jaw_p_contacts"] == r["jaw_n_contacts"] == 0 for r in released
+                ),
+                nut_retained_on_bolt_after_release=fraction >= 0.95 and tip > 0,
+            )
+            if config.get("minimum_tip_protrusion_m", 0) > 0:
+                checks["bolt_still_protrudes_after_release"] = (
+                    tip >= config["minimum_tip_protrusion_m"]
+                )
+            protrusion.update(
+                minimum_released_finger_m=opening,
+                released_thread_contact_fraction=fraction,
+                minimum_released_tip_protrusion_m=tip,
+            )
+    return dict(
+        success=all(checks.values()),
+        checks=checks,
+        turns=float(turns),
+        axial_advance_m=float(advance),
+        expected_thread_advance_m=float(expected),
+        pitch_error_fraction=float(error),
+        hold_drift_m=drift,
+        maximum_unthreaded_advance_m=unthreaded,
+        minimum_nut_lift_m=lift,
+        maximum_nut_grasp_slip_m=slip,
+        maximum_nut_yaw_rad=nut_rotation,
+        bilateral_grip_fraction=bilateral,
+        thread_contact_fraction=thread_fraction,
+        maximum_arm_tracking_error_rad=arm_error,
+        **protrusion,
+    )

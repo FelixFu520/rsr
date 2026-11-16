@@ -1,0 +1,93 @@
+# mujoco_hydroelastic_screw02_ur5e
+# UR5e + compliant electric socket driver; real M20 hydroelastic thread contact.
+# Prepare: ./app/python.sh scripts/physic_solver/prepare_screw_arm_assets.py
+[sim_world]
+backend = "isaacsim"
+physics_engine = "newton"
+newton_execution = "direct"
+newton_solver = "mujoco"
+physics_dt = 0.008333333333333333
+newton_substeps = 4
+newton_use_cuda_graph = true
+device = "cuda:0"
+headless = true
+renderer = "PathTracing"
+synchronous_capture = true
+samples_per_pixel_per_frame = 64
+pathtracing_max_bounces = 4
+pathtracing_cached = false
+pathtracing_many_light_sampling = false
+width = 1024
+height = 768
+rt_subframes = 4
+warmup_frames = 2
+
+[scene]
+backend = "screw_assembly"
+object_kind = "screw"
+bolt_mesh_path = "assets/PhysicSolver/Screw/M20/bolt.obj"
+nut_mesh_path = "assets/PhysicSolver/Screw/M20/nut.obj"
+thread_pitch_m = 0.0025
+initial_engagement_m = 0.004
+target_xy = [ 0.1, 0.0,]
+fill_light_intensity = 200
+key_light_intensity = 700
+[[scene.cameras]]
+name = "overview"
+prim_path = "/World/scene/overview_cam"
+pose_relative_to = "/World/scene"
+resolution = [1024, 768]
+clipping_range = [0.001, 10.0]
+focal_length = 28.0
+[scene.cameras.pose]
+position = [1.05, -1.25, 1.45]
+orientation_wxyz = [0.741962747163357, 0.5686483213481712, 0.21603806067752568, 0.28188282102392326]
+
+[[scene.cameras]]
+name = "threads"
+prim_path = "/World/scene/threads_cam"
+pose_relative_to = "/World/scene"
+resolution = [1024, 768]
+clipping_range = [0.001, 10.0]
+focal_length = 35.0
+[scene.cameras.pose]
+position = [0.29, -0.26, 0.96]
+orientation_wxyz = [0.822757935341633, 0.47619842603826656, 0.15545333144619883, 0.26858648628203413]
+
+[robot]
+backend = "ur5e_screwdriver"
+axial_stiffness_n_m = 200.0
+axial_damping_n_s_m = 8.0
+axial_preload_target_m = -0.04
+spindle_damping_nm_s_rad = 0.02
+maximum_torque_nm = 0.3
+carriage_mass_kg = 0.05
+
+[planner]
+backend = "ur5e_screwdriver"
+sdf_resolution = 128
+hydroelastic_stiffness = 100000000000.0
+friction = 0.01
+contact_capacity = 40000
+spindle_speed_rad_s = -3.0
+engage_s = 1.5
+screw_s = 7.0
+hold_s = 1.0
+minimum_turns = 2.0
+minimum_advance_m = 0.006
+maximum_pitch_error_fraction = 0.25
+maximum_hold_drift_m = 0.001
+
+[job]
+backend = "screw_assembly"
+output_dir = "outputs/physic_solver/mujoco_hydroelastic_screw02_ur5e"
+timeout_s = 7200
+max_steps = 2000
+record_rgb = true
+
+[job.recorder]
+fps = 30
+width = 1024
+height = 768
+save_failed_episodes = true
+task = "mujoco_hydroelastic_screw02_ur5e"

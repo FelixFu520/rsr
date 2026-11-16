@@ -58,7 +58,9 @@
 | `package06` | 黑色连帽衫包裹 | `assets/PhysicSolver/Package/v10/black_hoodie/` |
 | `package07` | 原尺寸纸箱01，350g | `assets/PhysicSolver/Package/v10/box01/` |
 | `package08` | 原尺寸纸箱02，250g | `assets/PhysicSolver/Package/v10/box02/` |
-| `screw01` | M20 loose螺栓／螺母 | `assets/PhysicSolver/Screw/M20/` |
+| `screw01` | M20 loose螺栓／螺母（导向主轴） | `assets/PhysicSolver/Screw/M20/` |
+| `screw02` | 同一 M20 loose螺纹副 + UR5e 电批工位 | `assets/PhysicSolver/Screw/M20/`、`Robot/ur5e/` |
+| `screw03` | 双 UR5e，自由螺母拾取后旋入 | 同上，新增夹爪和支座均由代码生成 |
 
 重量工况的100／200／350／500g指衣物质量；袋膜另约20.54g，不把两者混作总负载。
 纸箱采用原尺寸刚性包围盒，不模拟纸板压溃。模型、MDL、贴图、URDF、许可证和来源哈希均位于本任务资产目录，
@@ -98,6 +100,10 @@
 | [mujoco_vbd_package01_pos_x35mm_shake_spring](../configs/physic_solver/mujoco_vbd_package01_pos_x35mm_shake_spring.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_vbd_package01_pos_x35mm_shake_spring/` |
 | [mujoco_hydroelastic_screw01_rotate](../configs/physic_solver/mujoco_hydroelastic_screw01_rotate.toml) | 正式采集目标 | `outputs/physic_solver/mujoco_hydroelastic_screw01_rotate/` |
 | [mujoco_hydroelastic_screw01_rotate_debug](../configs/physic_solver/mujoco_hydroelastic_screw01_rotate_debug.toml) | 物理排错，不录RGB | `outputs/debug/physic_solver/mujoco_hydroelastic_screw01_rotate_debug/` |
+| [mujoco_hydroelastic_screw02_ur5e](../configs/physic_solver/mujoco_hydroelastic_screw02_ur5e.toml) | UR5e 电批，1K / 30fps | `outputs/physic_solver/mujoco_hydroelastic_screw02_ur5e/` |
+| [mujoco_hydroelastic_screw02_ur5e_debug](../configs/physic_solver/mujoco_hydroelastic_screw02_ur5e_debug.toml) | UR5e 电批，640px / 15fps | `outputs/debug/physic_solver/mujoco_hydroelastic_screw02_ur5e_debug/` |
+| [mujoco_hydroelastic_screw03_dual_ur5e](../configs/physic_solver/mujoco_hydroelastic_screw03_dual_ur5e.toml) | 双 UR5e，夹起螺母后旋入，1K / 30fps | `outputs/physic_solver/mujoco_hydroelastic_screw03_dual_ur5e/` |
+| [mujoco_hydroelastic_screw03_dual_ur5e_debug](../configs/physic_solver/mujoco_hydroelastic_screw03_dual_ur5e_debug.toml) | 双臂调试，640px / 15fps | `outputs/debug/physic_solver/mujoco_hydroelastic_screw03_dual_ur5e_debug/` |
 
 ## 4. 本轮重新采集
 
@@ -251,3 +257,412 @@ package05首轮已完成夹起、转运与释放，但落点误差84.6mm超过80
 资产准备脚本为 `prepare_physic_solver_assets.py`、`prepare_official_newton_cloth.py`、
 `prepare_package_assets.py` 与 `prepare_screw_assets.py`；后端注册见 `pyproject.toml`。
 运行时继续使用Isaac `python.sh`，没有创建 `.venv`，无新增包依赖，不修改其他任务配置、资产和输出。
+
+## 9. UR5e 电批拧螺栓 demo
+
+本变体丰富现有 `physic_solver`，旧的 `screw01` 主轴案例和已验收输出保持原样。
+目标是演示 UR5e 的法兰安装电批，以连续旋转套筒将 M20 六角头螺栓拧入固定螺母。
+螺栓起始已预入牙 4 mm、已被理想刚性套筒夹住；不包含取料、视觉找孔、自动上批或退出套筒。
+机械臂先进行 3 mm 的平滑加载，随后保持法兰位置；浮动轴的弹簧预压和真实螺纹接触决定进给。
+这是旋入和保持演示，尚不模拟拧紧至贴合后的预紧力或扭矩停机。
+
+运行环境沿用 Isaac Sim 6.2 rc.14、Kit 内 Newton 1.6.1 / Warp 1.17.0、MuJoCo Warp。
+没有新增 pip 依赖。视频处理依赖系统 `ffmpeg` / `ffprobe`，采集器复用现有 GPU 预算单调时钟补丁，
+编译该小型补丁需要 `cc`（Debian/Ubuntu 的 `build-essential`）。没有创建 `.venv`。
+
+### 9.1 资产和物理
+
+- UR5e 来源：用户的 `/home/fufa/Projects/screwdriving_robot_usd/screwdriving_robot_usd/universalrobots_ur5e/`。
+  复制整个 45 文件、约 15 MiB 的包到 `assets/PhysicSolver/Robot/ur5e/`；不修改源目录。
+  上游为 NVIDIA isaacsim-assets，固定 revision `a0d9dfbac5163a7005442ae4fe8f954ff6780093`；
+  主包 BSD-3-Clause，附带依赖保留其许可。`provenance.json` 记录逐文件 SHA-256、大小和来源。
+- 该源包只有机械臂，没有电批。电批机身、法兰适配器、浮动鼻部、转轴和套筒由 Robot 用 USD 几何生成，
+  不引用其它任务资产；套筒橙色标记用于辨认连续旋转，机身保持固定。无需额外 Blender 或网络资产。
+- 真实 M20 螺栓／螺母沿用 `assets/PhysicSolver/Screw/M20/` 的 IsaacGymEnvs Factory 网格；
+  桌面沿用该任务自己的 `Table/Aligned.usd`。所有本地 layer 位于 `assets/PhysicSolver/` 内。
+- 六个机械臂旋转关节、轴向浮动关节、无限旋转关节属于同一 Newton articulation，均由动力学求解。
+  源 USD 的 7 个连杆质量、惯量和凸分解碰撞体被导入；角驱动显式改为 SI 增益，
+  `kp=12000 N·m/rad`、`kd=400 N·m·s/rad`、力矩限值 `150 N·m`，不是实机控制器标定结果。
+- 继续选择 **Newton direct + MuJoCo + hydroelastic SDF**，以保留已验证的实际螺纹接触。
+  未选用电池拆解的 PhysX mimic 螺旋约束，因为该变体要保持原验证案例的真实螺纹进给。
+  物理 120 Hz，每步 4 子步，SDF 128、刚度 `1e11`、摩擦 `0.01`，与原案例一致。
+  导入接口已对照本机实现和 [Newton 1.6.1 ModelBuilder 文档](https://newton-physics.github.io/newton/1.6.1/api/_generated/newton.ModelBuilder.html)。
+- 螺栓头与套筒为**明确的理想刚性夹持模型**，不验证套筒接触滑移或防脱。
+  没有螺栓／螺母间的螺旋关节、吸附或按转角指定轴向轨迹。
+  电批外壳是可视几何，尚未做整机与工位的碰撞验收；本 demo 不能替代工艺安全或负载验证。
+
+### 9.2 组件与命令
+
+复用 Scene `screw_assembly`、Job `screw_assembly`，新 Robot / Planner 均为 `ur5e_screwdriver`，
+仍按 `BaseJob.run()` 生命周期执行。代码写入任务原有的 robot / planner / utils 文件；
+`ScrewRuntime` 用实际螺栓世界高度计算旋入量，避免将浮动轴相对位移误认为总进给。
+记录 8 维实测状态：六个机械臂角度、浮动轴位移、连续主轴角度；8 维动作：六个位置目标、
+弹簧位移目标、主轴速度目标。逐物理步 `trajectory.json` 保留与视频采样对应的测量和命令。
+
+```bash
+# 资产准备；已存在但哈希不同的文件拒绝覆盖。
+./app/python.sh scripts/physic_solver/prepare_screw_arm_assets.py
+
+# 只跑物理（先选择新的 output_dir）。
+RSR_JOB__record_rgb=false \
+RSR_JOB__output_dir=outputs/debug/physic_solver/ur5e_physics_new \
+./scripts/rsr collect run \
+  -c configs/physic_solver/mujoco_hydroelastic_screw02_ur5e_debug.toml
+
+# 640×480、15fps、MinimalRendering 纹理预览，仍是 RTX。
+./scripts/rsr collect run \
+  -c configs/physic_solver/mujoco_hydroelastic_screw02_ur5e_debug.toml
+
+# 正式 1024×768、30fps、PathTracing：64 samples/pixel，4 次反弹，空间降噪。
+# 采集器在 debug 目录暂存，进行物理、状态/动作对齐、全视频解码和关键帧校验。
+./app/python.sh scripts/physic_solver/collect_screw_arm_demo.py
+
+# 查看 run/capture/qa/keyframes.jpg 和双视角视频后，在
+# run/capture/qa/visual_review.json 记录 passed=true、检查范围和观察结果，再发布：
+./app/python.sh scripts/physic_solver/collect_screw_arm_demo.py --publish-run <run>
+
+# 独立重验：
+./app/python.sh scripts/physic_solver/validate_screw_assembly.py <output>
+```
+
+采集器拒绝覆盖已有输出。再次运行时通过 `RSR_JOB__output_dir` 指定新目录。
+两个配置只改变渲染、分辨率、fps 和输出目录，物理与验收门限一致。
+历史 `recapture_physic_solver.py` 的 640px 矩阵明确只读取其既有清单，不自动加入本 1K demo。
+正式目录包含 LeRobot v3、原始轨迹、配置、验收报告、双路 MP4 和 `demo.mp4` 同步并排预览。
+
+### 9.3 验收与调试记录
+
+沿用原门限：旋转至少 2 圈、旋入至少 6 mm、导程误差不超过 25%、保持漂移不超过 1 mm、
+全过程螺旋残差不超过 2 mm、旋入阶段至少 95% 的物理帧有接触、接触数量小于 40000。
+新增机械臂角度跟踪误差不超过 0.02 rad、8 维状态/动作与原始物理日志逐帧一致、
+本地资产 layer 无跨任务依赖。正式结果另需双相机关键帧视觉复核。
+
+首次物理通过（`outputs/debug/physic_solver/ur5e_development/physics04`）：
+3.4991 圈、8.7093 mm 旋入、0.4386% 导程误差、0.1416 mm 保持漂移、
+0.4195 mm 最大螺旋残差、98.69% 接触帧、0.001223 rad 最大机械臂跟踪误差。
+640px 调试全流程通过（143 帧/相机）：3.4942 圈、8.5792 mm 旋入、1.7882% 导程误差。
+两路的起点、中点、终点关键帧已实际查看；正式版本将全景焦距由 35 mm 改为 28 mm，避免顶部裁切。
+
+失败与修复均保存在 `outputs/debug/physic_solver/ur5e_development/`：
+
+| 记录 | 现象与修复 |
+|---|---|
+| `physics01` | 相机继承时列表追加，出现同名相机；debug scene 显式替换该 section。 |
+| `physics02` | 引用根已有 translate 属性；先清除 xformOpOrder 再覆盖变换。 |
+| `physics03` | 临时 stage 默认 Y-up，机器人被导入器旋转，批头偏离螺母；显式设 Z-up、米。该失败未发布。 |
+| `physics04` | 坐标修复后全部物理门限通过，未降低门限。 |
+| `original_screw_regression` | 原主轴版本复测通过：3.4902 圈、8.6977 mm、0.3184% 导程误差。 |
+
+GPU 接触求解在不同运行间有小幅差异，上述每次运行独立验收，没有选帧拼接或重置后拼接。
+回归：无 Kit 测试 355 通过 / 3 跳过（基线 350 / 3），ruff、全任务配置校验通过；
+Newton direct 自由落体/只渲染冒烟通过。未验证官方 LeRobot SDK 加载、自动取螺栓、脱离套筒和终拧扭矩。
+
+### 9.4 正式结果（2026-11-15，EST）
+
+[双视角 demo.mp4](../outputs/physic_solver/mujoco_hydroelastic_screw02_ur5e/demo.mp4) ·
+[全景](../outputs/physic_solver/mujoco_hydroelastic_screw02_ur5e/overview.mp4) ·
+[螺纹特写](../outputs/physic_solver/mujoco_hydroelastic_screw02_ur5e/threads.mp4) ·
+[关键帧](../outputs/physic_solver/mujoco_hydroelastic_screw02_ur5e/qa/keyframes.jpg) ·
+[独立验收](../outputs/physic_solver/mujoco_hydroelastic_screw02_ur5e/validation.json)。
+
+正式运行 `formal01` 一次通过，无重跑筛选、无中途重置。仿真 9.5 s / 1140 物理步，
+每路 285 帧、1024×768 / 30 fps，双路均完整解码；并排预览 2048×768 / 30 fps，时长 9.5 s。
+采集墙钟约 716 s；主轴、螺栓和机器人均来自同一次连续求解。
+
+| 指标 | 正式实测 | 门限 |
+|---|---:|---:|
+| 旋转圈数 | 3.4964 圈 | ≥ 2 圈 |
+| 实际旋入量 | 8.8930 mm | ≥ 6 mm |
+| 导程误差 | 1.7385% | ≤ 25% |
+| 停转保持漂移 | 0.3948 mm | ≤ 1 mm |
+| 最大螺旋残差 | 0.4723 mm | ≤ 2 mm |
+| 旋入期接触帧比例 | 99.1657% | ≥ 95% |
+| 峰值接触数 | 98 | < 40000 |
+| 最大机械臂跟踪误差 | 0.0012204 rad | ≤ 0.02 rad |
+
+Job 的 11 项检查和独立校验的 11 项检查均通过。8 维状态、动作逐帧与物理日志一致，
+两路起点、中点、终点关键帧及额外的初段／中段高分辨率对照已实际查看；
+`qa/visual_review.json` 记录复核范围，未声称逐帧人工检查全部视频。
+旧结果均保留；本变体只新增上述正式目录。
+
+## 10. 双 UR5e：夹起螺母后拧入螺栓
+
+本变体在单臂 demo 之上增加第二只 UR5e 与可见平行夹爪。螺母起始放在 100 mm 高的蓝色支座上，
+夹爪闭合后将它抬起约 160 mm；持稳后，电批臂下降并靠轴向弹簧预压建立接触，再旋入螺栓。
+螺母是独立的 **6 自由度刚体**，没有固定到世界、夹爪或机械臂，也没有吸附力或抓取附着约束。
+电批套筒仍按第 9 节采用理想刚性夹持螺栓头；取螺栓和终拧预紧力仍不在本变体范围内。
+
+### 10.1 组件、资产与控制
+
+| 能力域 | 后端 | 实现 |
+|---|---|---|
+| Scene | `dual_screw_assembly` | `DualScrewScene`，沿用桌面和 M20 网格，增加可见的拾取支座 |
+| Robot | `dual_ur5e_screwdriver` | `DualUr5eScrewRobot`，两只物理 UR5e、电批、两根独立驱动的夹指 |
+| Planner | `dual_ur5e_screwdriver` | `DualScrewPlanner` / `DualScrewRuntime` |
+| Job | `screw_assembly` | 复用原固定生命周期、记录与导出 |
+
+两臂复用同一份 `assets/PhysicSolver/Robot/ur5e/`；没有新增外部资产或 pip 依赖。
+夹爪由代码生成，橙色可见夹指与实际 hydroelastic 碰撞盒尺寸相同：12×8×100 mm。
+每侧夹指的开度坐标独立，初始 28 mm，正式配置闭合目标 12 mm，增益 30000 N/m、150 N·s/m，
+力上限 100 N/侧，摩擦系数 1.5。它是本 demo 的显式平行夹爪，不宣称是原装 Robotiq。
+这些值为仿真设计参数，未做实机标定。第一臂底座偏移 `[-0.45,0,0]`，第二臂 `[0.45,0.28,0]`。
+
+仍使用 Newton direct + MuJoCo Warp（本机 3.12.0）、实际 M20 螺纹 SDF，
+120 Hz × 4 子步。螺母／螺栓保持 KH=1e11、摩擦 0.01；夹指 KH=1e10、SDF 64。
+两臂、夹指、自由螺母由同一求解器做双向动力学，不用运动学代理移动螺母。
+动态螺母的轴向进给和转角都在**螺母坐标系**下由实际刚体位姿重新计算，防止把整物抬升误认为旋入。
+螺纹导程残差只在实际旋入和保持阶段计算；拾取、抬升及空中对准不应服从螺距关系。
+
+双臂变体显式使用 `cone="elliptic"`、`impratio=10`。
+本机 Newton 1.6.1 的 `SolverMuJoCo` 构造函数与接触参数 kernel 已核对支持该选项；
+[MuJoCo 防滑说明](https://mujoco.readthedocs.io/en/latest/modeling.html#preventing-slip)
+解释了软接触模型在持续切向载荷下的缓慢蠕滑，以及提高切向相对阻抗的作用。
+未使用 NoSlip 后处理或额外锁定约束；旧的单臂／主轴案例仍使用其原始求解器默认值。
+
+阶段：夹紧 0.8 s → 抬升 1.5 s → 电批对准 1.5 s → 预压接合 1 s → 旋入 7 s → 停转保持 1 s。
+视频采样 30 fps，两路 1024×768 / PathTracing 64 spp，4 次反弹；调试为 640×480 / 15 fps / MinimalRendering。
+并排预览额外加 52 像素阶段标题栏，原始两路视频不加字、不裁切。
+记录 16 维机器人状态和动作，顺序为：电批臂 6 关节、轴向浮动、主轴；持螺母臂 6 关节、负侧／正侧夹指。
+`trajectory.json` 另记录螺母／螺栓／夹爪 TCP 的原始刚体位姿、双侧接触和支座接触数量。
+
+### 10.2 运行与验收
+
+```bash
+# 只跑物理，选择未使用的输出目录。
+RSR_JOB__record_rgb=false \
+RSR_JOB__output_dir=outputs/debug/physic_solver/dual_ur5e_physics_new \
+./scripts/rsr collect run \
+  -c configs/physic_solver/mujoco_hydroelastic_screw03_dual_ur5e_debug.toml
+
+# 正式双视角采集，先写 debug 暂存目录；完成后进行独立验收和关键帧复核。
+./app/python.sh scripts/physic_solver/collect_screw_arm_demo.py \
+  --config configs/physic_solver/mujoco_hydroelastic_screw03_dual_ur5e.toml
+
+# 实际复核关键帧后，按第9节写 visual_review.json 并发布：
+./app/python.sh scripts/physic_solver/collect_screw_arm_demo.py --publish-run <run>
+
+# 独立校验同时检查拾取和螺纹，而非只检查动作执行完毕。
+./app/python.sh scripts/physic_solver/validate_screw_assembly.py <output>
+```
+
+保留原螺纹门限：≥2圈、≥6 mm进给、导程误差≤25%、保持漂移≤1 mm、最大螺旋残差≤2 mm、
+旋入期接触帧≥95%、接触容量不溢出。新增加：
+
+- 旋入／保持期螺母相对初始位置的最小抬升 ≥130 mm；支座和桌面接触为零。
+- 搬运到保持全程双侧夹指接触比例 ≥95%。
+- 螺母相对持物 TCP 的最大滑移 ≤3 mm，转动 ≤0.05 rad。
+- 两臂最大关节跟踪误差 ≤0.02 rad。
+- 从原始刚体位姿重算相对转角、轴向位置、抬升与滑移；16维状态/动作逐帧与物理记录一致。
+- 两路视频完整解码，起始、夹紧后、抬升后、旋入中段、保持末段均实际查看。
+
+### 10.3 调试记录
+
+记录目录为 `outputs/debug/physic_solver/dual_ur5e_development/`，失败和对照没有发布到正式目录。
+
+| 运行 | 现象、分析与处理 |
+|---|---|
+| `physics01` | USD 深度优先导入按负侧、正侧排序夹指，原本按正侧、负侧断言；按实际映射记录16维坐标。 |
+| `physics02`、`rgb_probe01_run` | 初始手腕配置与桌面发生干涉，夹爪被顶高约49 mm，未夹到螺母；将夹爪绕工具轴转180°，保留相同夹持方向并获得手腕净空。 |
+| `physics03` | 真实抬起156.2 mm，旋入8.53 mm，但最大滑移3.69 mm，失败；未放宽3 mm门限。 |
+| `physics04` | 闭合目标13→12 mm，增加驱动夹紧力；滑移2.991 mm，虽通过但余量不足，保留为对照。 |
+| `physics05` | 依据本机实现和MuJoCo资料，将双臂变体切向阻抗比设为10；滑移1.057 mm，抬升159.24 mm，旋入8.346 mm，全部通过。 |
+| `rgb01` | 640px完整调试、物理与独立数据验收通过，滑移0.921 mm；复核后调整特写至正前方俯视，以减少夹指遮挡。 |
+
+以上实验保持所有验收门限不变。旧主轴和单臂配置、资产和已发布结果保留。
+
+`rgb02` 的双视角与阶段标题已复核并发布到 debug 目录：抬升159.307 mm、旋入8.607 mm、
+滑移0.691 mm、双侧接触100%。正式版另将螺母显示色提亮，方便在深色夹爪前辨认。
+新增代码回归为360通过 / 3跳过，ruff、全任务配置校验通过；
+单臂UR5e和原主轴的物理回归与独立校验均通过（分别旋入8.730 mm、8.874 mm）。
+
+### 10.4 正式结果（2026-11-15，EST）
+
+[双臂完整演示](../outputs/physic_solver/mujoco_hydroelastic_screw03_dual_ur5e/demo.mp4) ·
+[全景](../outputs/physic_solver/mujoco_hydroelastic_screw03_dual_ur5e/overview.mp4) ·
+[特写](../outputs/physic_solver/mujoco_hydroelastic_screw03_dual_ur5e/threads.mp4) ·
+[拾取前后对照](../outputs/physic_solver/mujoco_hydroelastic_screw03_dual_ur5e/qa/pickup_review.jpg) ·
+[关键帧](../outputs/physic_solver/mujoco_hydroelastic_screw03_dual_ur5e/qa/keyframes.jpg) ·
+[独立验收](../outputs/physic_solver/mujoco_hydroelastic_screw03_dual_ur5e/validation.json)。
+
+正式 `formal01` 一次通过：12.8 s、1536 个物理步、每路384帧，1024×768 / 30 fps；
+并排预览含阶段标题栏，为2048×820 / 30 fps。采集墙钟1268.13 s（约21.1分钟）。
+两路原始视频及并排成品都完整解码，无跨运行拼接或中途重置。
+
+| 指标 | 正式实测 | 门限 |
+|---|---:|---:|
+| 旋入／保持期最小螺母抬升 | 159.279 mm | ≥130 mm |
+| 螺母相对夹爪最大滑移 | 0.612 mm | ≤3 mm |
+| 最大螺母转动 | 0.0016802 rad | ≤0.05 rad |
+| 双侧夹指接触帧比例 | 100% | ≥95% |
+| 旋入期支座／桌面接触 | 0 | 0 |
+| 螺栓相对螺母旋转 | 3.4816圈 | ≥2圈 |
+| 相对轴向旋入 | 8.5795 mm | ≥6 mm |
+| 导程误差 | 1.4304% | ≤25% |
+| 停转后相对轴向漂移 | 0.01676 mm | ≤1 mm |
+| 最大螺旋残差 | 0.1470 mm | ≤2 mm |
+| 螺纹接触帧比例 | 100% | ≥95% |
+| 两臂最大跟踪误差 | 0.0177843 rad | ≤0.02 rad |
+| 峰值接触数 | 205 | <40000 |
+
+Job的15项检查、独立校验的18项检查全部通过；两路各384帧的16维实测状态与动作均与物理日志对应。
+两路五个阶段关键帧、拾取及旋入对照、成品末段已实际查看，范围记录在 `qa/visual_review.json`。
+人工复核不代表逐帧观看所有视频。旧单臂、原主轴结果均保留；本次正式输出只新增 `screw03_dual_ur5e`。
+
+### 10.5 加深旋入，螺栓穿出螺母
+
+新增 `mujoco_hydroelastic_screw04_dual_through{,_debug}.toml`，复用双臂、M20资产、
+接触求解器和原有全部门限，只将旋拧阶段从7 s延长为14 s，总时长19.8 s。
+新增 `minimum_tip_protrusion_m=0.005`：整个停转保持阶段，螺栓尖端须在螺母下表面以外至少5 mm。
+该字段默认0，不改变旧配置行为；原双臂结果末帧仍差1.079 mm才穿出，因此不能用旋入量代替穿出量验收。
+
+穿出量由真实螺栓／螺母刚体位姿计算：把螺栓尖端变换到螺母局部坐标系，
+与螺母下表面比较；独立校验重新读取OBJ边界和完整位姿，不依赖电批目标值。
+螺栓尖端距其参考原点65 mm，螺母下表面局部z为−36 mm（两者网格均翻转180°）。
+螺母仍是六自由度刚体，没有新增吸附或固定约束。
+
+为便于直接辨认转动，`screw04` 在螺栓原网格上增加不对称蓝／黄／白纵向涂装、红色角度标记和短黑刻度。
+UV固定在螺栓局部顶点上，随求解器输出的真实姿态一起旋转，没有独立滚动贴图或修改螺纹碰撞体。
+特写相机改为约12°俯角，减少螺母对穿出尖端的遮挡。旧配置 `bolt_texture_path=None`，保留原金属外观。
+贴图由 `prepare_screw_arm_assets.py` 生成于 `assets/PhysicSolver/Screw/M20/Textures/`，
+1024×512 PNG、CC0、SHA-256见同目录 `provenance.json`，无需下载额外资产。
+材质采用 [UsdPreviewSurface标准节点链](https://openusd.org/release/spec_usdpreviewsurface.html)，
+具体效果以本机Isaac Sim 6.2预览和正式画面为准。
+
+```bash
+# 640×480 / 15 fps 调试，MinimalRendering
+./app/python.sh scripts/physic_solver/collect_screw_arm_demo.py \
+  --config configs/physic_solver/mujoco_hydroelastic_screw04_dual_through_debug.toml
+# 1024×768 / 30 fps 正式采集，PathTracing
+./app/python.sh scripts/physic_solver/collect_screw_arm_demo.py \
+  --config configs/physic_solver/mujoco_hydroelastic_screw04_dual_through.toml
+```
+
+与第9节相同，采集先留在debug暂存目录，独立校验和实际视觉复核后用 `--publish-run` 发布。
+开发记录：`outputs/debug/physic_solver/dual_through_development/`。
+`physics01` 一次通过：6.9169圈、旋入17.158 mm、保持期最小穿出7.501 mm、
+最大夹持滑移0.867 mm、导程误差0.7754%；最终浮动位移−24.410 mm，在−40 mm行程限位以内。
+
+带纹理的 `rgb03_texture` 已发布到
+`outputs/debug/physic_solver/mujoco_hydroelastic_screw04_dual_through_debug/`：
+6.8643圈、旋入16.936 mm、保持期最小穿出7.355 mm、最大夹持滑移1.008 mm、导程误差1.3107%。
+两路各297帧（640×480 / 15 fps），合成1280×532 / 19.8 s；完整解码和独立验收通过。
+实际查看两路五个阶段关键帧、8.0/8.2/8.4/8.6 s连续旋转对照及19.6 s末帧，
+能看到涂装绕轴变化和螺栓尖端穿出。此前 `rgb01` 为原俯视角，`rgb02` 为降低视角但尚无涂装的对照，均保留在开发目录。
+365项单元测试通过、3项跳过，ruff与全部物理验证配置校验通过；旧单臂和双臂已发布数据重新独立校验通过。
+
+正式 `formal01` 一次通过并发布（2026-11-16，EST）：
+[完整demo](../outputs/physic_solver/mujoco_hydroelastic_screw04_dual_through/demo.mp4) ·
+[旋转特写](../outputs/physic_solver/mujoco_hydroelastic_screw04_dual_through/threads.mp4) ·
+[连续旋转对照](../outputs/physic_solver/mujoco_hydroelastic_screw04_dual_through/qa/rotation_review.jpg) ·
+[末帧](../outputs/physic_solver/mujoco_hydroelastic_screw04_dual_through/qa/final_review.png) ·
+[独立验收](../outputs/physic_solver/mujoco_hydroelastic_screw04_dual_through/validation.json)。
+
+两路各594帧，1024×768 / 30 fps / PathTracing 64 spp、4反弹；
+合成2048×820 / 19.8 s，共2376物理步，采集墙钟1366.15 s（约22.8分钟）。
+Job的16项和独立校验的20项检查全部通过，包括贴图来源哈希、实际状态／动作对齐、无螺母附着和任务内资产依赖。
+
+| 指标 | 正式实测 | 门限 |
+|---|---:|---:|
+| 保持期最小尖端穿出 | 7.4958 mm | ≥5 mm |
+| 相对旋转 | 6.9151圈 | ≥2圈 |
+| 相对旋入 | 17.1535 mm | ≥6 mm |
+| 导程误差 | 0.7765% | ≤25% |
+| 最小螺母抬升 | 159.1781 mm | ≥130 mm |
+| 最大夹持滑移 | 0.7669 mm | ≤3 mm |
+| 最大螺母转动 | 0.0016199 rad | ≤0.05 rad |
+| 双侧夹指／螺纹接触比例 | 100% / 100% | ≥95% / ≥95% |
+| 旋入期支座／桌面接触 | 0 | 0 |
+| 停转后轴向漂移 | 0.00796 mm | ≤1 mm |
+| 最大螺旋残差 | 0.1453 mm | ≤2 mm |
+| 两臂最大跟踪误差 | 0.0177843 rad | ≤0.02 rad |
+| 峰值接触数 | 196 | <40000 |
+
+已实际查看两路五个阶段的编码视频关键帧、19.6 s成品末帧，以及8.0/8.2/8.4/8.6 s原始采集连续帧。
+可直接辨认黄色／红色涂装转离正面、蓝色涂装转向正面，末段尖端在螺母下方清楚可见。
+两路原始视频和并排成品完整解码通过；复核范围和限制见 `qa/visual_review.json`。
+没有放宽原门限，也没有覆盖旧单臂、双臂结果；全部对照与采集记录见开发目录 `run_note.json`。
+
+```bash
+./app/python.sh scripts/physic_solver/validate_screw_assembly.py \
+  outputs/physic_solver/mujoco_hydroelastic_screw04_dual_through
+```
+
+### 10.6 拧完后松开螺母夹爪
+
+`mujoco_hydroelastic_screw05_dual_release{,_debug}.toml` 在带纹理、穿出螺母版本之后，
+增加1 s张爪和1 s自由状态观察，总时长21.8 s。电批停转、保持夹住螺栓，第二只机械臂原地张开两指。
+螺母保持六自由度，不添加固定、吸附或隐藏托块。
+
+新增可选字段 `release_s/post_release_s` 默认均为0，保留旧六阶段流程；两者须同时为正才启用。
+夹持滑移、抗旋转和双侧接触门限适用于抬升至松爪前；松爪后独立要求两指实测坐标≥25 mm、
+两指与螺母零接触、螺纹接触比例≥95%，以及保持至少5 mm尖端穿出。没有放宽原有数值门限。
+
+原参数摩擦系数0.01在失去夹指后出现重力反驱：`physics01` 螺母相对螺栓回转3.558圈，
+全局下降25.274 mm，末段穿出量变为−1.548 mm，失败。
+`physics02/03` 将整个episode的螺纹摩擦系数恒定设为0.1，松开后螺纹接触100%，
+但原−3 rad/s电批目标只完成约5.84圈，穿出约2.2 mm，仍未达到5 mm门限。
+最终将目标转速改为−4 rad/s，其他旋拧时长保持14 s；`physics04` 完成7.976圈、旋入19.841 mm，
+停转期穿出10.075 mm、松爪后最小穿出9.855 mm，独立校验通过。
+摩擦系数为本demo选定并验证的仿真参数，尚未用实物材料试验标定。
+
+`latch_axial_hold=true` 在首次停转时锁存轴向位置驱动目标，避免每步把目标改成当前位姿而积累下沉。
+它仍使用原有限刚度驱动和真实行程限位，允许受载弹性位移，不直接固定刚体。
+该字段默认false，旧版本控制和配置保持不变。
+调试、失败和对照记录保存在 `outputs/debug/physic_solver/dual_release_development/`。
+
+```bash
+./app/python.sh scripts/physic_solver/collect_screw_arm_demo.py \
+  --config configs/physic_solver/mujoco_hydroelastic_screw05_dual_release_debug.toml
+# 正式采集；复核后仍按第9节用 --publish-run 发布
+./app/python.sh scripts/physic_solver/collect_screw_arm_demo.py \
+  --config configs/physic_solver/mujoco_hydroelastic_screw05_dual_release.toml
+```
+
+`rgb01` 带图像调试一次通过：两路各327帧，640×480 / 15 fps，合成1280×532 / 21.8 s。
+完成7.9208圈、旋入19.570 mm，停转保持期最小穿出7.468 mm，松爪后最小穿出7.260 mm。
+两指实测坐标均≥27.9996 mm，松爪后两侧接触均为0，螺纹接触100%。
+已实际查看两路七阶段关键帧、21.6 s成品末帧及19.6/20.1/20.7/21.6 s松爪连续对照；
+螺母在松开后随电批浮动机构受载下沉，但仍保持穿出并悬挂在螺栓上，未直接固定到电批或场景。
+该版本已发布到 `outputs/debug/physic_solver/mujoco_hydroelastic_screw05_dual_release_debug/`。
+回归：372项通过、3项跳过；新增完整松爪后穿出门限后的任务测试56项通过，ruff与全配置校验通过。
+旧双臂及穿出版已发布结果重新独立验收通过。
+
+关于松爪后的整体下沉：调试版从19.808 s至21.8 s，螺栓下降15.707 mm、螺母下降15.894 mm，
+两者之间的穿出量只缩回0.186 mm。电批浮动轴从−24.558 mm下移至−40.078 mm，接近−40 mm下行限位；
+位置目标保持在−24.841 mm，驱动刚度仍为200 N/m。
+夹爪松开后，通过螺纹承托的螺栓、螺母及部分浮动机构载荷转移至该有限刚度轴，产生受载位移。
+因此本版存在可见的整体下沉，螺母仍保持螺纹接触和穿出。若要求松爪后保持原高度，需另行验证更高刚度的轴向保持策略。
+
+正式 `formal01` 一次通过并发布（2026-11-16，EST）：
+[松爪版完整demo](../outputs/physic_solver/mujoco_hydroelastic_screw05_dual_release/demo.mp4) ·
+[特写](../outputs/physic_solver/mujoco_hydroelastic_screw05_dual_release/threads.mp4) ·
+[松爪连续对照](../outputs/physic_solver/mujoco_hydroelastic_screw05_dual_release/qa/release_review.jpg) ·
+[整体下沉实测](../outputs/physic_solver/mujoco_hydroelastic_screw05_dual_release/qa/axial_settling.json) ·
+[独立验收](../outputs/physic_solver/mujoco_hydroelastic_screw05_dual_release/validation.json)。
+
+21.8 s、2616物理步，两路各654帧，1024×768 / 30 fps、PathTracing 64 spp、4反弹；
+合成2048×820 / 30 fps，采集1498.58 s（约25分钟）。Job的21项和独立校验的25项检查全部通过。
+
+| 指标 | 正式实测 | 门限 |
+|---|---:|---:|
+| 相对旋转／旋入 | 7.9256圈 / 19.5281 mm | ≥2圈 / ≥6 mm |
+| 导程误差 | 1.4426% | ≤25% |
+| 停转期最小穿出 | 7.4240 mm | ≥5 mm |
+| 松爪后最小穿出 | 7.2455 mm | ≥5 mm |
+| 松爪后两指最小坐标 | 27.9996 mm | ≥25 mm |
+| 松爪后双指接触 | 0 | 0 |
+| 松爪后螺纹接触比例 | 100% | ≥95% |
+| 最小螺母抬升 | 158.9852 mm | ≥130 mm |
+| 最大夹持滑移 | 0.7831 mm | ≤3 mm |
+| 最大螺母转动（松爪前） | 0.0068352 rad | ≤0.05 rad |
+| 双侧夹指／旋入期螺纹接触 | 100% / 99.762% | ≥95% / ≥95% |
+| 停转期轴向漂移 | 0.1576 mm | ≤1 mm |
+| 最大螺旋残差 | 0.3966 mm | ≤2 mm |
+| 两臂最大跟踪误差 | 0.0177843 rad | ≤0.02 rad |
+| 峰值接触数 | 228 | <40000 |
+
+正式结果同样保留整体下沉：松爪至末帧，螺栓下降15.719 mm，螺母下降15.948 mm，
+穿出量缩回0.227 mm；浮动轴由−24.569 mm到−40.102 mm，保持目标为−24.806 mm。
+实际查看两路七阶段编码关键帧、21.6 s成品末帧、19.6/20.1/20.7/21.6 s编码松爪对照，
+以及7.0/7.2/7.4/7.6 s原始PNG旋转对照；完整解码两路源视频和成品通过。
+复核范围见 `qa/visual_review.json`，未逐帧人工观看。旧结果全部保留，失败和对照留在debug目录。

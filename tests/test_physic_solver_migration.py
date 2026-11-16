@@ -58,9 +58,21 @@ def test_flat_configs_match_output_names_and_640_capture_contract():
     root = Path("configs/physic_solver")
     assert not any(path.is_dir() for path in root.iterdir())
     paths = list(root.glob("*.toml"))
-    assert {p.stem for p in paths} == set(PHYSIC_SOLVER_CASE_NAMES.values())
+    arm_cases = {
+        "mujoco_hydroelastic_screw02_ur5e",
+        "mujoco_hydroelastic_screw02_ur5e_debug",
+        "mujoco_hydroelastic_screw03_dual_ur5e",
+        "mujoco_hydroelastic_screw03_dual_ur5e_debug",
+        "mujoco_hydroelastic_screw04_dual_through",
+        "mujoco_hydroelastic_screw04_dual_through_debug",
+        "mujoco_hydroelastic_screw05_dual_release",
+        "mujoco_hydroelastic_screw05_dual_release_debug",
+    }
+    assert {p.stem for p in paths} == set(PHYSIC_SOLVER_CASE_NAMES.values()) | arm_cases
     assert len(PHYSIC_SOLVER_PACKAGE_CASES) == 18
     for path in paths:
+        if path.stem in arm_cases:
+            continue  # New demos have their own formal/debug rendering contract below.
         config = tomllib.loads(path.read_text())
         assert "inherit" not in config
         assert Path(config["job"]["output_dir"]).name == path.stem
@@ -542,3 +554,221 @@ def test_newton_diagnostic_world_is_lazy_and_rejects_other_physics_modes():
         NewtonDiagnosticWorldConfig(physics_engine="physx")
     with pytest.raises(ValidationError):
         NewtonDiagnosticWorldConfig(newton_execution="usd")
+
+
+@pytest.mark.parametrize("debug", [False, True])
+def test_ur5e_screw_driver_routes_lazily_and_keeps_thread_gates(debug, monkeypatch, tmp_path):
+    name = "mujoco_hydroelastic_screw02_ur5e" + ("_debug" if debug else "")
+    monkeypatch.setenv(
+        "RSR_SETTINGS_FILE", str(Path(f"configs/physic_solver/{name}.toml").resolve())
+    )
+    monkeypatch.setenv("RSR_JOB__output_dir", str(tmp_path / name))
+    reset_settings()
+    try:
+        job = AutoJob.from_config()
+        assert job.sim_world.app is None
+        assert job.robot.config.backend == job.planner.config.backend == "ur5e_screwdriver"
+        assert len(job.robot.recording_joint_names) == len(job.planner.action_names) == 8
+        assert job.planner.config.minimum_turns == 2.0
+        assert job.planner.config.minimum_advance_m == 0.006
+        assert job.planner.config.maximum_pitch_error_fraction == 0.25
+        assert job.config.recorder.fps == (15 if debug else 30)
+        assert job.sim_world.config.renderer == ("MinimalRendering" if debug else "PathTracing")
+        assert {cam.resolution for cam in job.recording_cameras} == {
+            (640, 480) if debug else (1024, 768)
+        }
+    finally:
+        reset_settings()
+
+
+def test_screw_arm_measures_absolute_bolt_advance_instead_of_float_joint():
+    from real2sim2real.planner.planner_physic_solver import ScrewRuntime
+
+    runtime = object.__new__(ScrewRuntime)
+    runtime.screw_dofs = [6, 7]
+    runtime.spindle_body = 0
+    runtime.scene = SimpleNamespace(initial_bolt_z_m=0.077)
+    runtime.robot = SimpleNamespace(screw_control=lambda: None)
+    runtime.state_0 = SimpleNamespace(
+        joint_q=SimpleNamespace(numpy=lambda: np.array([0.0] * 6 + [-0.004, -12.0])),
+        body_q=SimpleNamespace(numpy=lambda: np.array([[0, 0, 0.067, 0, 0, 0, 1.0]])),
+    )
+    np.testing.assert_allclose(runtime.screw_coordinates(), [-0.010, -12.0])
+
+
+@pytest.mark.parametrize("debug", [False, True])
+@pytest.mark.parametrize(
+    "stem,duration,tip",
+    [
+        ("screw03_dual_ur5e", 12.8, 0.0),
+        ("screw04_dual_through", 19.8, 0.005),
+        ("screw05_dual_release", 21.8, 0.005),
+    ],
+)
+def test_dual_screw_routes_two_arms_without_loading_kit(
+    debug, stem, duration, tip, monkeypatch, tmp_path
+):
+    name = f"mujoco_hydroelastic_{stem}" + ("_debug" if debug else "")
+    monkeypatch.setenv(
+        "RSR_SETTINGS_FILE", str(Path(f"configs/physic_solver/{name}.toml").resolve())
+    )
+    monkeypatch.setenv("RSR_JOB__output_dir", str(tmp_path / name))
+    reset_settings()
+    try:
+        job = AutoJob.from_config()
+        assert job.sim_world.app is None
+        assert job.scene.config.backend == "dual_screw_assembly"
+        assert job.robot.config.backend == job.planner.config.backend == "dual_ur5e_screwdriver"
+        assert len(job.robot.recording_joint_names) == len(job.planner.action_names) == 16
+        assert job.planner.expected_duration_s == pytest.approx(duration)
+        assert job.planner.config.minimum_tip_protrusion_m == tip
+        assert job.scene.config.nut_support_height_m == 0.10
+        assert job.planner.config.nut_lift_m == 0.16
+        assert job.planner.config.minimum_advance_m == 0.006
+    finally:
+        reset_settings()
+
+
+def test_dual_screw_requires_lift_bilateral_contact_and_low_slip():
+    import copy
+
+    from real2sim2real.planner.planner_physic_solver import DualScrewPlannerConfig
+    from real2sim2real.utils.physic_solver_utils import dual_screw_phase, evaluate_dual_screw_rows
+
+    cfg = DualScrewPlannerConfig().model_dump()
+    cfg.update(engage_s=1.0, screw_s=7.0)
+    samples = [
+        (0.0, "clamp", 0.05, 0.0, 0.108),
+        (0.8, "lift", 0.05, 0.0, 0.108),
+        (2.3, "align", 0.05, 0.0, 0.268),
+        (3.8, "engage", 0.05, 0.0, 0.268),
+        (4.8, "screw", 0.05, 0.0, 0.268),
+        (11.7, "screw", 0.04375, -5 * np.pi, 0.268),
+        (11.8, "hold", 0.04375, -5 * np.pi, 0.268),
+        (12.8, "hold", 0.04375, -5 * np.pi, 0.268),
+    ]
+    rows = [
+        dict(
+            time_s=t,
+            phase=phase,
+            axial_displacement_m=z,
+            spindle_angle_rad=angle,
+            contacts=5,
+            jaw_p_contacts=3,
+            jaw_n_contacts=3,
+            support_contacts=0,
+            nut_center_local_m=[0, 0, height],
+            nut_relative_holder_m=[0, 0, 0.028],
+            nut_yaw_rad=0.0,
+            arm_q_rad=[0.0] * 12,
+            arm_target_rad=[0.0] * 12,
+        )
+        for t, phase, z, angle, height in samples
+    ]
+    assert dual_screw_phase(0.4, cfg) == ("clamp", 0.5)
+    assert dual_screw_phase(50.0, cfg) == ("hold", 1.0)
+    result = evaluate_dual_screw_rows(rows, cfg, 0.0025)
+    assert result["success"]
+    assert result["minimum_nut_lift_m"] == pytest.approx(0.16)
+    for field, value, failed_check in (
+        ("nut_center_local_m", [0, 0, 0.108], "nut_actually_lifted"),
+        ("jaw_n_contacts", 0, "bilateral_finger_contact"),
+        ("support_contacts", 1, "nut_clear_of_support_while_threading"),
+    ):
+        candidate = copy.deepcopy(rows)
+        for row in candidate:
+            row[field] = value
+        rejected = evaluate_dual_screw_rows(candidate, cfg, 0.0025)
+        assert not rejected["success"] and not rejected["checks"][failed_check]
+    candidate = copy.deepcopy(rows)
+    candidate[-1]["nut_relative_holder_m"] = [0.01, 0, 0.028]
+    assert not evaluate_dual_screw_rows(candidate, cfg, 0.0025)["checks"]["nut_held_without_slip"]
+    cfg["minimum_tip_protrusion_m"] = 0.005
+    for row in rows:
+        row["tip_protrusion_m"] = 0.008
+    assert evaluate_dual_screw_rows(rows, cfg, 0.0025)["success"]
+    # Passing thread-lead and advance gates does not establish that the bolt exits the nut.
+    rows[-1]["tip_protrusion_m"] = -0.001
+    result = evaluate_dual_screw_rows(rows, cfg, 0.0025)
+    assert result["checks"]["thread_lead_matches"]
+    assert not result["checks"]["bolt_protrudes_through_nut"]
+    rows[-1]["tip_protrusion_m"] = float("nan")
+    assert not evaluate_dual_screw_rows(rows, cfg, 0.0025)["success"]
+    rows[-1]["tip_protrusion_m"] = 0.008
+    rows[-1]["time_s"] = 12.79
+    cfg.update(release_s=1.0, post_release_s=1.0)
+    for t, phase in [(12.8, "release"), (13.8, "released"), (14.8, "released")]:
+        row = copy.deepcopy(rows[-1])
+        row.update(
+            time_s=t,
+            phase=phase,
+            joint_q=[0.0] * 14 + [0.028, 0.028],
+            jaw_p_contacts=0,
+            jaw_n_contacts=0,
+            nut_relative_holder_m=[0.01, 0, 0.028],
+        )
+        rows.append(row)
+    assert dual_screw_phase(14.8, cfg) == ("released", 1.0)
+    assert evaluate_dual_screw_rows(rows, cfg, 0.0025)["success"]
+    rows[-1]["joint_q"][14] = 0.012  # A target alone cannot establish that the jaw opened.
+    assert not evaluate_dual_screw_rows(rows, cfg, 0.0025)["checks"]["gripper_actually_reopened"]
+    rows[-1]["joint_q"][14] = 0.028
+    rows[-1]["jaw_p_contacts"] = 1
+    assert not evaluate_dual_screw_rows(rows, cfg, 0.0025)["checks"]["nut_clear_of_both_fingers"]
+
+
+def test_screw_release_requires_observation_duration():
+    from pydantic import ValidationError
+
+    from real2sim2real.planner.planner_physic_solver import DualScrewPlannerConfig
+
+    for fields in ({"release_s": 1}, {"post_release_s": 1}):
+        with pytest.raises(ValidationError, match="both"):
+            DualScrewPlannerConfig(**fields)
+
+
+@pytest.mark.parametrize("latch", [False, True])
+def test_screw_axial_stop_can_keep_first_position_target(latch):
+    from types import SimpleNamespace
+
+    from real2sim2real.planner.planner_physic_solver import DualScrewRuntime
+
+    runtime = object.__new__(DualScrewRuntime)
+    measured = np.zeros(23)
+
+    def targets(**kwargs):
+        q = np.zeros(16)
+        q[6] = kwargs["measured"][6]
+        return q, np.zeros(16), q.copy()
+
+    runtime.robot = SimpleNamespace(screw_dofs=[6, 7], dual_control=targets)
+    runtime.config = SimpleNamespace(latch_axial_hold=latch)
+    runtime.state_0 = SimpleNamespace(joint_q=SimpleNamespace(numpy=lambda: measured))
+    runtime.model = SimpleNamespace(joint_dof_count=22)
+    captured = {}
+    runtime.control = SimpleNamespace(
+        joint_target_q=SimpleNamespace(assign=lambda q: captured.update(q=q.copy())),
+        joint_target_qd=SimpleNamespace(assign=lambda qd: None),
+    )
+    for z in (-0.024, -0.027):
+        measured[6] = z
+        runtime.command_dual(
+            holder_z_m=0.268, driver_z_m=0.342, finger_m=0.028, preload=True, speed=0.0, hold=True
+        )
+    assert captured["q"][6] == (-0.024 if latch else -0.027)
+    assert runtime.target_q[6] == captured["q"][6]
+
+
+def test_bolt_rotation_texture_uv_follows_mesh_and_unwraps_seam():
+    from real2sim2real.utils.physic_solver_utils import screw_cylindrical_uv
+
+    angles = np.deg2rad([-2.0, 2.0, 3.0])
+    vertices = np.c_[np.cos(angles), np.sin(angles), [0.0, 1.0, 0.5]]
+    uv = screw_cylindrical_uv(vertices, np.array([[0, 1, 2]]))
+    assert uv.shape == (3, 2)
+    assert np.ptp(uv[:, 0]) < 0.02  # Interpolate across the seam, not around the whole bolt.
+    np.testing.assert_allclose(uv[:, 1], [0, 1, 0.5])
+    rotated = vertices.copy()
+    rotated[:, :2] = vertices[:, :2] @ np.array([[0, 1], [-1, 0]])
+    turned = screw_cylindrical_uv(rotated, np.array([[0, 1, 2]]))
+    np.testing.assert_allclose(np.mod(turned[:, 0] - uv[:, 0], 1), 0.25, atol=1e-7)

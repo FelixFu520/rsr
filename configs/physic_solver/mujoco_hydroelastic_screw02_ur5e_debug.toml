@@ -1,0 +1,45 @@
+inherit = "mujoco_hydroelastic_screw02_ur5e.toml"
+[sim_world]
+renderer = "MinimalRendering"
+minimal_shading_mode = 2
+width = 640
+height = 480
+rt_subframes = 1
+synchronous_capture = false
+[scene]
+dynaconf_merge = false
+backend = "screw_assembly"
+object_kind = "screw"
+thread_pitch_m = 0.0025
+initial_engagement_m = 0.004
+target_xy = [0.1, 0.0]
+fill_light_intensity = 200
+key_light_intensity = 700
+[[scene.cameras]]
+name = "overview"
+prim_path = "/World/scene/overview_cam"
+pose_relative_to = "/World/scene"
+resolution = [640, 480]
+clipping_range = [0.001, 10.0]
+focal_length = 28.0
+[scene.cameras.pose]
+position = [1.05, -1.25, 1.45]
+orientation_wxyz = [0.741962747163357, 0.5686483213481712, 0.21603806067752568, 0.28188282102392326]
+
+[[scene.cameras]]
+name = "threads"
+prim_path = "/World/scene/threads_cam"
+pose_relative_to = "/World/scene"
+resolution = [640, 480]
+clipping_range = [0.001, 10.0]
+focal_length = 35.0
+[scene.cameras.pose]
+position = [0.29, -0.26, 0.96]
+orientation_wxyz = [0.822757935341633, 0.47619842603826656, 0.15545333144619883, 0.26858648628203413]
+
+[job]
+output_dir = "outputs/debug/physic_solver/mujoco_hydroelastic_screw02_ur5e_debug"
+[job.recorder]
+fps = 15
+width = 640
+height = 480

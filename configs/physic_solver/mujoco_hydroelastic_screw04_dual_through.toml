@@ -1,0 +1,104 @@
+# mujoco_hydroelastic_screw04_dual_through
+# Bolt-through variant: screw 14s and retain at least 5mm tip protrusion.
+# Dual UR5e: visible parallel gripper lifts a free nut; electric driver then threads the bolt.
+# Prepare: ./app/python.sh scripts/physic_solver/prepare_screw_arm_assets.py
+[sim_world]
+backend = "isaacsim"
+physics_engine = "newton"
+newton_execution = "direct"
+newton_solver = "mujoco"
+physics_dt = 0.008333333333333333
+newton_substeps = 4
+newton_use_cuda_graph = true
+device = "cuda:0"
+headless = true
+renderer = "PathTracing"
+synchronous_capture = true
+samples_per_pixel_per_frame = 64
+pathtracing_max_bounces = 4
+pathtracing_cached = false
+pathtracing_many_light_sampling = false
+width = 1024
+height = 768
+rt_subframes = 4
+warmup_frames = 2
+
+[scene]
+backend = "dual_screw_assembly"
+object_kind = "screw"
+bolt_mesh_path = "assets/PhysicSolver/Screw/M20/bolt.obj"
+bolt_texture_path = "assets/PhysicSolver/Screw/M20/Textures/bolt_rotation.png"
+nut_mesh_path = "assets/PhysicSolver/Screw/M20/nut.obj"
+thread_pitch_m = 0.0025
+initial_engagement_m = 0.004
+target_xy = [ 0.1, 0.0,]
+fill_light_intensity = 200
+key_light_intensity = 700
+[[scene.cameras]]
+name = "overview"
+prim_path = "/World/scene/overview_cam"
+pose_relative_to = "/World/scene"
+resolution = [1024, 768]
+clipping_range = [0.001, 10.0]
+focal_length = 26.0
+[scene.cameras.pose]
+position = [1.25, -1.65, 1.75]
+orientation_wxyz = [0.771305051386122, 0.5695300146456919, 0.16876999091657818, 0.22856239911662637]
+
+[[scene.cameras]]
+name = "threads"
+prim_path = "/World/scene/threads_cam"
+pose_relative_to = "/World/scene"
+resolution = [1024, 768]
+clipping_range = [0.001, 10.0]
+focal_length = 30.0
+[scene.cameras.pose]
+position = [0.1, -0.5, 1.08]
+orientation_wxyz = [0.7793785289174703, 0.6265533565965791, -0.0, -0.0]
+
+
+[robot]
+finger_closed_m = 0.012
+backend = "dual_ur5e_screwdriver"
+axial_stiffness_n_m = 200.0
+axial_damping_n_s_m = 8.0
+axial_preload_target_m = -0.04
+spindle_damping_nm_s_rad = 0.02
+maximum_torque_nm = 0.3
+carriage_mass_kg = 0.05
+
+[planner]
+mujoco_impratio = 10.0
+clamp_s = 0.8
+lift_s = 1.5
+align_s = 1.5
+nut_lift_m = 0.16
+driver_clearance_m = 0.07
+backend = "dual_ur5e_screwdriver"
+sdf_resolution = 128
+hydroelastic_stiffness = 100000000000.0
+friction = 0.01
+contact_capacity = 40000
+spindle_speed_rad_s = -3.0
+engage_s = 1.0
+screw_s = 14.0
+minimum_tip_protrusion_m = 0.005
+hold_s = 1.0
+minimum_turns = 2.0
+minimum_advance_m = 0.006
+maximum_pitch_error_fraction = 0.25
+maximum_hold_drift_m = 0.001
+
+[job]
+backend = "screw_assembly"
+output_dir = "outputs/physic_solver/mujoco_hydroelastic_screw04_dual_through"
+timeout_s = 7200
+max_steps = 3000
+record_rgb = true
+
+[job.recorder]
+fps = 30
+width = 1024
+height = 768
+save_failed_episodes = true
+task = "mujoco_hydroelastic_screw04_dual_through"
