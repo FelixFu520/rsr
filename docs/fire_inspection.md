@@ -273,6 +273,8 @@ assets/FireInspection/
 |---|---|---|
 | [x30_physx_warehouse.toml](../configs/fire_inspection/x30_physx_warehouse.toml) | 正式采集；只发布全部验收通过的数据；已有数据集时拒绝覆盖 | `outputs/fire_inspection/` |
 | [x30_physx_warehouse_demo_2k.toml](../configs/fire_inspection/x30_physx_warehouse_demo_2k.toml) | 展示版；front_rgb / follow 两路视频和照片原生 2560×1440、16:9，30 fps；保留正式路径追踪质量；独立配置，不覆盖原结果 | `outputs/fire_inspection_demo_2k/` |
+| [x30_physx_warehouse_demo_1k_bright_stable.toml](../configs/fire_inspection/x30_physx_warehouse_demo_1k_bright_stable.toml) | 推荐：独立明亮场景，普通灯×6、应急灯等不增强；1024×576、30 fps、PathTracing 4096 spp，延长火焰动画；详见 [1K 明亮场景](fire_inspection_1k_bright.md) | `outputs/fire_inspection_demo_1k_bright_stable/` |
+| [x30_physx_warehouse_demo_1k_bright.toml](../configs/fire_inspection/x30_physx_warehouse_demo_1k_bright.toml) | 历史256 spp对照，有光照闪烁；数据已归档，正式采集使用上一行修正版 | `outputs/debug/fire_inspection/demo_1k_bright_256spp_flicker_retired/` |
 | [x30_physx_warehouse_demo_640.toml](../configs/fire_inspection/x30_physx_warehouse_demo_640.toml) | 展示版机位的完整预验证；640×360、15 fps，64 spp；通过全流程、独立校验和相机检查后再运行 2K 版 | `outputs/debug/fire_inspection/demo_640_validation/` |
 | [x30_physx_warehouse_debug.toml](../configs/fire_inspection/x30_physx_warehouse_debug.toml) | 继承正式配置；可重复运行并覆盖上次数据集；失败轨迹也导出为 `diagnostic` | `outputs/debug/fire_inspection/` |
 
